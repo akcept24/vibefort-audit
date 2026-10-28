@@ -1,0 +1,4 @@
+Contact: mailto:security@probcapital.com
+Expires: 2027-10-28T23:59:59Z
+Canonical: https://audit.probcapital.com/.well-known/security.txt
+Preferred-Languages: en
