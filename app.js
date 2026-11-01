@@ -1,10 +1,10 @@
-// Site configuration. Run `node sync-config.js` after changing the contact address.
+// Site configuration.
 const BRAND = 'ShipAudit Lab';
 const CONTACT_EMAIL = 'security@probcapital.com';
 const CHECKOUT_URLS = { 'Free scan': '#', 'Quick Audit': '#', 'Full Audit': '#', 'Deep Audit': '#', 'Monitoring': '#' };
 document.querySelectorAll('[data-brand]').forEach(el => el.textContent = BRAND);
 document.querySelectorAll('[data-contact]').forEach(el => { el.textContent = CONTACT_EMAIL; el.href = `mailto:${CONTACT_EMAIL}`; });
-document.title = document.title + ' — ' + BRAND;
+if (!document.title.includes(BRAND)) document.title = document.title + ' — ' + BRAND;
 const scanForm = document.querySelector('#scan-form');
 const output = document.querySelector('#scan-output');
 const checks = ['TLS configuration', 'Security headers', 'CORS policy', 'Exposed files', 'JavaScript bundle secrets', 'Public database probes', 'Email records'];
@@ -53,12 +53,12 @@ if (dialog) {
   form.elements.tier.addEventListener('change',()=>{form.dataset.checkoutUrl=CHECKOUT_URLS[form.elements.tier.value] || '#';});
   dialog.querySelector('.close').addEventListener('click', () => dialog.close());
   dialog.querySelector('.close-success').addEventListener('click', () => dialog.close());
-  form.addEventListener('submit', async event => { event.preventDefault(); const fields=['name','email','url','tier'].map(n=>form.elements[n]); const valid=fields.map(validate); if(valid.includes(false)){fields[valid.indexOf(false)].focus();return;} const errBox=document.querySelector('#brief-error'); errBox.hidden=true; const btn=form.querySelector('button[type=submit]'); btn.disabled=true;
+  form.addEventListener('submit', async event => { event.preventDefault(); const fields=['name','email','url','tier'].map(n=>form.elements[n]); const valid=fields.map(validate); if(valid.includes(false)){fields[valid.indexOf(false)].focus();return;} const errBox=document.querySelector('#brief-error'); if(!form.elements.authorized.checked){errBox.textContent='Please confirm you own this application or have written authorization to test it.';errBox.hidden=false;form.elements.authorized.focus();return;} errBox.hidden=true; const btn=form.querySelector('button[type=submit]'); btn.disabled=true;
     try {
-      const resp = await fetch('/api/brief', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: form.elements.name.value.trim(), email: form.elements.email.value.trim(), url: form.elements.url.value.trim(), tier: form.elements.tier.value, notes: form.elements.notes.value.trim(), company_website: form.elements.company_website ? form.elements.company_website.value : '' }) });
+      const resp = await fetch('/api/brief', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: form.elements.name.value.trim(), email: form.elements.email.value.trim(), url: form.elements.url.value.trim(), tier: form.elements.tier.value, notes: form.elements.notes.value.trim(), authorized: form.elements.authorized.checked, company_website: form.elements.company_website ? form.elements.company_website.value : '' }) });
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || !data.ok) throw new Error('brief rejected');
-      document.querySelector('#brief-content').hidden = true; document.querySelector('#brief-success').hidden = false;
+      document.querySelector('#brief-content').hidden = true; document.querySelector('#brief-success').hidden = false; if (data.confirmation === 'failed') { const m = document.querySelector('#brief-success-mail'); if (m) m.textContent = 'Your brief is in — but the confirmation email could not be sent. We have your brief on file and will reply within one business day.'; }
     } catch (e) {
       errBox.textContent = 'Something went wrong sending your brief. Please try again, or email us directly at ' + CONTACT_EMAIL + '.';
       errBox.hidden = false;

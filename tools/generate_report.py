@@ -13,7 +13,7 @@ the repo root; the CSS is inlined so the file is self-contained).
 
 Usage:
     python3 tools/generate_report.py findings.json -o report-client.html
-        [--id VF-002] [--scope "Surface scan"] [--date "31 October 2026"]
+        [--id SAL-002] [--scope "Surface scan"] [--date "31 October 2026"]
 
 This tool is NOT deployed with the site; it runs on the operator's machine.
 """
@@ -219,7 +219,7 @@ def main():
     ap = argparse.ArgumentParser(description="VibeFort report generator")
     ap.add_argument("input", help="findings JSON (widecheck results shape)")
     ap.add_argument("-o", "--output", required=True, help="output HTML file")
-    ap.add_argument("--id", default="VF-002", help="report id (default VF-002)")
+    ap.add_argument("--id", default="SAL-002", help="report id (default SAL-002)")
     ap.add_argument("--scope", default="Surface scan",
                     help="scope label for the cover")
     ap.add_argument("--date", default=None,

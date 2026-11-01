@@ -70,6 +70,11 @@ STATIC_FILES = {
     "/style.css": ("style.css", "text/css"),
     "/app.js": ("app.js", "application/javascript"),
     "/.well-known/security.txt": (".well-known/security.txt", "text/plain"),
+    "/terms.html": ("terms.html", "text/html"),
+    "/privacy.html": ("privacy.html", "text/html"),
+    "/favicon.svg": ("favicon.svg", "image/svg+xml"),
+    "/robots.txt": ("robots.txt", "text/plain"),
+    "/sitemap.xml": ("sitemap.xml", "application/xml"),
 }
 
 TIERS = ["Free scan", "Quick Audit", "Full Audit", "Deep Audit", "Monitoring"]
@@ -216,6 +221,9 @@ def validate_brief(data):
         errors["tier"] = "Select an audit tier."
     if len(notes) > 2000:
         errors["notes"] = "Notes are too long."
+    if data.get("authorized") is not True:
+        errors["authorized"] = ("Please confirm you own this application or "
+                                "have written authorization to test it.")
     clean = {"name": name, "email": email, "url": url,
              "tier": tier, "notes": notes}
     return clean, errors
@@ -1422,6 +1430,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "errors": errors})
             return
         amount = TIER_PRICES.get(clean["tier"], 0)
+        amount_label = (f"${amount}/mo" if clean["tier"] == "Monitoring"
+                        else f"${amount}")
         with _db_lock:
             conn = db_connect()
             cur = conn.execute(
@@ -1437,7 +1447,7 @@ class Handler(BaseHTTPRequestHandler):
 
         alert_text = (
             f"New audit brief #{order_id}\n"
-            f"Tier: {clean['tier']} (${amount})\n"
+            f"Tier: {clean['tier']} ({amount_label})\n"
             f"Name: {clean['name']}\n"
             f"Work email: {clean['email']}\n"
             f"App URL: {clean['url']}\n"
@@ -1445,7 +1455,7 @@ class Handler(BaseHTTPRequestHandler):
             f"Status: NEW (awaiting payment link / payment)")
         alert_ok, alert_detail = send_resend(
             CONTACT_EMAIL,
-            f"New brief: {clean['tier']} (${amount}) — {clean['url']}",
+            f"New brief: {clean['tier']} ({amount_label}) — {clean['url']}",
             alert_text)
         log_event(order_id, "ALERT_EMAIL_SENT" if alert_ok
                   else "ALERT_EMAIL_FAILED", alert_detail)
@@ -1474,7 +1484,7 @@ class Handler(BaseHTTPRequestHandler):
         # loud here, never silent.
         tg_text = (
             f"🛡 ShipAudit Lab: new brief #{order_id}\n"
-            f"Tier: {clean['tier']} (${amount})\nApp: {clean['url']}\n"
+            f"Tier: {clean['tier']} ({amount_label})\nApp: {clean['url']}\n"
             f"From: {clean['name']} <{clean['email']}>\n"
             f"Alert email: {'SENT' if alert_ok else 'FAILED — ' + alert_detail}\n"
             f"Client confirmation: {'SENT' if confirm_ok else 'FAILED — ' + confirm_detail}")
@@ -1504,7 +1514,8 @@ class Handler(BaseHTTPRequestHandler):
                           1 if tg_ok else 0, order_id))
             conn.commit()
             conn.close()
-        self._send_json(200, {"ok": True, "id": order_id})
+        self._send_json(200, {"ok": True, "id": order_id,
+                              "confirmation": "sent" if confirm_ok else "failed"})
 
     # -- /api/scan ------------------------------------------------------------------
     def _api_scan(self):
@@ -1548,7 +1559,7 @@ class Handler(BaseHTTPRequestHandler):
         findings.sort(key=lambda x: SEV_ORDER.get(x["severity"], 9))
         grade, score = score_findings(findings)
         results = {
-            "tool": "widecheck 1.1 (vibefort server port)",
+            "tool": "widecheck 1.1 (shipauditlab server port)",
             "generated_at": utcnow(),
             "note": "Automated surface evidence — findings receive an "
                     "independent verification pass in paid audits.",
