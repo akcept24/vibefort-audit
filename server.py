@@ -1,0 +1,1327 @@
+#!/usr/bin/env python3
+"""
+VibeFort site server — serves the static site AND the order plumbing API.
+
+Endpoints:
+  GET  /, /index.html, /report.html, /style.css, /app.js,
+       /.well-known/security.txt          (static, exact pre-existing files)
+  POST /api/brief  {name, email, url, tier, notes}
+       -> validate, persist order (SQLite, status NEW), alert email +
+          client confirmation via Resend, Telegram alert to HQ group.
+  POST /api/scan   {url, consent:true, email?}
+       -> real gentle surface scan (widecheck port + bundle-secret and
+          public-database probes), stores the lead, returns UI-shaped JSON.
+
+Stdlib only. Security headers replicate the old nginx.conf posture exactly
+on every response.
+"""
+
+import datetime
+import json
+import os
+import re
+import sqlite3
+import sys
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.environ.get("VF_DB_PATH", "/data/vibefort.db")
+PORT = int(os.environ.get("PORT", "80"))
+CONTACT_EMAIL = "security@probcapital.com"
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+MAIL_FROM = os.environ.get("MAIL_FROM", "VibeFort <audit@probcapital.com>")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1004396317271")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+TIER_PRICES = {"Free scan": 0, "Quick Audit": 299, "Full Audit": 899,
+               "Deep Audit": 2999, "Monitoring": 79}
+ORDER_STATUSES = ["NEW", "PAID", "IN_PROGRESS", "VERIFYING", "DELIVERED",
+                  "RETEST"]
+
+
+def log(msg):
+    sys.stderr.write(f"[{utcnow()}] {msg}\n")
+    sys.stderr.flush()
+
+SECURITY_HEADERS = [
+    ("Strict-Transport-Security", "max-age=63072000; includeSubDomains"),
+    ("X-Frame-Options", "DENY"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "strict-origin-when-cross-origin"),
+    ("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()"),
+    ("Content-Security-Policy",
+     "default-src 'self'; script-src 'self'; style-src 'self' "
+     "https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; "
+     "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+     "object-src 'none'; base-uri 'self'; form-action 'self'; "
+     "upgrade-insecure-requests"),
+]
+
+STATIC_FILES = {
+    "/": ("index.html", "text/html"),
+    "/index.html": ("index.html", "text/html"),
+    "/report.html": ("report.html", "text/html"),
+    "/style.css": ("style.css", "text/css"),
+    "/app.js": ("app.js", "application/javascript"),
+    "/.well-known/security.txt": (".well-known/security.txt", "text/plain"),
+}
+
+TIERS = ["Free scan", "Quick Audit", "Full Audit", "Deep Audit", "Monitoring"]
+EMAIL_RX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+_db_lock = threading.Lock()
+
+
+def db_connect():
+    path = DB_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        path = os.path.join(BASE_DIR, "vibefort.db")
+    conn = sqlite3.connect(path)
+    conn.execute("""CREATE TABLE IF NOT EXISTS orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        name TEXT NOT NULL, email TEXT NOT NULL, url TEXT NOT NULL,
+        tier TEXT NOT NULL, notes TEXT DEFAULT '',
+        amount INTEGER DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'NEW',
+        alert_sent INTEGER DEFAULT 0, confirm_sent INTEGER DEFAULT 0,
+        tg_sent INTEGER DEFAULT 0)""")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
+    for col, ddl in (("amount", "INTEGER DEFAULT 0"),
+                     ("tg_sent", "INTEGER DEFAULT 0")):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
+    conn.execute("""CREATE TABLE IF NOT EXISTS events(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        order_id INTEGER, event TEXT NOT NULL, detail TEXT DEFAULT '')""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS scans(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        url TEXT NOT NULL, email TEXT DEFAULT '',
+        grade TEXT DEFAULT '', score INTEGER DEFAULT 0,
+        results_json TEXT NOT NULL)""")
+    return conn
+
+
+def log_event(order_id, event, detail=""):
+    try:
+        with _db_lock:
+            conn = db_connect()
+            conn.execute(
+                "INSERT INTO events(created_at,order_id,event,detail)"
+                " VALUES(?,?,?,?)", (utcnow(), order_id, event, detail))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        log(f"event-log write failed: {e!r}")
+    log(f"order={order_id} event={event} {detail}")
+
+
+def utcnow():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Outbound notifications
+# ---------------------------------------------------------------------------
+def send_resend(to, subject, text):
+    """Returns (ok, detail). Never raises."""
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY not configured"
+    payload = json.dumps({"from": MAIL_FROM, "to": [to],
+                          "subject": subject, "text": text}).encode()
+    req = urllib.request.Request(
+        "https://api.resend.com/emails", data=payload, method="POST",
+        headers={"Authorization": f"Bearer {RESEND_API_KEY}",
+                 "Content-Type": "application/json",
+                 "User-Agent": "vibefort-server/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+            return True, str(body.get("id", "sent"))
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            detail = ""
+        return False, f"HTTP {e.code}: {detail}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+def send_telegram(text):
+    """Known-working pattern on this machine: urllib POST (curl hangs)."""
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "TELEGRAM_BOT_TOKEN not configured"
+    data = urllib.parse.urlencode(
+        {"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
+    req = urllib.request.Request(
+        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        data=data, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+            return bool(body.get("ok")), str(body.get("ok"))
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Validation (mirrors the site's form rules)
+# ---------------------------------------------------------------------------
+def valid_url(value):
+    try:
+        u = urllib.parse.urlparse(value)
+        return u.scheme in ("http", "https") and bool(u.hostname)
+    except Exception:
+        return False
+
+
+def validate_brief(data):
+    errors = {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip()
+    url = (data.get("url") or "").strip()
+    tier = (data.get("tier") or "").strip()
+    notes = (data.get("notes") or "").strip()
+    if not name or len(name) > 200:
+        errors["name"] = "Enter your name."
+    if not EMAIL_RX.match(email) or len(email) > 254:
+        errors["email"] = "Enter a valid work email."
+    if not valid_url(url) or len(url) > 2000:
+        errors["url"] = "Enter a valid app URL starting with http:// or https://."
+    if tier not in TIERS:
+        errors["tier"] = "Select an audit tier."
+    if len(notes) > 2000:
+        errors["notes"] = "Notes are too long."
+    clean = {"name": name, "email": email, "url": url,
+             "tier": tier, "notes": notes}
+    return clean, errors
+
+
+# ---------------------------------------------------------------------------
+# Surface scanner — port of widecheck 1.1 (gentle, read-only) plus
+# JS-bundle secret heuristics and public-database probes.
+# ---------------------------------------------------------------------------
+import base64
+import hashlib as _hl
+import http.client
+import secrets as _secrets
+import socket
+import ssl
+import time
+from html.parser import HTMLParser
+
+SCAN_UA = "widecheck/1.1 (owner-operated surface audit; read-only)"
+EVIL_ORIGIN = "https://evil.example"
+MIN_INTERVAL = 0.35
+REQ_TIMEOUT = 8
+MAX_BODY = 1024 * 1024
+_scan_last = {}
+_scan_lock = threading.Lock()
+
+
+def _throttle(host):
+    with _scan_lock:
+        now = time.monotonic()
+        last = _scan_last.get(host)
+        if last is not None:
+            wait = MIN_INTERVAL - (now - last)
+            if wait > 0:
+                time.sleep(wait)
+        _scan_last[host] = time.monotonic()
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _fetch(url, headers=None, follow_redirects=True, method="GET"):
+    host = urllib.parse.urlparse(url).netloc
+    _throttle(host)
+    hdrs = {"User-Agent": SCAN_UA, "Accept": "*/*"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, headers=hdrs, method=method)
+    opener = urllib.request.build_opener() if follow_redirects else \
+        urllib.request.build_opener(_NoRedirect)
+    out = {"url": url, "status": None, "headers": {}, "body": b"", "error": None}
+    try:
+        with opener.open(req, timeout=REQ_TIMEOUT) as resp:
+            out["status"] = resp.status
+            out["headers"] = {k.lower(): v for k, v in resp.headers.items()}
+            try:
+                out["body"] = resp.read(MAX_BODY)
+            except http.client.IncompleteRead as e:
+                out["body"] = e.partial or b""
+    except urllib.error.HTTPError as e:
+        out["status"] = e.code
+        try:
+            out["headers"] = {k.lower(): v for k, v in e.headers.items()}
+            out["body"] = e.read(MAX_BODY)
+        except Exception:
+            pass
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def _fetch_retry(url, **kw):
+    r = _fetch(url, **kw)
+    if r["error"]:
+        time.sleep(0.8)
+        r2 = _fetch(url, **kw)
+        if not r2["error"]:
+            return r2
+    return r
+
+
+class _PageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.scripts = []
+        self.links = []
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "script" and a.get("src"):
+            self.scripts.append(a["src"])
+        if tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+
+
+def _doh_query(name, rtype):
+    url = ("https://cloudflare-dns.com/dns-query?name=" +
+           urllib.parse.quote(name) + f"&type={rtype}")
+    req = urllib.request.Request(url, headers={"Accept": "application/dns-json",
+                                               "User-Agent": SCAN_UA})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.load(resp)
+    out = []
+    for ans in data.get("Answer", []):
+        d = (ans.get("data") or "").strip()
+        d = d.replace('" "', "")
+        if len(d) >= 2 and d.startswith('"') and d.endswith('"'):
+            d = d[1:-1]
+        out.append(d)
+    return out
+
+
+def _dns_txt(name):
+    try:
+        return _doh_query(name, "TXT"), "DoH"
+    except Exception:
+        return [], "DoH"
+
+
+def _resolver_alive(reg_domain):
+    try:
+        return bool(_doh_query(reg_domain, "NS"))
+    except Exception:
+        return False
+
+
+def _registrable(host):
+    parts = host.split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else host
+
+
+def _tls_info(host):
+    """Origin TLS version + cert expiry. Uses the HTTPS_PROXY CONNECT tunnel
+    when one is configured (sandbox), direct otherwise (production)."""
+    ctx = ssl.create_default_context()
+    proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    sock = None
+    if proxy:
+        u = urllib.parse.urlparse(proxy)
+        sock = socket.create_connection((u.hostname, u.port or 8080),
+                                        timeout=REQ_TIMEOUT)
+        auth = ""
+        if u.username:
+            creds = base64.b64encode(
+                f"{urllib.parse.unquote(u.username)}:"
+                f"{urllib.parse.unquote(u.password or '')}".encode()).decode()
+            auth = f"Proxy-Authorization: Basic {creds}\r\n"
+        sock.sendall(f"CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n"
+                     f"{auth}\r\n".encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        if b" 200" not in resp.split(b"\r\n", 1)[0]:
+            sock.close()
+            raise OSError(f"proxy CONNECT failed: {resp[:80]!r}")
+    else:
+        sock = socket.create_connection((host, 443), timeout=REQ_TIMEOUT)
+    with ctx.wrap_socket(sock, server_hostname=host) as tls:
+        version = tls.version()
+        cert = tls.getpeercert()
+    na = cert.get("notAfter")
+    exp = datetime.datetime.strptime(na, "%b %d %H:%M:%S %Y %Z") \
+        .replace(tzinfo=datetime.timezone.utc)
+    days = (exp - datetime.datetime.now(datetime.timezone.utc)).days
+    return {"version": version, "not_after": na, "days_left": days}
+
+
+SECRET_PATTERNS = [
+    (re.compile(r"(?i)(api[_-]?key|secret|password|passwd|token|private[_-]?key)\s*[:=]"),
+     "key=value-style secret assignment"),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), "AWS access key id pattern"),
+    (re.compile(r"sk-[A-Za-z0-9\-_]{16,}"), "sk- API key pattern"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "PEM private key header"),
+    (re.compile(r"eyJ[A-Za-z0-9\-_]{10,}\."), "JWT-looking token"),
+]
+JWT_RX = re.compile(r"eyJ[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{10,}\.[A-Za-z0-9\-_]{5,}")
+SUPABASE_RX = re.compile(r"https://[a-z0-9]{10,}\.supabase\.co")
+FIREBASE_RX = re.compile(r"https://[a-z0-9\-]+\.(?:firebaseio\.com|firebasedatabase\.app)")
+
+
+def _jwt_role(token):
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload))
+        return data.get("role")
+    except Exception:
+        return None
+
+
+def _sig(resp):
+    return (resp["status"], len(resp["body"]),
+            _hl.sha1(resp["body"][:512]).hexdigest()[:12])
+
+
+def _guard_public_target(host):
+    """SSRF hygiene: refuse loopback / private / link-local targets.
+    VF_ALLOW_PRIVATE_TARGETS=1 disables the check (local development only;
+    filtered sandbox resolvers map every name into 198.18.0.0/15)."""
+    if os.environ.get("VF_ALLOW_PRIVATE_TARGETS") == "1":
+        return None
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        return f"host does not resolve: {e}"
+    import ipaddress
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if ip.is_private or ip.is_loopback or ip.is_link_local or \
+                ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return f"target resolves to non-public address {ip}"
+    return None
+
+
+def run_surface_scan(base_url):
+    """Returns (findings, meta) in the widecheck results shape:
+    findings: [{target, check, severity(lowercase), title, evidence, status}],
+    meta: dict with target/host/tls info/errors."""
+    host = urllib.parse.urlparse(base_url).netloc
+    origin = f"https://{host}"
+    findings = []
+    meta = {"target": base_url, "host": host, "errors": []}
+
+    def add(check, severity, title, evidence):
+        findings.append({"target": base_url, "check": check,
+                         "severity": severity, "title": title,
+                         "evidence": evidence, "status": "[raw]"})
+
+    # ---- TLS -------------------------------------------------------------
+    http_probe = _fetch(f"http://{host}/", follow_redirects=False)
+    if http_probe["status"] in (301, 302, 307, 308):
+        loc = http_probe["headers"].get("location", "")
+        meta["http_redirect"] = f"{http_probe['status']} -> {loc}"
+        if not loc.startswith("https://"):
+            add("tls", "medium", "HTTP redirects somewhere other than HTTPS",
+                f"GET http://{host}/ -> {http_probe['status']} Location: {loc}")
+    elif http_probe["status"] == 200:
+        add("tls", "medium", "Homepage served over plain HTTP (no redirect to HTTPS)",
+            f"GET http://{host}/ -> 200")
+    elif http_probe["error"]:
+        meta["errors"].append(f"http probe: {http_probe['error']}")
+
+    tls_ok = False
+    try:
+        ti = _tls_info(host)
+        meta["tls_version"] = ti["version"]
+        meta["cert_days_left"] = ti["days_left"]
+        tls_ok = ti["days_left"] >= 0
+        if ti["days_left"] < 0:
+            add("tls", "critical", "TLS certificate is EXPIRED",
+                f"notAfter={ti['not_after']} ({ti['days_left']} days)")
+        elif ti["days_left"] < 14:
+            add("tls", "high", "TLS certificate expires very soon",
+                f"notAfter={ti['not_after']} ({ti['days_left']} days left)")
+        elif ti["days_left"] < 30:
+            add("tls", "medium", "TLS certificate expires within 30 days",
+                f"notAfter={ti['not_after']} ({ti['days_left']} days left)")
+        if ti["version"] in ("TLSv1", "TLSv1.1"):
+            add("tls", "high", f"Obsolete TLS protocol negotiated: {ti['version']}",
+                f"TLS handshake negotiated {ti['version']}")
+        if tls_ok and ti["version"] not in ("TLSv1", "TLSv1.1"):
+            add("tls", "info",
+                f"TLS available ({ti['version']}, certificate valid {ti['days_left']} more days)",
+                f"TLS handshake negotiated {ti['version']}; cert notAfter={ti['not_after']}")
+    except Exception as e:
+        meta["errors"].append(f"tls handshake: {type(e).__name__}: {e}")
+
+    home = _fetch_retry(origin + "/")
+    if home["error"]:
+        meta["errors"].append(f"homepage: {home['error']}")
+        return findings, meta
+    hh = home["headers"]
+    body_text = home["body"].decode("utf-8", "replace")
+    meta["homepage_status"] = home["status"]
+
+    nonsense = _fetch(origin + f"/widecheck-nonexistent-{_secrets.token_hex(4)}")
+    fallback_sig = _sig(nonsense) if not nonsense["error"] else None
+    meta["fallback_signature"] = str(fallback_sig)
+
+    def is_fallback(resp):
+        return fallback_sig is not None and _sig(resp) == fallback_sig
+
+    # ---- headers -----------------------------------------------------------
+    csp = hh.get("content-security-policy")
+    if not csp:
+        add("headers", "medium", "Missing Content-Security-Policy",
+            "no content-security-policy header on /")
+    else:
+        meta["csp"] = csp[:200]
+        if "unsafe-inline" in csp and "script-src" in csp:
+            add("headers", "low", "CSP allows 'unsafe-inline' scripts (weakened XSS value)",
+                f"CSP: {csp[:200]}")
+    hsts = hh.get("strict-transport-security")
+    if not hsts:
+        add("headers", "medium", "Missing Strict-Transport-Security",
+            "no strict-transport-security header on /")
+    else:
+        m = re.search(r"max-age=(\d+)", hsts)
+        if m and int(m.group(1)) < 15552000:
+            add("headers", "low", "HSTS max-age below 180 days",
+                f"strict-transport-security: {hsts}")
+    if not hh.get("x-frame-options") and not (csp and "frame-ancestors" in csp):
+        add("headers", "medium",
+            "No clickjacking protection (no X-Frame-Options, no CSP frame-ancestors)",
+            "x-frame-options absent; CSP has no frame-ancestors")
+    if (hh.get("x-content-type-options") or "").lower() != "nosniff":
+        add("headers", "low", "Missing X-Content-Type-Options: nosniff",
+            f"x-content-type-options: {hh.get('x-content-type-options')}")
+    if not hh.get("referrer-policy"):
+        add("headers", "low", "Missing Referrer-Policy", "no referrer-policy header on /")
+    if not hh.get("permissions-policy"):
+        add("headers", "low", "Missing Permissions-Policy",
+            "no permissions-policy header on /")
+    for leak_hdr in ("x-powered-by", "server", "x-aspnet-version", "x-generator"):
+        if hh.get(leak_hdr):
+            sev = "low" if re.search(r"\d+\.\d+", hh[leak_hdr]) else "info"
+            add("headers", sev, f"Technology/version disclosure via {leak_hdr}",
+                f"{leak_hdr}: {hh[leak_hdr]}")
+
+    # ---- cookies (homepage) -------------------------------------------------
+    seen_cookies = set()
+
+    def check_cookies(resp, where):
+        raw = resp["headers"].get("set-cookie")
+        if not raw:
+            return
+        for cookie in re.split(r", (?=[^;,]+?=)", raw):
+            name = cookie.split("=", 1)[0].strip()
+            if name in seen_cookies:
+                continue
+            seen_cookies.add(name)
+            low = cookie.lower()
+            missing = [f for f, p in (("Secure", "secure"), ("HttpOnly", "httponly"),
+                                      ("SameSite", "samesite")) if p not in low]
+            if missing:
+                sev = "medium" if ("HttpOnly" in missing or "Secure" in missing) else "low"
+                add("cookies", sev,
+                    f"Cookie '{name}' missing flags: {', '.join(missing)}",
+                    f"Set-Cookie on {where}: {cookie[:160]}")
+    check_cookies(home, "/")
+
+    # ---- page parse / framework markers ------------------------------------
+    parser = _PageParser()
+    try:
+        parser.feed(body_text)
+    except Exception:
+        pass
+    next_markers = []
+    if any(h.startswith("x-nextjs") for h in hh):
+        next_markers.append("x-nextjs-* response header")
+    if "_next/static" in body_text:
+        next_markers.append("/_next/static asset reference")
+    if "__NEXT_DATA__" in body_text:
+        next_markers.append("__NEXT_DATA__ script block")
+    meta["nextjs_markers"] = next_markers
+    is_next = bool(next_markers)
+    auth_links = [ln for ln in parser.links
+                  if re.search(r"(?i)(login|log-in|signin|sign-in|signup|sign-up|register|auth)", ln)]
+
+    # ---- CORS ----------------------------------------------------------------
+    for path in ("/", "/api", "/api/auth"):
+        r = _fetch(origin + path, headers={"Origin": EVIL_ORIGIN})
+        acao = r["headers"].get("access-control-allow-origin")
+        acac = (r["headers"].get("access-control-allow-credentials") or "").lower()
+        if acao == EVIL_ORIGIN and acac == "true":
+            add("cors", "critical",
+                f"CORS reflects arbitrary Origin WITH credentials on {path}",
+                f"Origin: {EVIL_ORIGIN} -> ACAO: {acao}, ACAC: {acac} (status {r['status']})")
+        elif acao == EVIL_ORIGIN:
+            add("cors", "high", f"CORS reflects arbitrary Origin on {path}",
+                f"Origin: {EVIL_ORIGIN} -> ACAO: {acao} (status {r['status']})")
+        elif acao == "*" and acac == "true":
+            add("cors", "high", f"CORS wildcard origin with credentials allowed on {path}",
+                f"ACAO: *, ACAC: true (status {r['status']})")
+        elif acao == "*":
+            sev = "medium" if path.startswith("/api") else "low"
+            add("cors", sev, f"CORS wildcard origin (ACAO: *) on {path}",
+                f"ACAO: * (status {r['status']})")
+
+    # ---- exposed files --------------------------------------------------------
+    sec_present = False
+    for path in ("/.env", "/.git/config", "/.git/HEAD",
+                 "/.well-known/security.txt", "/security.txt"):
+        r = _fetch(origin + path)
+        if r["status"] != 200 or not r["body"]:
+            continue
+        if is_fallback(r):
+            add("exposed-files", "info",
+                f"{path} returns the app fallback page (same as a nonexistent path) — "
+                "not a real file exposure",
+                f"GET {path} -> 200, {len(r['body'])} bytes, signature matches "
+                f"nonexistent-path response {fallback_sig}")
+            continue
+        text = r["body"].decode("utf-8", "replace")
+        if path == "/.env":
+            hits = [label for rx, label in SECRET_PATTERNS if rx.search(text)]
+            if hits:
+                add("exposed-files", "critical",
+                    "/.env is publicly accessible AND contains secret-looking patterns "
+                    f"({'; '.join(hits)}) — secret values NOT copied",
+                    f"GET /.env -> 200, {len(r['body'])} bytes, patterns: {'; '.join(hits)}")
+            else:
+                add("exposed-files", "high", "/.env is publicly accessible",
+                    f"GET /.env -> 200, {len(r['body'])} bytes, no known secret pattern matched")
+        elif path.startswith("/.git"):
+            looks_git = ("[core]" in text or text.startswith("ref:") or
+                         "repositoryformatversion" in text)
+            if looks_git:
+                add("exposed-files", "high",
+                    f"{path} is publicly accessible (git metadata exposure)",
+                    f"GET {path} -> 200, {len(r['body'])} bytes, git-format content markers present")
+            else:
+                add("exposed-files", "medium",
+                    f"{path} returns 200 but content does not look like git metadata (verify manually)",
+                    f"GET {path} -> 200, {len(r['body'])} bytes")
+        else:
+            sec_present = True
+            add("exposed-files", "info", "security.txt present (good practice)",
+                f"GET {path} -> 200, {len(r['body'])} bytes")
+    if not sec_present:
+        add("exposed-files", "low", "No security.txt (responsible-disclosure contact missing)",
+            "/.well-known/security.txt and /security.txt did not return a distinct 200")
+
+    rob = _fetch(origin + "/robots.txt")
+    if rob["status"] == 200 and not is_fallback(rob):
+        rtext = rob["body"].decode("utf-8", "replace")
+        sens = [ln.strip() for ln in rtext.splitlines()
+                if ln.strip().lower().startswith("disallow:")
+                and re.search(r"(?i)(admin|api|config|backup|private|internal|debug|staging)", ln)]
+        if sens:
+            add("exposed-files", "low", "robots.txt discloses sensitive-looking paths",
+                "; ".join(sens[:6]))
+
+    js_assets = [s for s in parser.scripts if s.split("?")[0].endswith(".js")]
+    if js_assets:
+        main_js = urllib.parse.urljoin(origin + "/", js_assets[0])
+        r = _fetch(main_js + ".map")
+        if r["status"] == 200 and r["body"] and not is_fallback(r):
+            add("exposed-files", "medium", "JavaScript source map publicly accessible",
+                f"GET {main_js}.map -> 200, {len(r['body'])} bytes")
+
+    # ---- CVE-2025-29927 probe (only when Next.js markers detected) ------------
+    probe_note = "framework not detected (no Next.js markers)"
+    if is_next:
+        cand = None
+        for ln in auth_links + parser.links:
+            if re.search(r"(?i)(dashboard|account|profile|admin|app)", ln):
+                cand = urllib.parse.urljoin(origin + "/", ln)
+                break
+        cand = cand or (origin + "/dashboard")
+        baseline = _fetch(cand)
+        probe = _fetch(cand, headers={
+            "x-middleware-subrequest":
+                "middleware:middleware:middleware:middleware:middleware"})
+        b, p = baseline["status"], probe["status"]
+        blen, plen = len(baseline["body"]), len(probe["body"])
+        probe_note = (f"Next.js markers: {'; '.join(next_markers)}; probe target {cand}: "
+                      f"baseline {b} ({blen}B) vs subrequest {p} ({plen}B)")
+        if b in (301, 302, 303, 307, 308, 401, 403) and p == 200 and abs(plen - blen) > 200:
+            add("framework-cve", "critical",
+                "Possible CVE-2025-29927 middleware bypass: protected path answers 200 "
+                "with x-middleware-subrequest while baseline is gated", probe_note)
+        elif p != b or abs(plen - blen) > 200:
+            add("framework-cve", "medium",
+                "CVE-2025-29927 probe changed the response on a Next.js app "
+                "(inconclusive — verify manually)", probe_note)
+    meta["cve_2025_29927_probe"] = probe_note
+
+    # ---- rate-limit signal (indicative only) -----------------------------------
+    if auth_links:
+        auth_url = urllib.parse.urljoin(origin + "/", auth_links[0])
+        statuses, signal = [], False
+        for _ in range(3):
+            r = _fetch(auth_url)
+            statuses.append(r["status"])
+            if r["status"] == 429:
+                signal = True
+            if re.search(rb"(?i)(captcha|recaptcha|hcaptcha|turnstile)", r["body"] or b""):
+                signal = True
+            check_cookies(r, auth_url)
+        if not signal:
+            add("rate-limit", "low",
+                "No rate-limit signal observed on auth page (INDICATIVE ONLY — "
+                "3 gentle page loads, no credential attempts)",
+                f"GET {auth_url} x3 -> statuses {statuses}, no 429/captcha seen")
+    else:
+        meta["rate_limit_probe"] = "no auth link discovered on homepage; skipped"
+
+    # ---- cache deception ---------------------------------------------------------
+    cd = _fetch(origin + "//widecheck-probe.css")
+    cc = (cd["headers"].get("cache-control") or "").lower()
+    ctype = cd["headers"].get("content-type", "")
+    m = re.search(r"max-age=(\d+)", cc)
+    if (cd["status"] == 200 and "text/html" in ctype and "public" in cc
+            and m and int(m.group(1)) >= 300 and not is_fallback(cd)):
+        add("cache-deception", "medium",
+            "Cache-deception signal: static-looking suffix path returned HTML "
+            "with genuinely cacheable headers",
+            f"GET //widecheck-probe.css -> 200, content-type {ctype}, cache-control: {cc}")
+
+    # ---- JS bundle secret heuristics + backend discovery -------------------------
+    haystacks = [("homepage HTML", body_text)]
+    for src in js_assets[:3]:
+        js_url = urllib.parse.urljoin(origin + "/", src)
+        r = _fetch(js_url)
+        if r["status"] == 200 and r["body"]:
+            haystacks.append((f"JS bundle {urllib.parse.urlparse(js_url).path}",
+                              r["body"].decode("utf-8", "replace")))
+
+    supabase_urls, firebase_urls, anon_keys = set(), set(), []
+    service_role_found = []
+    for where, text in haystacks:
+        supabase_urls.update(SUPABASE_RX.findall(text))
+        firebase_urls.update(FIREBASE_RX.findall(text))
+        for token in JWT_RX.findall(text):
+            role = _jwt_role(token)
+            if role == "service_role":
+                service_role_found.append(where)
+            elif role == "anon":
+                anon_keys.append(token)
+        if where.startswith("JS bundle"):
+            # Bundles only: high-confidence patterns only. The loose
+            # key=value heuristic matches ordinary minified code and would
+            # cry wolf; concrete key material is the real signal.
+            for rx, label in SECRET_PATTERNS:
+                if label not in ("AWS access key id pattern", "sk- API key pattern",
+                                 "PEM private key header"):
+                    continue
+                if rx.search(text):
+                    add("bundle-secrets", "high",
+                        f"Secret-looking pattern in {where}: {label} (value NOT copied)",
+                        f"pattern '{label}' matched in {where}")
+                    break  # one bundle-secrets finding per bundle is enough
+    for where in service_role_found:
+        add("bundle-secrets", "critical",
+            f"Supabase SERVICE-ROLE key embedded in {where} — bypasses all row-level security (value NOT copied)",
+            f"a JWT with role=service_role was found in {where}")
+    meta["supabase_urls"] = sorted(supabase_urls)
+    meta["firebase_urls"] = sorted(firebase_urls)
+
+    # ---- public database probes (read-only, no data rows fetched) -----------------
+    for sb in sorted(supabase_urls):
+        if anon_keys:
+            key = anon_keys[0]
+            hdrs = {"apikey": key, "Authorization": f"Bearer {key}"}
+            root = _fetch(sb + "/rest/v1/", headers=hdrs)
+            tables = []
+            if root["status"] == 200 and root["body"]:
+                try:
+                    spec = json.loads(root["body"].decode("utf-8", "replace"))
+                    tables = [p.lstrip("/") for p in spec.get("paths", {})
+                              if p.startswith("/") and "{" not in p][:40]
+                except Exception:
+                    pass
+            if tables:
+                open_tables = []
+                for t in tables[:8]:
+                    probe = _fetch(
+                        f"{sb}/rest/v1/{urllib.parse.quote(t)}?select=*&limit=0",
+                        headers={**hdrs, "Prefer": "count=exact"})
+                    cr = probe["headers"].get("content-range", "")
+                    tm = re.search(r"/(\d+)$", cr)
+                    if probe["status"] == 200 and tm:
+                        open_tables.append(f"{t} ({tm.group(1)} rows)")
+                if open_tables:
+                    add("db-probe", "high",
+                        "Supabase tables readable by the public anon key (row counts only — no rows fetched)",
+                        f"anon key GET /rest/v1/<table>?limit=0 returned counts for: "
+                        f"{'; '.join(open_tables)}")
+                else:
+                    add("db-probe", "info",
+                        "Supabase detected; anon key cannot read table data (RLS appears enforced)",
+                        f"project {sb}; {len(tables)} tables in schema listing, "
+                        "count probes denied/empty")
+            else:
+                add("db-probe", "info",
+                    "Supabase project detected in client code; REST root did not list tables to the anon key",
+                    f"GET {sb}/rest/v1/ with anon key -> {root['status']}")
+        else:
+            add("db-probe", "info",
+                "Supabase project URL found in client code, but no anon key was found to probe with",
+                f"project {sb}; probe skipped (an anon key is normally public by design)")
+    for fb in sorted(firebase_urls):
+        probe = _fetch(fb + "/.json?shallow=true")
+        if probe["status"] == 200 and probe["body"]:
+            try:
+                keys = list(json.loads(probe["body"].decode("utf-8", "replace")).keys())
+            except Exception:
+                keys = []
+            if keys:
+                add("db-probe", "critical",
+                    "Firebase Realtime Database is WORLD-READABLE (top-level keys listed; no values fetched)",
+                    f"GET {fb}/.json?shallow=true -> 200, top-level keys: "
+                    f"{', '.join(keys[:10])}")
+            else:
+                add("db-probe", "info",
+                    "Firebase Realtime Database answered the public probe with an empty payload",
+                    f"GET {fb}/.json?shallow=true -> 200, empty")
+        elif probe["status"] in (401, 403):
+            add("db-probe", "info",
+                "Firebase Realtime Database denies public reads (rules appear enforced)",
+                f"GET {fb}/.json?shallow=true -> {probe['status']}")
+
+    # ---- email DNS ------------------------------------------------------------------
+    _dns_checks(host, findings)
+    return findings, meta
+
+
+def _dns_checks(host, findings):
+    reg = _registrable(host)
+    base = {"target": f"https://{host}", "check": "email-dns", "status": "[raw]"}
+    if not _resolver_alive(reg):
+        findings.append({**base, "severity": "info",
+                         "title": "Email DNS checks inconclusive — resolver returned no data at all",
+                         "evidence": "NS lookup for the registrable domain came back "
+                                     "empty via DoH; absence of records NOT established"})
+        return
+    txts, via = _dns_txt(reg)
+    spf = [t for t in txts if t.lower().startswith("v=spf1")]
+    if not spf:
+        findings.append({**base, "severity": "medium",
+                         "title": f"No SPF record on {reg}",
+                         "evidence": f"TXT {reg} via {via} -> records: {txts[:3]} (no v=spf1)"})
+    elif spf[0].strip().endswith("~all") or spf[0].strip().endswith("?all"):
+        findings.append({**base, "severity": "low",
+                         "title": f"SPF on {reg} uses softfail/neutral (~all/?all)",
+                         "evidence": spf[0][:160]})
+    dmarc_found = None
+    for dmarc_name in (f"_dmarc.{host}", f"_dmarc.{reg}"):
+        txts, via = _dns_txt(dmarc_name)
+        dmarc = [t for t in txts if t.lower().startswith("v=dmarc1")]
+        if dmarc:
+            dmarc_found = (dmarc_name, dmarc[0])
+            break
+    if dmarc_found:
+        pol = re.search(r"p=([a-z]+)", dmarc_found[1])
+        if pol and pol.group(1) == "none":
+            findings.append({**base, "severity": "low",
+                             "title": f"DMARC policy is p=none (monitoring only) at {dmarc_found[0]}",
+                             "evidence": dmarc_found[1][:160]})
+    else:
+        findings.append({**base, "severity": "medium",
+                         "title": f"No DMARC record for {host} or {reg}",
+                         "evidence": "TXT _dmarc.<host> and _dmarc.<registrable> -> no v=DMARC1"})
+    findings.append({**base, "severity": "info",
+                     "title": "DKIM: not checkable without selector",
+                     "evidence": "DKIM requires knowing the mail provider's selector; skipped by design"})
+
+
+SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+SEV_DEDUCT = {"critical": 25, "high": 15, "medium": 8, "low": 3, "info": 0}
+
+
+def score_findings(findings):
+    score = 100
+    for f in findings:
+        score -= SEV_DEDUCT.get(f["severity"], 0)
+    score = max(0, score)
+    if score >= 97:
+        grade = "A+"
+    elif score >= 90:
+        grade = "A"
+    elif score >= 80:
+        grade = "B"
+    elif score >= 70:
+        grade = "C"
+    elif score >= 60:
+        grade = "D"
+    elif score >= 50:
+        grade = "E"
+    else:
+        grade = "F"
+    return grade, score
+
+
+def ui_findings(findings):
+    """Map widecheck-shaped findings to the shape app.js renders."""
+    out = []
+    for f in sorted(findings, key=lambda x: SEV_ORDER.get(x["severity"], 9)):
+        sev = f["severity"]
+        out.append({
+            "severity": sev.upper(),
+            "finding": f["title"],
+            "evidence": f["evidence"],
+            "status": "INFO" if sev == "info" else "OBSERVED",
+        })
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Rate limiting (per-IP, in-memory sliding window)
+# ---------------------------------------------------------------------------
+_rate_hits = {}
+_rate_lock = threading.Lock()
+RATE_LIMITS = {"brief": (5, 600), "scan": (3, 600)}  # (max hits, window sec)
+
+
+def rate_ok(bucket, ip):
+    limit, window = RATE_LIMITS[bucket]
+    now = time.time()
+    with _rate_lock:
+        hits = [t for t in _rate_hits.get((bucket, ip), [])
+                if now - t < window]
+        if len(hits) >= limit:
+            _rate_hits[(bucket, ip)] = hits
+            return False
+        hits.append(now)
+        _rate_hits[(bucket, ip)] = hits
+        return True
+
+
+# ---------------------------------------------------------------------------
+# HTTP handler
+# ---------------------------------------------------------------------------
+class Handler(BaseHTTPRequestHandler):
+    server_version = "nginx"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    # -- plumbing ------------------------------------------------------------
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+    def send_error(self, code, message=None, explain=None):
+        # Minimal error body: no version strings, no stack traces, ever.
+        try:
+            self._send(code, f"{code}\n", "text/plain")
+        except Exception:
+            pass
+
+    def _client_ip(self):
+        xff = self.headers.get("X-Forwarded-For") or ""
+        if xff:
+            return xff.split(",")[0].strip()
+        return self.client_address[0]
+
+    def _send(self, code, body, content_type):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        for k, v in SECURITY_HEADERS:
+            self.send_header(k, v)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _send_json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json")
+
+    def _read_json(self, max_bytes=65536):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = 0
+        if length <= 0 or length > max_bytes:
+            return None
+        try:
+            return json.loads(self.rfile.read(length).decode("utf-8"))
+        except Exception:
+            return None
+
+    def _admin_ok(self):
+        if not ADMIN_TOKEN:
+            return False
+        import hmac
+        given = self.headers.get("X-Admin-Token") or ""
+        return hmac.compare_digest(given, ADMIN_TOKEN)
+
+    # -- routing ---------------------------------------------------------------
+    def do_GET(self):
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path.startswith("/api/"):
+                self._api_admin_get(path)
+            else:
+                self._route()
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            log(f"unhandled GET error: {e!r}")
+            try:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            except Exception:
+                pass
+
+    def do_HEAD(self):
+        try:
+            self._route()
+        except Exception as e:
+            log(f"unhandled HEAD error: {e!r}")
+
+    def do_POST(self):
+        try:
+            path = urllib.parse.urlparse(self.path).path
+            if path == "/api/brief":
+                self._api_brief()
+            elif path == "/api/scan":
+                self._api_scan()
+            elif path.startswith("/api/orders/"):
+                self._api_admin_post(path)
+            else:
+                self._send_json(404, {"ok": False, "error": "not found"})
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            log(f"unhandled POST error: {e!r}")
+            try:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            except Exception:
+                pass
+
+    def _route(self):
+        path = urllib.parse.urlparse(self.path).path
+        entry = STATIC_FILES.get(path)
+        if entry is None:
+            self._send(404, "404 Not Found\n", "text/plain")
+            return
+        fname, ctype = entry
+        fpath = os.path.join(BASE_DIR, fname)
+        try:
+            with open(fpath, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            self._send(404, "404 Not Found\n", "text/plain")
+            return
+        mtime = int(os.path.getmtime(fpath))
+        etag = '"%x-%x"' % (mtime, len(data))
+        self.send_response(200)
+        for k, v in SECURITY_HEADERS:
+            self.send_header(k, v)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("ETag", etag)
+        self.send_header("Last-Modified",
+                         self.date_time_string(mtime))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    # -- admin (token-guarded register) ---------------------------------------
+    def _order_dict(self, conn, row):
+        d = dict(row)
+        evs = conn.execute(
+            "SELECT created_at,event,detail FROM events WHERE order_id=?"
+            " ORDER BY id", (d["id"],)).fetchall()
+        d["events"] = [dict(e) for e in evs]
+        return d
+
+    def _api_admin_get(self, path):
+        if not self._admin_ok():
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        conn = db_connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            if path == "/api/orders":
+                rows = conn.execute(
+                    "SELECT * FROM orders ORDER BY id DESC LIMIT 100"
+                ).fetchall()
+                self._send_json(200, {"ok": True,
+                                      "orders": [dict(r) for r in rows]})
+            elif path.startswith("/api/orders/"):
+                try:
+                    oid = int(path.rsplit("/", 1)[1])
+                except ValueError:
+                    self._send_json(400, {"ok": False, "error": "bad id"})
+                    return
+                row = conn.execute("SELECT * FROM orders WHERE id=?",
+                                   (oid,)).fetchone()
+                if row is None:
+                    self._send_json(404, {"ok": False, "error": "no such order"})
+                    return
+                self._send_json(200, {"ok": True,
+                                      "order": self._order_dict(conn, row)})
+            elif path == "/api/scans":
+                rows = conn.execute(
+                    "SELECT id,created_at,url,email,grade,score,results_json"
+                    " FROM scans ORDER BY id DESC LIMIT 20").fetchall()
+                out = []
+                for r in rows:
+                    d = dict(r)
+                    d["results"] = json.loads(d.pop("results_json"))
+                    out.append(d)
+                self._send_json(200, {"ok": True, "scans": out})
+            else:
+                self._send_json(404, {"ok": False, "error": "not found"})
+        finally:
+            conn.close()
+
+    def _api_admin_post(self, path):
+        if not self._admin_ok():
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        parts = path.split("/")  # /api/orders/<id>/status
+        if len(parts) != 5 or parts[4] != "status":
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        try:
+            oid = int(parts[3])
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "bad id"})
+            return
+        data = self._read_json(4096) or {}
+        new_status = (data.get("status") or "").strip()
+        if new_status not in ORDER_STATUSES:
+            self._send_json(400, {"ok": False,
+                                  "error": f"status must be one of "
+                                           f"{ORDER_STATUSES}"})
+            return
+        conn = db_connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT * FROM orders WHERE id=?",
+                               (oid,)).fetchone()
+            if row is None:
+                self._send_json(404, {"ok": False, "error": "no such order"})
+                return
+            cur_status = row["status"]
+            if ORDER_STATUSES.index(new_status) <= \
+                    ORDER_STATUSES.index(cur_status):
+                self._send_json(400, {"ok": False,
+                                      "error": f"cannot move {cur_status} "
+                                               f"-> {new_status} (forward only)"})
+                return
+            with _db_lock:
+                conn.execute("UPDATE orders SET status=? WHERE id=?",
+                             (new_status, oid))
+                conn.commit()
+        finally:
+            conn.close()
+        log_event(oid, "STATUS_CHANGED", f"{cur_status} -> {new_status}")
+        self._send_json(200, {"ok": True, "id": oid, "status": new_status})
+
+    # -- /api/brief ---------------------------------------------------------------
+    def _api_brief(self):
+        ip = self._client_ip()
+        if not rate_ok("brief", ip):
+            log(f"brief rate-limited ip={ip}")
+            self._send_json(429, {"ok": False,
+                                  "error": "too many requests — please try again later"})
+            return
+        data = self._read_json(16384)
+        if data is None:
+            self._send_json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        # Honeypot: humans never see or fill this field. Pretend success so
+        # bots learn nothing; store nothing, send nothing.
+        if (data.get("company_website") or "").strip():
+            log(f"HONEYPOT hit on /api/brief from ip={ip} — discarded")
+            self._send_json(200, {"ok": True})
+            return
+        clean, errors = validate_brief(data)
+        if errors:
+            self._send_json(400, {"ok": False, "errors": errors})
+            return
+        amount = TIER_PRICES.get(clean["tier"], 0)
+        with _db_lock:
+            conn = db_connect()
+            cur = conn.execute(
+                "INSERT INTO orders(created_at,name,email,url,tier,notes,"
+                "amount,status) VALUES(?,?,?,?,?,?,?,'NEW')",
+                (utcnow(), clean["name"], clean["email"], clean["url"],
+                 clean["tier"], clean["notes"], amount))
+            order_id = cur.lastrowid
+            conn.commit()
+            conn.close()
+        log_event(order_id, "ORDER_CREATED",
+                  f"tier={clean['tier']} amount=${amount} url={clean['url']}")
+
+        alert_text = (
+            f"New audit brief #{order_id}\n"
+            f"Tier: {clean['tier']} (${amount})\n"
+            f"Name: {clean['name']}\n"
+            f"Work email: {clean['email']}\n"
+            f"App URL: {clean['url']}\n"
+            f"Notes: {clean['notes'] or '—'}\n"
+            f"Status: NEW (awaiting payment link / payment)")
+        alert_ok, alert_detail = send_resend(
+            CONTACT_EMAIL,
+            f"New brief: {clean['tier']} (${amount}) — {clean['url']}",
+            alert_text)
+        log_event(order_id, "ALERT_EMAIL_SENT" if alert_ok
+                  else "ALERT_EMAIL_FAILED", alert_detail)
+
+        confirm_text = (
+            f"Hi {clean['name']},\n\n"
+            f"Thanks — we've received your brief for a {clean['tier']} of "
+            f"{clean['url']}.\n\n"
+            "What happens next:\n"
+            "1. We review the scope of your app (usually within one business day).\n"
+            "2. We then email you a secure payment link. We have not charged "
+            "you anything.\n"
+            "3. Your audit starts as soon as the payment lands — the delivery "
+            "clock on the pricing page runs from payment, not from this brief.\n\n"
+            "If anything in the brief needs correcting, just reply to this "
+            "email.\n\n"
+            "— VibeFort\n"
+            "Security for what you shipped.")
+        confirm_ok, confirm_detail = send_resend(
+            clean["email"],
+            f"We received your brief — {clean['tier']}", confirm_text)
+        log_event(order_id, "CONFIRM_EMAIL_SENT" if confirm_ok
+                  else "CONFIRM_EMAIL_FAILED", confirm_detail)
+
+        # Telegram carries the delivery status of BOTH emails — failures are
+        # loud here, never silent.
+        tg_text = (
+            f"🛡 VibeFort: new brief #{order_id}\n"
+            f"Tier: {clean['tier']} (${amount})\nApp: {clean['url']}\n"
+            f"From: {clean['name']} <{clean['email']}>\n"
+            f"Alert email: {'SENT' if alert_ok else 'FAILED — ' + alert_detail}\n"
+            f"Client confirmation: {'SENT' if confirm_ok else 'FAILED — ' + confirm_detail}")
+        tg_ok, tg_detail = send_telegram(tg_text)
+        log_event(order_id, "TELEGRAM_SENT" if tg_ok else "TELEGRAM_FAILED",
+                  tg_detail)
+
+        if not tg_ok:
+            # Last-resort loud channel: email HQ about the Telegram failure
+            # (and restate the email results, in case those failed too).
+            fb_ok, fb_detail = send_resend(
+                CONTACT_EMAIL,
+                f"DELIVERY PROBLEM: Telegram alert failed for brief #{order_id}",
+                f"The Telegram alert for brief #{order_id} "
+                f"({clean['tier']}, {clean['url']}) FAILED: {tg_detail}\n"
+                f"Alert email: {'SENT' if alert_ok else 'FAILED — ' + alert_detail}\n"
+                f"Client confirmation: {'SENT' if confirm_ok else 'FAILED — ' + confirm_detail}\n"
+                f"The order IS stored in the register (id {order_id}).")
+            log_event(order_id, "FALLBACK_EMAIL_SENT" if fb_ok
+                      else "FALLBACK_EMAIL_FAILED", fb_detail)
+
+        with _db_lock:
+            conn = db_connect()
+            conn.execute("UPDATE orders SET alert_sent=?, confirm_sent=?, "
+                         "tg_sent=? WHERE id=?",
+                         (1 if alert_ok else 0, 1 if confirm_ok else 0,
+                          1 if tg_ok else 0, order_id))
+            conn.commit()
+            conn.close()
+        self._send_json(200, {"ok": True, "id": order_id})
+
+    # -- /api/scan ------------------------------------------------------------------
+    def _api_scan(self):
+        ip = self._client_ip()
+        if not rate_ok("scan", ip):
+            log(f"scan rate-limited ip={ip}")
+            self._send_json(429, {"ok": False,
+                                  "error": "too many scans — please try again later"})
+            return
+        data = self._read_json(8192)
+        if data is None:
+            self._send_json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        url = (data.get("url") or "").strip()
+        consent = data.get("consent")
+        email = (data.get("email") or "").strip()
+        if consent is not True:
+            self._send_json(400, {"ok": False,
+                                  "error": "consent confirmation is required"})
+            return
+        if not valid_url(url):
+            self._send_json(400, {"ok": False, "error": "invalid URL"})
+            return
+        if email and not EMAIL_RX.match(email):
+            self._send_json(400, {"ok": False, "error": "invalid email"})
+            return
+        host = urllib.parse.urlparse(url).hostname or ""
+        guard = _guard_public_target(host)
+        if guard:
+            self._send_json(400, {"ok": False,
+                                  "error": f"target refused: {guard}"})
+            return
+        log(f"scan started url={url} ip={ip}")
+        try:
+            findings, meta = run_surface_scan("https://" + host)
+        except Exception as e:
+            log(f"scan CRASHED for {url}: {e!r}")
+            self._send_json(502, {"ok": False,
+                                  "error": "scan could not be completed"})
+            return
+        findings.sort(key=lambda x: SEV_ORDER.get(x["severity"], 9))
+        grade, score = score_findings(findings)
+        results = {
+            "tool": "widecheck 1.1 (vibefort server port)",
+            "generated_at": utcnow(),
+            "note": "Automated surface evidence — findings receive an "
+                    "independent verification pass in paid audits.",
+            "targets": [meta],
+            "findings": findings,
+        }
+        with _db_lock:
+            conn = db_connect()
+            conn.execute(
+                "INSERT INTO scans(created_at,url,email,grade,score,"
+                "results_json) VALUES(?,?,?,?,?,?)",
+                (utcnow(), url, email, grade, score, json.dumps(results)))
+            conn.commit()
+            conn.close()
+        log(f"scan finished url={url} grade={grade} score={score} "
+            f"findings={len(findings)}")
+        self._send_json(200, {"ok": True, "grade": grade, "score": score,
+                              "findings": ui_findings(findings)})
+
+
+def main():
+    # Warm the DB so a bad path fails loudly at boot, not on first order.
+    conn = db_connect()
+    conn.close()
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    sys.stderr.write(f"vibefort server listening on :{PORT}, db={DB_PATH}\n")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()
