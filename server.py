@@ -35,7 +35,7 @@ DB_PATH = os.environ.get("VF_DB_PATH", "/data/vibefort.db")
 PORT = int(os.environ.get("PORT", "80"))
 CONTACT_EMAIL = "security@probcapital.com"
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
-MAIL_FROM = os.environ.get("MAIL_FROM", "VibeFort <audit@probcapital.com>")
+MAIL_FROM = os.environ.get("MAIL_FROM", "ShipAudit Lab <audit@probcapital.com>")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1004396317271")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
@@ -1462,7 +1462,7 @@ class Handler(BaseHTTPRequestHandler):
             "clock on the pricing page runs from payment, not from this brief.\n\n"
             "If anything in the brief needs correcting, just reply to this "
             "email.\n\n"
-            "— VibeFort\n"
+            "— ShipAudit Lab\n"
             "Security for what you shipped.")
         confirm_ok, confirm_detail = send_resend(
             clean["email"],
@@ -1473,7 +1473,7 @@ class Handler(BaseHTTPRequestHandler):
         # Telegram carries the delivery status of BOTH emails — failures are
         # loud here, never silent.
         tg_text = (
-            f"🛡 VibeFort: new brief #{order_id}\n"
+            f"🛡 ShipAudit Lab: new brief #{order_id}\n"
             f"Tier: {clean['tier']} (${amount})\nApp: {clean['url']}\n"
             f"From: {clean['name']} <{clean['email']}>\n"
             f"Alert email: {'SENT' if alert_ok else 'FAILED — ' + alert_detail}\n"

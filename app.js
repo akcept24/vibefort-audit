@@ -1,5 +1,5 @@
 // Site configuration. Run `node sync-config.js` after changing the contact address.
-const BRAND = 'VibeFort';
+const BRAND = 'ShipAudit Lab';
 const CONTACT_EMAIL = 'security@probcapital.com';
 const CHECKOUT_URLS = { 'Free scan': '#', 'Quick Audit': '#', 'Full Audit': '#', 'Deep Audit': '#', 'Monitoring': '#' };
 document.querySelectorAll('[data-brand]').forEach(el => el.textContent = BRAND);
