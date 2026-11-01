@@ -1485,11 +1485,11 @@ class Handler(BaseHTTPRequestHandler):
             f"Thanks — we've received your brief for a {clean['tier']} of "
             f"{clean['url']}.\n\n"
             "What happens next:\n"
-            "1. We review the scope of your app (usually within one business day).\n"
+            "1. We review the scope of your app (within one business day).\n"
             "2. We then email you a secure payment link. We have not charged "
             "you anything.\n"
             "3. Your audit starts as soon as the payment lands — the delivery "
-            "clock on the pricing page runs from payment, not from this brief.\n\n"
+            "clock in the pricing section of our site runs from payment, not from this brief.\n\n"
             "If anything in the brief needs correcting, just reply to this "
             "email.\n\n"
             "— ShipAudit Lab\n"
@@ -1706,7 +1706,7 @@ def _run_monitor(mon):
     results = {
         "tool": "widecheck 1.1 (shipauditlab server port)",
         "generated_at": utcnow(),
-        "note": "Monitoring rescan - automated surface evidence.",
+        "note": "Monitoring rescan - surface evidence.",
         "targets": [meta],
         "findings": findings,
     }
