@@ -11,12 +11,14 @@ Endpoints:
   POST /api/scan   {url, consent:true, email?}
        -> real gentle surface scan (widecheck port + bundle-secret and
           public-database probes), stores the lead, returns UI-shaped JSON.
+  GET/POST/DELETE /api/orders..., /api/scans (X-Admin-Token register)
 
 Stdlib only. Security headers replicate the old nginx.conf posture exactly
 on every response.
 """
 
 import datetime
+import ipaddress
 import json
 import os
 import re
@@ -110,6 +112,10 @@ def db_connect():
         url TEXT NOT NULL, email TEXT DEFAULT '',
         grade TEXT DEFAULT '', score INTEGER DEFAULT 0,
         results_json TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS rate_hits(
+        bucket TEXT NOT NULL, ip TEXT NOT NULL, ts REAL NOT NULL)""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_hits"
+                 " ON rate_hits(bucket, ip, ts)")
     return conn
 
 
@@ -187,13 +193,19 @@ def valid_url(value):
         return False
 
 
+def _s(value):
+    """String field or '' — JSON type confusion ({"url": 123}) must be a
+    validation failure, never a 500."""
+    return value.strip() if isinstance(value, str) else ""
+
+
 def validate_brief(data):
     errors = {}
-    name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip()
-    url = (data.get("url") or "").strip()
-    tier = (data.get("tier") or "").strip()
-    notes = (data.get("notes") or "").strip()
+    name = _s(data.get("name"))
+    email = _s(data.get("email"))
+    url = _s(data.get("url"))
+    tier = _s(data.get("tier"))
+    notes = _s(data.get("notes"))
     if not name or len(name) > 200:
         errors["name"] = "Enter your name."
     if not EMAIL_RX.match(email) or len(email) > 254:
@@ -242,39 +254,133 @@ def _throttle(host):
         _scan_last[host] = time.monotonic()
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+def _resolve_ips(host):
+    """Resolve host ONCE and return (ips, error).
+
+    When the SSRF guard is active, ANY non-public resolved address is an
+    error — the same semantics the old one-shot guard had. Callers connect
+    to one of the returned addresses (pinning), so the address that was
+    validated is the address that is used: there is no second resolution
+    for DNS-rebinding / TOCTOU to exploit."""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as e:
+        return None, f"host does not resolve: {e}"
+    ips = []
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if ip not in ips:
+            ips.append(ip)
+    if not ips:
+        return None, "host does not resolve: no addresses"
+    if os.environ.get("VF_ALLOW_PRIVATE_TARGETS") != "1":
+        for ip in ips:
+            if ip.is_private or ip.is_loopback or ip.is_link_local or \
+                    ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+                return None, f"target resolves to non-public address {ip}"
+    return ips, None
+
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+MAX_REDIRECTS = 3
+
+
+def _pinned_request(url, headers, method="GET"):
+    """A single HTTP(S) request whose TCP connection goes to an IP address
+    returned by _resolve_ips for the URL's host — never to a fresh DNS
+    answer. For HTTPS the TLS handshake still uses the original hostname
+    for SNI and certificate verification, so a pinned IP serving a wrong
+    certificate fails closed. Raises ValueError on guard refusal."""
+    u = urllib.parse.urlparse(url)
+    scheme = u.scheme.lower()
+    if scheme not in ("http", "https"):
+        raise ValueError(f"refused scheme: {scheme or '(none)'}")
+    host = u.hostname
+    if not host:
+        raise ValueError("URL has no host")
+    try:
+        port = u.port or (443 if scheme == "https" else 80)
+    except ValueError:
+        raise ValueError("bad port in URL")
+    ips, err = _resolve_ips(host)
+    if err:
+        raise ValueError(err)
+    ip = ips[0]
+    _throttle(u.netloc)
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
+    host_header = f"[{host}]" if ":" in host else host
+    if (scheme == "https" and port != 443) or \
+            (scheme == "http" and port != 80):
+        host_header += f":{port}"
+    hdrs = dict(headers)
+    hdrs["Host"] = host_header
+    family = socket.AF_INET6 if ip.version == 6 else socket.AF_INET
+    raw = socket.socket(family, socket.SOCK_STREAM)
+    raw.settimeout(REQ_TIMEOUT)
+    raw.connect((str(ip), port))
+    if scheme == "https":
+        ctx = ssl.create_default_context()
+        raw = ctx.wrap_socket(raw, server_hostname=host)
+        conn = http.client.HTTPSConnection(host, port, timeout=REQ_TIMEOUT)
+    else:
+        conn = http.client.HTTPConnection(host, port, timeout=REQ_TIMEOUT)
+    conn.sock = raw
+    try:
+        conn.request(method, path, headers=hdrs)
+        resp = conn.getresponse()
+        try:
+            body = resp.read(MAX_BODY)
+        except http.client.IncompleteRead as e:
+            body = e.partial or b""
+        return resp.status, {k.lower(): v for k, v in resp.getheaders()}, body
+    finally:
+        conn.close()
 
 
 def _fetch(url, headers=None, follow_redirects=True, method="GET"):
-    host = urllib.parse.urlparse(url).netloc
-    _throttle(host)
+    """Scanner fetch with manual redirect handling: EVERY hop — including
+    redirect targets — is scheme-checked, resolved, guard-validated and
+    pinned by _pinned_request before any byte is requested. A redirect to
+    a non-public target yields an error result and NO content from that
+    target. Redirects are capped at MAX_REDIRECTS hops."""
     hdrs = {"User-Agent": SCAN_UA, "Accept": "*/*"}
     if headers:
         hdrs.update(headers)
-    req = urllib.request.Request(url, headers=hdrs, method=method)
-    opener = urllib.request.build_opener() if follow_redirects else \
-        urllib.request.build_opener(_NoRedirect)
-    out = {"url": url, "status": None, "headers": {}, "body": b"", "error": None}
-    try:
-        with opener.open(req, timeout=REQ_TIMEOUT) as resp:
-            out["status"] = resp.status
-            out["headers"] = {k.lower(): v for k, v in resp.headers.items()}
-            try:
-                out["body"] = resp.read(MAX_BODY)
-            except http.client.IncompleteRead as e:
-                out["body"] = e.partial or b""
-    except urllib.error.HTTPError as e:
-        out["status"] = e.code
+    out = {"url": url, "status": None, "headers": {}, "body": b"",
+           "error": None}
+    current = url
+    hops = 0
+    while True:
         try:
-            out["headers"] = {k.lower(): v for k, v in e.headers.items()}
-            out["body"] = e.read(MAX_BODY)
-        except Exception:
-            pass
-    except Exception as e:
-        out["error"] = f"{type(e).__name__}: {e}"
-    return out
+            status, rheaders, body = _pinned_request(
+                current, hdrs, method=method)
+        except ValueError as e:
+            # Guard refusal (incl. a redirect hop into non-public space):
+            # fail closed — report NOTHING from the chain, so no status,
+            # header or byte of any hop can leak into findings.
+            return {"url": url, "status": None, "headers": {}, "body": b"",
+                    "error": f"SSRF guard: {e}"}
+        except Exception as e:
+            out["error"] = f"{type(e).__name__}: {e}"
+            return out
+        out["status"] = status
+        out["headers"] = rheaders
+        out["body"] = body
+        if not follow_redirects or status not in _REDIRECT_STATUSES:
+            return out
+        loc = rheaders.get("location")
+        if not loc:
+            return out
+        hops += 1
+        if hops > MAX_REDIRECTS:
+            return {"url": url, "status": None, "headers": {}, "body": b"",
+                    "error": f"too many redirects (>{MAX_REDIRECTS})"}
+        current = urllib.parse.urljoin(current, loc)
 
 
 def _fetch_retry(url, **kw):
@@ -344,6 +450,11 @@ def _tls_info(host):
     proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
     sock = None
     if proxy:
+        # Sandbox-only path: the proxy resolves the name itself, so pinning
+        # is impossible here; still run the guard as defense in depth.
+        _, gerr = _resolve_ips(host)
+        if gerr:
+            raise OSError(gerr)
         u = urllib.parse.urlparse(proxy)
         sock = socket.create_connection((u.hostname, u.port or 8080),
                                         timeout=REQ_TIMEOUT)
@@ -365,7 +476,13 @@ def _tls_info(host):
             sock.close()
             raise OSError(f"proxy CONNECT failed: {resp[:80]!r}")
     else:
-        sock = socket.create_connection((host, 443), timeout=REQ_TIMEOUT)
+        # Direct path (production): connect to a guard-validated IP,
+        # pinned exactly like _pinned_request; SNI/cert still use `host`.
+        ips, gerr = _resolve_ips(host)
+        if gerr:
+            raise OSError(gerr)
+        sock = socket.create_connection((str(ips[0]), 443),
+                                        timeout=REQ_TIMEOUT)
     with ctx.wrap_socket(sock, server_hostname=host) as tls:
         version = tls.version()
         cert = tls.getpeercert()
@@ -405,22 +522,16 @@ def _sig(resp):
 
 
 def _guard_public_target(host):
-    """SSRF hygiene: refuse loopback / private / link-local targets.
+    """SSRF hygiene pre-check for /api/scan (fast path with a clear error
+    message). The fetch layer independently re-validates and PINS every
+    connection it makes — including every redirect hop — so this check is
+    advisory; enforcement lives in _resolve_ips/_pinned_request.
     VF_ALLOW_PRIVATE_TARGETS=1 disables the check (local development only;
     filtered sandbox resolvers map every name into 198.18.0.0/15)."""
     if os.environ.get("VF_ALLOW_PRIVATE_TARGETS") == "1":
         return None
-    try:
-        infos = socket.getaddrinfo(host, None)
-    except Exception as e:
-        return f"host does not resolve: {e}"
-    import ipaddress
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0])
-        if ip.is_private or ip.is_loopback or ip.is_link_local or \
-                ip.is_reserved or ip.is_multicast or ip.is_unspecified:
-            return f"target resolves to non-public address {ip}"
-    return None
+    _, err = _resolve_ips(host)
+    return err
 
 
 def run_surface_scan(base_url):
@@ -899,25 +1010,41 @@ def ui_findings(findings):
 
 
 # ---------------------------------------------------------------------------
-# Rate limiting (per-IP, in-memory sliding window)
+# Rate limiting (per-IP sliding window, DURABLE — counts live in the same
+# SQLite register as the orders, on the persistent volume)
+#
+# The previous implementation kept counters in process memory keyed on
+# X-Forwarded-For[0]. Both halves were wrong in production: the state died
+# with the process (and would split across any replicas), and XFF[0] is
+# client-controlled — GLM's pass showed requests carrying one fixed XFF
+# being keyed by a different, rotating address on every hit, so the limit
+# never accumulated. Counts are now stored in SQLite (survive restarts,
+# shared by every thread/process using this register), and the bucket key
+# comes from _client_ip(), which trusts only the hop Traefik appended.
 # ---------------------------------------------------------------------------
-_rate_hits = {}
-_rate_lock = threading.Lock()
 RATE_LIMITS = {"brief": (5, 600), "scan": (3, 600)}  # (max hits, window sec)
 
 
 def rate_ok(bucket, ip):
     limit, window = RATE_LIMITS[bucket]
     now = time.time()
-    with _rate_lock:
-        hits = [t for t in _rate_hits.get((bucket, ip), [])
-                if now - t < window]
-        if len(hits) >= limit:
-            _rate_hits[(bucket, ip)] = hits
-            return False
-        hits.append(now)
-        _rate_hits[(bucket, ip)] = hits
-        return True
+    with _db_lock:
+        conn = db_connect()
+        try:
+            conn.execute("DELETE FROM rate_hits WHERE ts < ?",
+                         (now - 3600.0,))
+            count = conn.execute(
+                "SELECT COUNT(*) FROM rate_hits WHERE bucket=? AND ip=?"
+                " AND ts > ?", (bucket, ip, now - window)).fetchone()[0]
+            if count >= limit:
+                conn.commit()
+                return False
+            conn.execute("INSERT INTO rate_hits(bucket, ip, ts)"
+                         " VALUES(?,?,?)", (bucket, ip, now))
+            conn.commit()
+            return True
+        finally:
+            conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -940,10 +1067,68 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _client_ip(self):
+        """Bucket key for rate limiting and logs.
+
+        The app is reachable ONLY through Coolify's Traefik (the container
+        port is not published), and Traefik APPENDS the address it directly
+        observed to X-Forwarded-For. The LAST parseable XFF entry is
+        therefore the trustworthy hop; every earlier entry is
+        client-supplied and spoofable, so it is never used as a key.
+        Without XFF (direct/local access) the TCP peer is the key."""
         xff = self.headers.get("X-Forwarded-For") or ""
-        if xff:
-            return xff.split(",")[0].strip()
+        for cand in reversed([p.strip() for p in xff.split(",")] ):
+            if not cand:
+                continue
+            try:
+                ipaddress.ip_address(cand)
+                return cand
+            except ValueError:
+                continue
         return self.client_address[0]
+
+    # Hard cap for up-front body reads: every body this API legitimately
+    # accepts is <= 16 KB. Anything larger is refused AND the connection
+    # is closed after the response, so unread bytes can never be mistaken
+    # for the next request on a pooled keep-alive connection.
+    _BODY_HARD_CAP = 262144
+
+    def _take_body(self):
+        """Read the request body exactly once, before routing.
+
+        This is the desync fix: previously, early exits (unknown path 404,
+        failed admin-token 404, rate-limit 429, oversize 400) responded
+        WITHOUT reading the body, leaving its bytes in the socket; the
+        next request Traefik pooled onto that connection was then parsed
+        out of the leftover body and answered with a bare 400. Now the
+        body is always consumed up front — or, when it cannot be framed
+        safely (chunked encoding, bogus or absurd Content-Length), the
+        connection is marked for closure after the response."""
+        self._raw_body = b""
+        te = (self.headers.get("Transfer-Encoding") or "").lower()
+        if "chunked" in te:
+            self.close_connection = True
+            return
+        raw_len = self.headers.get("Content-Length")
+        if raw_len is None:
+            return
+        try:
+            length = int(raw_len)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length <= 0:
+            return
+        if length > self._BODY_HARD_CAP:
+            self.close_connection = True
+            return
+        try:
+            self._raw_body = self.rfile.read(length) or b""
+        except Exception:
+            self._raw_body = b""
+            self.close_connection = True
+            return
+        if len(self._raw_body) < length:
+            self.close_connection = True
 
     def _send(self, code, body, content_type):
         if isinstance(body, str):
@@ -953,6 +1138,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header(k, v)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if self.close_connection:
+            self.send_header("Connection", "close")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(body)
@@ -961,16 +1148,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, json.dumps(obj), "application/json")
 
     def _read_json(self, max_bytes=65536):
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            length = 0
-        if length <= 0 or length > max_bytes:
+        """Parse the body buffered by _take_body. Returns a dict or None:
+        non-object JSON (list, number, string) is invalid here too —
+        previously it reached .get() and produced a 500."""
+        raw = getattr(self, "_raw_body", b"")
+        if not raw or len(raw) > max_bytes:
             return None
         try:
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            data = json.loads(raw.decode("utf-8"))
         except Exception:
             return None
+        return data if isinstance(data, dict) else None
 
     def _admin_ok(self):
         if not ADMIN_TOKEN:
@@ -982,6 +1170,7 @@ class Handler(BaseHTTPRequestHandler):
     # -- routing ---------------------------------------------------------------
     def do_GET(self):
         try:
+            self._take_body()
             path = urllib.parse.urlparse(self.path).path
             if path.startswith("/api/"):
                 self._api_admin_get(path)
@@ -998,12 +1187,14 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_HEAD(self):
         try:
+            self._take_body()
             self._route()
         except Exception as e:
             log(f"unhandled HEAD error: {e!r}")
 
     def do_POST(self):
         try:
+            self._take_body()
             path = urllib.parse.urlparse(self.path).path
             if path == "/api/brief":
                 self._api_brief()
@@ -1017,6 +1208,24 @@ class Handler(BaseHTTPRequestHandler):
             pass
         except Exception as e:
             log(f"unhandled POST error: {e!r}")
+            try:
+                self._send_json(500, {"ok": False, "error": "internal error"})
+            except Exception:
+                pass
+
+    def do_DELETE(self):
+        try:
+            self._take_body()
+            path = urllib.parse.urlparse(self.path).path
+            if path.startswith("/api/orders/") or \
+                    path.startswith("/api/scans/"):
+                self._api_admin_delete(path)
+            else:
+                self._send_json(404, {"ok": False, "error": "not found"})
+        except BrokenPipeError:
+            pass
+        except Exception as e:
+            log(f"unhandled DELETE error: {e!r}")
             try:
                 self._send_json(500, {"ok": False, "error": "internal error"})
             except Exception:
@@ -1114,7 +1323,7 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"ok": False, "error": "bad id"})
             return
         data = self._read_json(4096) or {}
-        new_status = (data.get("status") or "").strip()
+        new_status = _s(data.get("status"))
         if new_status not in ORDER_STATUSES:
             self._send_json(400, {"ok": False,
                                   "error": f"status must be one of "
@@ -1144,6 +1353,50 @@ class Handler(BaseHTTPRequestHandler):
         log_event(oid, "STATUS_CHANGED", f"{cur_status} -> {new_status}")
         self._send_json(200, {"ok": True, "id": oid, "status": new_status})
 
+    def _api_admin_delete(self, path):
+        """Operator register hygiene: remove one order (with its events)
+        or one scan. Same token model as the rest of the admin API —
+        without the token this endpoint does not exist (404)."""
+        if not self._admin_ok():
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        parts = path.split("/")  # /api/(orders|scans)/<id>
+        if len(parts) != 4:
+            self._send_json(404, {"ok": False, "error": "not found"})
+            return
+        kind = parts[2]
+        try:
+            oid = int(parts[3])
+        except ValueError:
+            self._send_json(400, {"ok": False, "error": "bad id"})
+            return
+        with _db_lock:
+            conn = db_connect()
+            try:
+                if kind == "orders":
+                    cur = conn.execute("DELETE FROM orders WHERE id=?",
+                                       (oid,))
+                    if cur.rowcount:
+                        conn.execute(
+                            "DELETE FROM events WHERE order_id=?", (oid,))
+                elif kind == "scans":
+                    cur = conn.execute("DELETE FROM scans WHERE id=?",
+                                       (oid,))
+                else:
+                    self._send_json(404, {"ok": False,
+                                          "error": "not found"})
+                    return
+                conn.commit()
+                deleted = cur.rowcount
+            finally:
+                conn.close()
+        if not deleted:
+            self._send_json(404, {"ok": False,
+                                  "error": f"no such {kind[:-1]}"})
+            return
+        log(f"admin deleted {kind[:-1]} id={oid}")
+        self._send_json(200, {"ok": True, "deleted": oid})
+
     # -- /api/brief ---------------------------------------------------------------
     def _api_brief(self):
         ip = self._client_ip()
@@ -1158,7 +1411,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         # Honeypot: humans never see or fill this field. Pretend success so
         # bots learn nothing; store nothing, send nothing.
-        if (data.get("company_website") or "").strip():
+        hp = data.get("company_website")
+        if (isinstance(hp, str) and hp.strip()) or \
+                (hp and not isinstance(hp, str)):
             log(f"HONEYPOT hit on /api/brief from ip={ip} — discarded")
             self._send_json(200, {"ok": True})
             return
@@ -1263,9 +1518,9 @@ class Handler(BaseHTTPRequestHandler):
         if data is None:
             self._send_json(400, {"ok": False, "error": "invalid JSON body"})
             return
-        url = (data.get("url") or "").strip()
+        url = _s(data.get("url"))
         consent = data.get("consent")
-        email = (data.get("email") or "").strip()
+        email = _s(data.get("email"))
         if consent is not True:
             self._send_json(400, {"ok": False,
                                   "error": "consent confirmation is required"})
