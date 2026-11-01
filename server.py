@@ -1651,6 +1651,32 @@ def _fmt_changes(items):
     return "\n".join(lines)
 
 
+def _scan_with_timeout(target, timeout=None):
+    """run_surface_scan with a hard wall-clock bound. The scan's own
+    per-request timeouts do not cover every socket path (resolver
+    stalls, a TLS handshake that never completes); an unbounded call
+    would wedge the weekly scheduler thread forever on one bad target.
+    A stuck worker leaks one daemon thread; the loop lives."""
+    if timeout is None:
+        timeout = int(os.environ.get("VF_MONITOR_SCAN_TIMEOUT", "600"))
+    box = {}
+
+    def _work():
+        try:
+            box["r"] = run_surface_scan(target)
+        except Exception as e:
+            box["e"] = e
+
+    th = threading.Thread(target=_work, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        raise TimeoutError(f"scan of {target} exceeded {timeout}s")
+    if "e" in box:
+        raise box["e"]
+    return box["r"]
+
+
 def _run_monitor(mon):
     order_id = mon["order_id"]
     host = urllib.parse.urlparse(mon["url"]).hostname or ""
@@ -1663,7 +1689,7 @@ def _run_monitor(mon):
         return
     try:
         with _monitor_scan_lock:
-            findings, meta = run_surface_scan("https://" + host)
+            findings, meta = _scan_with_timeout("https://" + host)
     except Exception as e:
         log_event(order_id, "MONITOR_ERROR", f"scan crashed: {e!r}")
         send_telegram(f"ShipAudit Lab: monitoring rescan of {mon['url']} "
