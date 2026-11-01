@@ -121,6 +121,16 @@ def db_connect():
         bucket TEXT NOT NULL, ip TEXT NOT NULL, ts REAL NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_hits"
                  " ON rate_hits(bucket, ip, ts)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS monitors(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER UNIQUE NOT NULL,
+        url TEXT NOT NULL, email TEXT NOT NULL, name TEXT DEFAULT '',
+        created_at TEXT NOT NULL,
+        next_run_at REAL NOT NULL,
+        last_run_at REAL DEFAULT 0,
+        last_scan_id INTEGER,
+        last_digest TEXT,
+        active INTEGER NOT NULL DEFAULT 1)""")
     return conn
 
 
@@ -1283,7 +1293,13 @@ class Handler(BaseHTTPRequestHandler):
         conn = db_connect()
         conn.row_factory = sqlite3.Row
         try:
-            if path == "/api/orders":
+            if path == "/api/monitors":
+                rows = conn.execute(
+                    "SELECT * FROM monitors ORDER BY id DESC LIMIT 100"
+                ).fetchall()
+                self._send_json(200, {"ok": True,
+                                      "monitors": [dict(r) for r in rows]})
+            elif path == "/api/orders":
                 rows = conn.execute(
                     "SELECT * FROM orders ORDER BY id DESC LIMIT 100"
                 ).fetchall()
@@ -1359,6 +1375,8 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
         log_event(oid, "STATUS_CHANGED", f"{cur_status} -> {new_status}")
+        if new_status == "PAID" and row["tier"] == "Monitoring":
+            activate_monitor(dict(row))
         self._send_json(200, {"ok": True, "id": oid, "status": new_status})
 
     def _api_admin_delete(self, path):
@@ -1387,6 +1405,8 @@ class Handler(BaseHTTPRequestHandler):
                     if cur.rowcount:
                         conn.execute(
                             "DELETE FROM events WHERE order_id=?", (oid,))
+                        conn.execute(
+                            "DELETE FROM monitors WHERE order_id=?", (oid,))
                 elif kind == "scans":
                     cur = conn.execute("DELETE FROM scans WHERE id=?",
                                        (oid,))
@@ -1580,10 +1600,182 @@ class Handler(BaseHTTPRequestHandler):
                               "findings": ui_findings(findings)})
 
 
+# ---------------------------------------------------------------------------
+# Monitoring — the $79/mo tier's machinery: a weekly rescan per PAID
+# Monitoring order, a stored baseline digest, and a client alert when
+# the finding set changes. Activation happens in _api_admin_post when a
+# Monitoring order reaches PAID. The baseline scan runs on the first
+# tick and never emails the client — it is the reference point.
+# ---------------------------------------------------------------------------
+MONITOR_INTERVAL = 7 * 86400
+MONITOR_TICK = int(os.environ.get("VF_MONITOR_TICK", "600"))
+_monitor_scan_lock = threading.Lock()
+
+
+def activate_monitor(order):
+    with _db_lock:
+        conn = db_connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO monitors(order_id,url,email,name,"
+            "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
+            (order["id"], order["url"], order["email"], order["name"],
+             utcnow(), time.time()))
+        conn.commit()
+        conn.close()
+    log_event(order["id"], "MONITOR_ACTIVATED",
+              "weekly rescan scheduled; baseline due on next tick")
+
+
+def _monitor_reschedule(monitor_id, when):
+    with _db_lock:
+        conn = db_connect()
+        conn.execute("UPDATE monitors SET next_run_at=? WHERE id=?",
+                     (when, monitor_id))
+        conn.commit()
+        conn.close()
+
+
+def _finding_key(f):
+    return f"{(f.get('severity') or '').upper()}|{f.get('title') or ''}"
+
+
+def _fmt_changes(items):
+    if not items:
+        return "  - none"
+    lines = []
+    for it in items[:15]:
+        sev, _, title = it.partition("|")
+        lines.append(f"  - [{sev}] {title}")
+    if len(items) > 15:
+        lines.append(f"  - ... and {len(items) - 15} more")
+    return "\n".join(lines)
+
+
+def _run_monitor(mon):
+    order_id = mon["order_id"]
+    host = urllib.parse.urlparse(mon["url"]).hostname or ""
+    guard = _guard_public_target(host)
+    if guard:
+        log_event(order_id, "MONITOR_ERROR", f"target refused: {guard}")
+        send_telegram(f"ShipAudit Lab: monitoring rescan of {mon['url']} "
+                      f"refused by the SSRF guard ({guard}); retry in 24h.")
+        _monitor_reschedule(mon["id"], time.time() + 86400)
+        return
+    try:
+        with _monitor_scan_lock:
+            findings, meta = run_surface_scan("https://" + host)
+    except Exception as e:
+        log_event(order_id, "MONITOR_ERROR", f"scan crashed: {e!r}")
+        send_telegram(f"ShipAudit Lab: monitoring rescan of {mon['url']} "
+                      f"CRASHED ({e!r}); retry in 24h.")
+        _monitor_reschedule(mon["id"], time.time() + 86400)
+        return
+    if meta.get("errors") and not findings:
+        log_event(order_id, "MONITOR_ERROR",
+                  f"scan returned errors only: {meta.get('errors')}")
+        _monitor_reschedule(mon["id"], time.time() + 86400)
+        return
+    findings.sort(key=lambda x: SEV_ORDER.get(x["severity"], 9))
+    grade, score = score_findings(findings)
+    results = {
+        "tool": "widecheck 1.1 (shipauditlab server port)",
+        "generated_at": utcnow(),
+        "note": "Monitoring rescan - automated surface evidence.",
+        "targets": [meta],
+        "findings": findings,
+    }
+    with _db_lock:
+        conn = db_connect()
+        cur = conn.execute(
+            "INSERT INTO scans(created_at,url,email,grade,score,"
+            "results_json) VALUES(?,?,?,?,?,?)",
+            (utcnow(), mon["url"], mon["email"], grade, score,
+             json.dumps(results)))
+        scan_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+    digest = sorted({_finding_key(f) for f in findings})
+    prev = None
+    if mon.get("last_digest"):
+        try:
+            prev = json.loads(mon["last_digest"])
+        except Exception:
+            prev = None
+    now = time.time()
+    with _db_lock:
+        conn = db_connect()
+        conn.execute(
+            "UPDATE monitors SET last_run_at=?, last_scan_id=?, "
+            "last_digest=?, next_run_at=? WHERE id=?",
+            (now, scan_id, json.dumps(digest), now + MONITOR_INTERVAL,
+             mon["id"]))
+        conn.commit()
+        conn.close()
+    if prev is None:
+        log_event(order_id, "MONITOR_BASELINE",
+                  f"grade={grade} score={score} findings={len(digest)}")
+        send_telegram(
+            f"ShipAudit Lab: monitoring baseline set for {mon['url']} - "
+            f"grade {grade} ({score}), {len(digest)} findings. "
+            "Weekly rescans from here.")
+        return
+    new = [d for d in digest if d not in prev]
+    gone = [d for d in prev if d not in digest]
+    if not new and not gone:
+        log_event(order_id, "MONITOR_RESCAN",
+                  f"no changes; grade={grade} score={score}")
+        return
+    log_event(order_id, "MONITOR_CHANGED",
+              f"new={len(new)} resolved={len(gone)} "
+              f"grade={grade} score={score}")
+    body = (
+        f"Hi {mon['name']},\n\n"
+        f"Our weekly rescan of {mon['url']} found changes since the "
+        f"previous scan.\n\n"
+        f"Current grade: {grade} ({score}/100)\n\n"
+        f"New findings ({len(new)}):\n{_fmt_changes(new)}\n\n"
+        f"Resolved since the last scan ({len(gone)}):\n"
+        f"{_fmt_changes(gone)}\n\n"
+        "Reply to this email if you would like the full updated "
+        "report.\n\n"
+        "- ShipAudit Lab\n"
+        "Security for what you shipped.")
+    ok, detail = send_resend(
+        mon["email"], f"Monitoring: changes detected on {host}", body)
+    log_event(order_id,
+              "MONITOR_ALERT_SENT" if ok else "MONITOR_ALERT_FAILED",
+              detail)
+    send_telegram(
+        f"ShipAudit Lab: monitoring changes on {mon['url']} - "
+        f"{len(new)} new, {len(gone)} resolved; grade {grade} ({score}). "
+        f"Client alert: {'SENT' if ok else 'FAILED - ' + detail}")
+
+
+def _monitor_loop():
+    while True:
+        try:
+            with _db_lock:
+                conn = db_connect()
+                conn.row_factory = sqlite3.Row
+                due = conn.execute(
+                    "SELECT * FROM monitors WHERE active=1 "
+                    "AND next_run_at<=? ORDER BY next_run_at",
+                    (time.time(),)).fetchall()
+                conn.close()
+            for mon in due:
+                _run_monitor(dict(mon))
+        except Exception as e:
+            log(f"monitor loop error: {e!r}")
+        time.sleep(MONITOR_TICK)
+
+
 def main():
     # Warm the DB so a bad path fails loudly at boot, not on first order.
     conn = db_connect()
     conn.close()
+    if os.environ.get("VF_MONITORING", "1") != "0":
+        threading.Thread(target=_monitor_loop, daemon=True,
+                         name="monitor-loop").start()
     server = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     sys.stderr.write(f"vibefort server listening on :{PORT}, db={DB_PATH}\n")
     server.serve_forever()
