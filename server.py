@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("VF_DB_PATH", "/data/vibefort.db")
 PORT = int(os.environ.get("PORT", "80"))
-CONTACT_EMAIL = "security@probcapital.com"
+ALERT_EMAIL = "security@probcapital.com"  # internal HQ alert inbox (not public)
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 MAIL_FROM = os.environ.get("MAIL_FROM", "ShipAudit Lab <audit@probcapital.com>")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -1474,7 +1474,7 @@ class Handler(BaseHTTPRequestHandler):
             f"Notes: {clean['notes'] or '—'}\n"
             f"Status: NEW (awaiting payment link / payment)")
         alert_ok, alert_detail = send_resend(
-            CONTACT_EMAIL,
+            ALERT_EMAIL,
             f"New brief: {clean['tier']} ({amount_label}) — {clean['url']}",
             alert_text)
         log_event(order_id, "ALERT_EMAIL_SENT" if alert_ok
@@ -1516,7 +1516,7 @@ class Handler(BaseHTTPRequestHandler):
             # Last-resort loud channel: email HQ about the Telegram failure
             # (and restate the email results, in case those failed too).
             fb_ok, fb_detail = send_resend(
-                CONTACT_EMAIL,
+                ALERT_EMAIL,
                 f"DELIVERY PROBLEM: Telegram alert failed for brief #{order_id}",
                 f"The Telegram alert for brief #{order_id} "
                 f"({clean['tier']}, {clean['url']}) FAILED: {tg_detail}\n"
