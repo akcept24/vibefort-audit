@@ -39,8 +39,8 @@ MAIL_FROM = os.environ.get("MAIL_FROM", "ShipAudit Lab <audit@probcapital.com>")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "-1004396317271")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
-TIER_PRICES = {"Free scan": 0, "Quick Audit": 299, "Full Audit": 899,
-               "Deep Audit": 2999, "Monitoring": 79}
+TIER_PRICES = {"Free scan": 0, "Deep Scan": 29, "Quick Audit": 299,
+               "Full Audit": 899, "Deep Audit": 2999, "Monitoring": 79}
 ORDER_STATUSES = ["NEW", "PAID", "IN_PROGRESS", "VERIFYING", "DELIVERED",
                   "RETEST"]
 
@@ -77,7 +77,7 @@ STATIC_FILES = {
     "/sitemap.xml": ("sitemap.xml", "application/xml"),
 }
 
-TIERS = ["Free scan", "Quick Audit", "Full Audit", "Deep Audit", "Monitoring"]
+TIERS = ["Free scan", "Deep Scan", "Quick Audit", "Full Audit", "Deep Audit", "Monitoring"]
 EMAIL_RX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
 
 # ---------------------------------------------------------------------------

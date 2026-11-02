@@ -1,7 +1,7 @@
 // Site configuration.
 const BRAND = 'ShipAudit Lab';
 const CONTACT_EMAIL = 'security@probcapital.com';
-const CHECKOUT_URLS = { 'Free scan': '#', 'Quick Audit': '#', 'Full Audit': '#', 'Deep Audit': '#', 'Monitoring': '#' };
+const CHECKOUT_URLS = { 'Free scan': '#', 'Deep Scan': '#', 'Quick Audit': '#', 'Full Audit': '#', 'Deep Audit': '#', 'Monitoring': '#' };
 document.querySelectorAll('[data-brand]').forEach(el => el.textContent = BRAND);
 document.querySelectorAll('[data-contact]').forEach(el => { el.textContent = CONTACT_EMAIL; el.href = `mailto:${CONTACT_EMAIL}`; });
 if (!document.title.includes(BRAND)) document.title = document.title + ' — ' + BRAND;
