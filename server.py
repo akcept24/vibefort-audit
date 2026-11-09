@@ -30,6 +30,8 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import email_template
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("VF_DB_PATH", "/data/vibefort.db")
 PORT = int(os.environ.get("PORT", "80"))
@@ -131,6 +133,13 @@ def db_connect():
         last_scan_id INTEGER,
         last_digest TEXT,
         active INTEGER NOT NULL DEFAULT 1)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS fulfilment_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER UNIQUE NOT NULL,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        created_at TEXT NOT NULL)""")
     return conn
 
 
@@ -155,12 +164,17 @@ def utcnow():
 # ---------------------------------------------------------------------------
 # Outbound notifications
 # ---------------------------------------------------------------------------
-def send_resend(to, subject, text):
-    """Returns (ok, detail). Never raises."""
+def send_resend(to, subject, text, html=None):
+    """Returns (ok, detail). Never raises. When html is given the
+    mail goes out multipart: the plain-text body is preserved
+    byte-for-byte and the branded HTML renders alongside it."""
     if not RESEND_API_KEY:
         return False, "RESEND_API_KEY not configured"
-    payload = json.dumps({"from": MAIL_FROM, "to": [to],
-                          "subject": subject, "text": text}).encode()
+    body = {"from": MAIL_FROM, "to": [to],
+            "subject": subject, "text": text}
+    if html:
+        body["html"] = html
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         "https://api.resend.com/emails", data=payload, method="POST",
         headers={"Authorization": f"Bearer {RESEND_API_KEY}",
@@ -1377,6 +1391,8 @@ class Handler(BaseHTTPRequestHandler):
         log_event(oid, "STATUS_CHANGED", f"{cur_status} -> {new_status}")
         if new_status == "PAID" and row["tier"] == "Monitoring":
             activate_monitor(dict(row))
+        if new_status == "PAID" and row["tier"] == "Deep Scan":
+            on_deep_scan_paid(dict(row))
         self._send_json(200, {"ok": True, "id": oid, "status": new_status})
 
     def _api_admin_delete(self, path):
@@ -1494,9 +1510,43 @@ class Handler(BaseHTTPRequestHandler):
             "email.\n\n"
             "— ShipAudit Lab\n"
             "Security for what you shipped.")
+        confirm_html = email_template.render_email(
+            eyebrow="Brief received",
+            headline="We've received your brief.",
+            body_html=(
+                email_template.para(f"Hi {clean['name']},")
+                + email_template.para(
+                    f"Thanks — we've received your brief for a "
+                    f"{clean['tier']} of {clean['url']}.")
+                + email_template.details_table([
+                    ("Reference", f"Brief #{order_id}"),
+                    ("Service", f"{clean['tier']} ({amount_label})"),
+                    ("Target", clean["url"]),
+                    ("Status", "Received — awaiting scope review"),
+                ])
+                + email_template.list_heading("What happens next")
+                + email_template.steps([
+                    ("Scope review.",
+                     "We review the scope of your app (within one "
+                     "business day)."),
+                    ("Payment link.",
+                     "We then email you a secure payment link. We "
+                     "have not charged you anything."),
+                    ("Audit starts at payment.",
+                     "Your audit starts as soon as the payment "
+                     "lands — the delivery clock in the pricing "
+                     "section of our site runs from payment, not "
+                     "from this brief."),
+                ])
+                + email_template.para(
+                    "If anything in the brief needs correcting, just "
+                    "reply to this email.")),
+            reason="You received this email because you submitted an "
+                   "audit brief at shipauditlab.com.")
         confirm_ok, confirm_detail = send_resend(
             clean["email"],
-            f"We received your brief — {clean['tier']}", confirm_text)
+            f"We received your brief — {clean['tier']}", confirm_text,
+            html=confirm_html)
         log_event(order_id, "CONFIRM_EMAIL_SENT" if confirm_ok
                   else "CONFIRM_EMAIL_FAILED", confirm_detail)
 
@@ -1601,6 +1651,48 @@ class Handler(BaseHTTPRequestHandler):
 
 
 # ---------------------------------------------------------------------------
+# Deep Scan fulfilment hook — the seam where payment confirmation plugs in.
+#
+# STRIPE SEAM (activation day): Stripe is not live yet, so no webhook
+# handler exists and nothing here calls Stripe. When it lands, the
+# webhook receiver will move the paid order NEW -> PAID through the same
+# admin transition used today (_api_admin_post), and this hook fires
+# unchanged. Do not grow Stripe-specific code in this function.
+#
+# What the hook does (and all it does): record a durable fulfilment
+# request carrying everything the delivery chain needs, log an order
+# event, and ping HQ on Telegram. The actual delivery — engine job,
+# client report, report email — lives on the engine side in
+# engine/engine/fulfil.py (`python3 -m engine.fulfil from-json <file>`),
+# which consumes exactly this payload shape:
+#   {"order_id", "tier", "name", "email", "url", "amount", "queued_at"}
+# A worker picks up rows with status='queued' and marks them done; the
+# transport between this register and the engine host is wired on
+# activation day (the payload is the contract, not the channel).
+# ---------------------------------------------------------------------------
+def on_deep_scan_paid(order):
+    payload = {"order_id": order["id"], "tier": order["tier"],
+               "name": order["name"], "email": order["email"],
+               "url": order["url"], "amount": order["amount"],
+               "queued_at": utcnow()}
+    with _db_lock:
+        conn = db_connect()
+        conn.execute(
+            "INSERT OR IGNORE INTO fulfilment_requests(order_id,kind,"
+            "payload,status,created_at) VALUES(?,?,?,?,?)",
+            (order["id"], "deep_scan", json.dumps(payload), "queued",
+             utcnow()))
+        conn.commit()
+        conn.close()
+    log_event(order["id"], "DEEPSCAN_QUEUED",
+              "fulfilment request recorded for the engine worker")
+    send_telegram(
+        f"ShipAudit Lab: Deep Scan order #{order['id']} is PAID — "
+        f"fulfilment queued for {order['url']} "
+        f"(client {order['email']}).")
+
+
+# ---------------------------------------------------------------------------
 # Monitoring — the $79/mo tier's machinery: a weekly rescan per PAID
 # Monitoring order, a stored baseline digest, and a client alert when
 # the finding set changes. Activation happens in _api_admin_post when a
@@ -1649,6 +1741,20 @@ def _fmt_changes(items):
     if len(items) > 15:
         lines.append(f"  - ... and {len(items) - 15} more")
     return "\n".join(lines)
+
+
+def _fmt_changes_html(items):
+    """HTML twin of _fmt_changes: same 15-item cap, same content,
+    rendered as a severity-chip list."""
+    pairs = []
+    for it in items[:15]:
+        sev, _, title = it.partition("|")
+        pairs.append((sev, title))
+    out = email_template.severity_list(pairs)
+    if len(items) > 15:
+        out += email_template.para(
+            f"…and {len(items) - 15} more — reply for the full list.")
+    return out
 
 
 def _scan_with_timeout(target, timeout=None):
@@ -1766,8 +1872,34 @@ def _run_monitor(mon):
         "report.\n\n"
         "- ShipAudit Lab\n"
         "Security for what you shipped.")
+    body_html = email_template.render_email(
+        eyebrow="Monitoring · Weekly rescan",
+        headline=f"Changes detected on {host}",
+        body_html=(
+            email_template.para(f"Hi {mon['name']},")
+            + email_template.para(
+                f"Our weekly rescan of {mon['url']} found changes "
+                f"since the previous scan.")
+            + email_template.grade_block(grade, score)
+            + email_template.details_table([
+                ("Target", mon["url"]),
+                ("Service", "Monitoring — weekly rescan"),
+                ("Reference", f"Order #{order_id}"),
+            ])
+            + email_template.list_heading(
+                f"New findings ({len(new)})")
+            + _fmt_changes_html(new)
+            + email_template.list_heading(
+                f"Resolved since the last scan ({len(gone)})")
+            + _fmt_changes_html(gone)
+            + email_template.para(
+                "Reply to this email if you would like the full "
+                "updated report.")),
+        reason="You received this email because Monitoring is active "
+               "for this app on your ShipAudit Lab account.")
     ok, detail = send_resend(
-        mon["email"], f"Monitoring: changes detected on {host}", body)
+        mon["email"], f"Monitoring: changes detected on {host}", body,
+        html=body_html)
     log_event(order_id,
               "MONITOR_ALERT_SENT" if ok else "MONITOR_ALERT_FAILED",
               detail)
