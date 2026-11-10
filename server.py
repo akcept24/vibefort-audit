@@ -370,6 +370,132 @@ def _send_status(result):
 _MAIL_IDEM = contextvars.ContextVar("vf_mail_idem", default=None)
 
 
+# Round 24 (Codex delta-22): the TOTAL wall-clock deadline
+# for a gated send. Round 23 stated a delete's wait for an
+# in-flight send as bounded by "the provider timeout
+# (20 s)" — but urllib's timeout caps each socket
+# operation, not the call: a provider dribbling its
+# response (every read prompt, the body minutes long) held
+# _db_lock far past 20 s. _gated_send therefore arms an
+# absolute deadline (this constant, seconds) in the
+# ContextVar below for the duration of the provider call,
+# and the two wrappers enforce it on their transport:
+# _send_urlopen shortens the per-operation timeout to
+# what is left of the deadline (and refuses to start once
+# it is spent), and _read_body_bounded reads the response
+# against the clock, cutting the read at the deadline.
+# The cut surfaces inside the wrappers as a transport
+# exception, so their own tri-state machinery classifies
+# it — "unknown" (the provider may have accepted the
+# message), exactly like a lost answer; the paid/monitor
+# idempotency semantics govern the retry. The deadline is
+# deliberately NOT a wrapper parameter (the _MAIL_IDEM
+# pattern above): the wrappers' signatures — and every
+# stub of them — are untouched, and a send outside
+# _gated_send (the unmatched-payment alert) arms no
+# deadline and behaves exactly as before.
+_GATED_SEND_DEADLINE = 30.0
+_SEND_DEADLINE_AT = contextvars.ContextVar(
+    "vf_send_deadline_at", default=None)
+
+
+def _send_deadline_remaining():
+    """Seconds left on the armed gated-send deadline, or
+    None when no deadline is armed."""
+    at = _SEND_DEADLINE_AT.get()
+    if at is None:
+        return None
+    return at - time.monotonic()
+
+
+def _send_urlopen(req):
+    """urlopen for the provider wrappers: the long-standing
+    20 s per-operation timeout, shortened to whatever is
+    left of the gated-send deadline when one is armed —
+    and a refusal to start once it is spent (the
+    TimeoutError lands in the wrappers' own exception arm
+    and classifies as "unknown")."""
+    remaining = _send_deadline_remaining()
+    if remaining is None:
+        return urllib.request.urlopen(req, timeout=20)
+    if remaining <= 0:
+        raise TimeoutError(
+            "gated send deadline already spent before the "
+            "provider call started")
+    return urllib.request.urlopen(
+        req, timeout=min(20, remaining))
+
+
+def _send_socket(stream):
+    """Best effort: the socket beneath a response stream
+    (the resp.fp.raw._sock chain and its wrappers), or
+    None. Scripted transports have none, and none is
+    needed there: their reads return promptly, so the
+    clock checks in _read_body_bounded are the whole
+    enforcement for them."""
+    obj = stream
+    for _ in range(6):
+        if obj is None:
+            return None
+        if callable(getattr(obj, "settimeout", None)):
+            return obj
+        nxt = None
+        for attr in ("fp", "raw", "_sock"):
+            nxt = getattr(obj, attr, None)
+            if nxt is not None:
+                break
+        if nxt is None or nxt is obj:
+            return None
+        obj = nxt
+    return None
+
+
+def _read_body_bounded(stream):
+    """Read a provider response body. With no gated-send
+    deadline armed this is exactly the long-standing
+    stream.read(). With a deadline armed the body is read
+    in slices against the clock — read1 (at most one
+    underlying read per slice, so the clock is consulted
+    between socket reads) with the socket's own timeout
+    tightened to the time remaining: a body still
+    dribbling when the deadline passes is CUT, and the
+    TimeoutError propagates into the calling wrapper's
+    exception arm, which classifies it "unknown". A
+    stream with no read1 (an in-memory or scripted body —
+    never a real socket) is read in one call, as before,
+    after the same spent-deadline refusal."""
+    if _SEND_DEADLINE_AT.get() is None:
+        return stream.read()
+    read1 = getattr(stream, "read1", None)
+    if not callable(read1):
+        if _send_deadline_remaining() <= 0:
+            raise TimeoutError(
+                "gated send deadline spent before the "
+                "provider response could be read")
+        return stream.read()
+    sock = _send_socket(stream)
+    chunks = []
+    while True:
+        remaining = _send_deadline_remaining()
+        if remaining is None:
+            chunks.append(stream.read())
+            break
+        if remaining <= 0:
+            raise TimeoutError(
+                "gated send deadline exceeded while "
+                "reading the provider response")
+        if sock is not None:
+            try:
+                sock.settimeout(remaining)
+            except Exception:
+                pass
+        chunk = read1(65536)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def send_resend(to, subject, text, html=None):
     """Returns an _SendOutcome (ok, detail, .status). Never
     raises. When html is given the mail goes out multipart: the
@@ -395,8 +521,10 @@ def send_resend(to, subject, text, html=None):
         "https://api.resend.com/emails", data=payload, method="POST",
         headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            rbody = json.loads(resp.read().decode("utf-8", "replace"))
+        with _send_urlopen(req) as resp:
+            rbody = json.loads(
+                _read_body_bounded(resp).decode(
+                    "utf-8", "replace"))
             # Round 19 (Codex delta-18 (a)): a 2xx is "delivered"
             # ONLY when the body carries the message id — that id
             # is the provider's receipt. A 2xx without one (an
@@ -417,7 +545,8 @@ def send_resend(to, subject, text, html=None):
                        f"{str(rbody)[:120]}", "unknown")
     except urllib.error.HTTPError as e:
         try:
-            detail = e.read().decode("utf-8", "replace")[:300]
+            detail = _read_body_bounded(e).decode(
+                "utf-8", "replace")[:300]
         except Exception:
             detail = ""
         status = "failed" if 400 <= e.code < 500 else "unknown"
@@ -444,8 +573,10 @@ def send_telegram(text):
         f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         data=data, method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read().decode("utf-8", "replace"))
+        with _send_urlopen(req) as resp:
+            body = json.loads(
+                _read_body_bounded(resp).decode(
+                    "utf-8", "replace"))
             # Round 19 (Codex delta-18 (a)): "delivered" requires
             # ok:true and "failed" requires ok:false (or a 4xx,
             # handled below). A 2xx whose body has no valid ok
@@ -468,7 +599,8 @@ def send_telegram(text):
         detail = ""
         ok_flag = None
         try:
-            raw = e.read().decode("utf-8", "replace")
+            raw = _read_body_bounded(e).decode(
+                "utf-8", "replace")
             parsed = json.loads(raw) if raw else {}
             ok_flag = parsed.get("ok")
             detail = str(parsed.get("description", "")) \
@@ -3680,14 +3812,27 @@ def _gated_send(order_id, send_fn, *args, **kwargs):
     or it waits until the provider call has returned (the
     send was legitimately inside its call when the deletion
     began — the accepted in-flight residual, now the only
-    residual). The delete's wait is bounded: both provider
-    wrappers time out at 20 s (send_resend, send_telegram).
-    Returns None when the gate aborts; otherwise the send
-    function's own result."""
+    residual). Round 24 (Codex delta-22): that wait is
+    bounded BY CONSTRUCTION, not by the wrappers'
+    per-operation timeout — _GATED_SEND_DEADLINE (30 s) is
+    armed below for the duration of the call and the
+    wrappers enforce it on their transport (see
+    _send_urlopen / _read_body_bounded beside _MAIL_IDEM):
+    a call still in flight when the deadline passes is cut
+    there, its outcome classified "unknown" by the
+    wrappers' own machinery, and this section exits —
+    releasing the lock, and with it the waiting delete, at
+    the deadline at the latest. Returns None when the gate
+    aborts; otherwise the send function's own result."""
     with _db_lock:
         if _order_dead(order_id):
             return None
-        return send_fn(*args, **kwargs)
+        _dl_tok = _SEND_DEADLINE_AT.set(
+            time.monotonic() + _GATED_SEND_DEADLINE)
+        try:
+            return send_fn(*args, **kwargs)
+        finally:
+            _SEND_DEADLINE_AT.reset(_dl_tok)
 
 
 def _log_event_alive(order_id, event, detail=""):

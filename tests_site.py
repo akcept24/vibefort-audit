@@ -2373,6 +2373,7 @@ check("N19 escalation: accept-lost -> treated as delivered, "
       len(esc18j) == 1
       and p18j["attempts"] == 4 and p18j.get("escalated") is True)
 
+
 _ureq18.urlopen = _real_urlopen18
 
 # ---- Round 19 catalog (added 2026-11-10, Codex delta-18
@@ -4283,6 +4284,177 @@ check("N67 (1): scan-crash arm — order deleted mid-scan: "
       [t for t in PROV22.tg_requests
        if "n67.example.com" in t] == []
       and count("events", "order_id=?", (o67,)) == 0)
+
+# ============================================================
+# Round 24 (Codex delta-22): THE TOTAL DEADLINE — round
+# 23's final semantics (point 5) bounded a delete's wait
+# for an in-flight gated send by "the provider timeout
+# (20 s)", but urllib's timeout caps each socket operation,
+# not the call: a provider dribbling its response body
+# (every read prompt, the whole minutes long) held _db_lock
+# — and with it a waiting delete — far past 20 s. The bound
+# is now true by construction: _gated_send arms a TOTAL
+# wall-clock deadline (_GATED_SEND_DEADLINE, 30 s in
+# production) for the provider call, and the genuine
+# wrappers enforce it on their transport — the response is
+# read against the deadline and the wrappers' own exception
+# arm classifies the cut as "unknown" (the provider may
+# have accepted the message; never a definite outcome).
+# The pins below patch the deadline constant the way the
+# catalog patches SR's other module state, and drive a
+# dribbling transport beneath the GENUINE send_resend: each
+# read1 returns promptly with a small slice (modelling
+# socket reads that each make progress well inside the
+# per-operation timeout), while the full body would take
+# ~5 s — far past the patched 2 s deadline.
+
+_BODY68 = json.dumps(
+    {"id": "mail-n68", "pad": "x" * 4000}).encode()
+
+
+class _DribbleResp68:
+    """A provider response that dribbles: every individual
+    read returns promptly with a small slice; the whole
+    body takes seconds. read(amt) composes read1 slices,
+    the way a real buffered response satisfies one large
+    read from many small socket reads."""
+
+    def __init__(self, body, chunk=64, delay=0.08):
+        self._body = body
+        self._pos = 0
+        self._chunk = chunk
+        self._delay = delay
+        self.started = threading.Event()
+
+    def read1(self, n=-1):
+        if self._pos >= len(self._body):
+            return b""
+        self.started.set()
+        time.sleep(self._delay)
+        take = min(self._chunk, len(self._body) - self._pos)
+        if n is not None and n >= 0:
+            take = min(take, n)
+        out = self._body[self._pos:self._pos + take]
+        self._pos += take
+        return out
+
+    def read(self, amt=-1):
+        out = b""
+        while amt is None or amt < 0 or len(out) < amt:
+            piece = self.read1(
+                65536 if amt is None or amt < 0
+                else amt - len(out))
+            if not piece:
+                break
+            out += piece
+        return out
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_drib68 = {"resp": None, "calls": 0}
+
+
+def _urlopen68(req, timeout=None):
+    assert "api.resend.com" in req.full_url, req.full_url
+    _drib68["calls"] += 1
+    _drib68["resp"] = _DribbleResp68(_BODY68)
+    return _drib68["resp"]
+
+
+_saved_open68 = _ureq18.urlopen
+_saved_deadline68 = getattr(SR, "_GATED_SEND_DEADLINE", None)
+SR._GATED_SEND_DEADLINE = 2.0
+_ureq18.urlopen = _urlopen68
+
+# N68 (1): the direct arm — a gated send whose provider
+#      dribbles past the total deadline returns at the
+#      deadline with an outcome _send_status classifies as
+#      UNKNOWN (the wrappers' own machinery: the cut is a
+#      transport exception, like a lost answer), never a
+#      definite outcome and never the delivered result the
+#      full dribble would have produced.
+o68a = mk_order("n68a@test.dev", "Deep Scan", 29,
+                status="PAID")
+_t068a = time.time()
+res68a = SR._gated_send(o68a, SR.send_resend,
+                        "n68a@test.dev",
+                        "Payment received — Deep Scan", "body")
+_el68a = time.time() - _t068a
+check("N68 (1): gated send cut at the TOTAL deadline — "
+      "classified unknown by the wrapper's own machinery, "
+      "returned at the deadline, not after the full dribble",
+      res68a is not None
+      and SR._send_status(res68a) == "unknown"
+      and _drib68["calls"] == 1
+      and 1.8 <= _el68a < 3.0)
+
+# N68 (2)+(3): the threaded arm — the receipt send dribbles
+#      inside its provider call (past the gate, holding
+#      _db_lock); an admin deletion attempted from another
+#      thread completes at the total deadline (it genuinely
+#      waited for the in-flight call, and was released by
+#      the deadline — not by the full ~5 s dribble); the
+#      receipt does not land; and afterwards no durable
+#      state is attributable to the interrupted send.
+o68 = mk_order("n68@test.dev", "Deep Scan", 29, status="PAID")
+row68 = row_of18(o68)
+_drib68["calls"] = 0
+_drib68["resp"] = None
+_box68 = {}
+
+
+def _drive68():
+    _box68["t0"] = time.time()
+    _box68["r"] = SR._ensure_paid_receipt(row68, 2900)
+
+
+th68 = threading.Thread(target=_drive68)
+th68.start()
+_deadline68 = time.time() + 10
+while _drib68["resp"] is None and time.time() < _deadline68:
+    time.sleep(0.01)
+if _drib68["resp"] is not None:
+    _drib68["resp"].started.wait(10)
+_del68 = {}
+
+
+def _delete68():
+    _del68["code"] = admin_delete22(o68)
+    _del68["done"] = time.time()
+
+
+dth68 = threading.Thread(target=_delete68)
+dth68.start()
+th68.join(20)
+dth68.join(20)
+_el_del68 = _del68.get("done", 0) - _box68.get("t0", 0)
+check("N68 (2): deletion attempted while the receipt send "
+      "dribbles inside its provider call completes at the "
+      "total deadline — not after the full dribble — and "
+      "the receipt does not land",
+      _del68.get("code") == 200
+      and 1.5 <= _el_del68 < 3.5
+      and _box68.get("r") is False
+      and _drib68["calls"] == 1)
+check("N68 (3): after the deadline cut and the deletion, "
+      "no state is attributable to the interrupted send: "
+      "tombstone present, no email_delivery row, no events",
+      tombstone_of22(o68)
+      and email_state19(f"receipt:{o68}") is None
+      and count("events", "order_id=?", (o68,)) == 0)
+_ureq18.urlopen = _saved_open68
+if _saved_deadline68 is None:
+    try:
+        del SR._GATED_SEND_DEADLINE
+    except AttributeError:
+        pass
+else:
+    SR._GATED_SEND_DEADLINE = _saved_deadline68
 
 _ureq18.urlopen = _real_urlopen18
 
