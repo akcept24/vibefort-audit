@@ -905,6 +905,287 @@ def main():
           and loop_end_s.get("how") == "KeyboardInterrupt"
           and not th_s.is_alive())
 
+    # ---- (t) GOVERNING, not vetoing: a clock that read
+    #           successfully and then DIES drops out of the
+    #           exit set — the other clock governs and the
+    #           wait ENDS on its accumulation. Monotonic
+    #           reads successfully twice (small elapsed),
+    #           then raises forever; the wall clock is
+    #           healthy, so the recovery wait must end after
+    #           ~the recovery interval by the wall clock and
+    #           a second pass must run. (On the round-5 loop
+    #           a once-live clock belonged to the exit set
+    #           FOREVER: its frozen elapsed vetoed exit and
+    #           the wait hung until the stop event — no
+    #           second pass inside the window. The window is
+    #           bounded and the stop event is set for
+    #           cleanup, so the prefix failure is a clean
+    #           FAIL, not a hung catalog.) The handler is
+    #           driven by a flaky stop event whose FIRST
+    #           wait() raises, as in (q).
+    dirT = os.path.join(tmp, "caseT")
+    os.makedirs(dirT)
+    cfgT = {"db_path": os.path.join(dirT, "site.db"),
+            "inbox_dir": os.path.join(dirT, "inbox"),
+            "ledger_path": os.path.join(dirT, "ledger.json"),
+            "poll_sec": 0.05}
+    real_export_once_t = exporter.export_once
+    real_monotonic_t = time.monotonic
+    pass_times_t = []
+    loop_end_t = {}
+
+    class FlakyEventT:
+        """A stop event whose first wait() raises; later
+        waits are real short waits on an inner event."""
+
+        def __init__(self):
+            self._inner = threading.Event()
+            self.wait_calls = 0
+
+        def is_set(self):
+            return self._inner.is_set()
+
+        def set(self):
+            self._inner.set()
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise RuntimeError("simulated interval-wait "
+                                   "failure")
+            return self._inner.wait(
+                min(timeout if timeout is not None else 0.05,
+                    0.05))
+
+    stop_t = FlakyEventT()
+    mono_calls_t = {"n": 0}
+
+    def dying_monotonic_t():
+        mono_calls_t["n"] += 1
+        if mono_calls_t["n"] <= 2:
+            return real_monotonic_t()
+        raise RuntimeError("simulated monotonic death")
+
+    def flaky_pass_t(db_path, inbox_dir, ledger_path):
+        pass_times_t.append(time.time())
+        if len(pass_times_t) == 1:
+            raise RuntimeError("simulated first-pass failure")
+        return {"exported": 0, "errors": 0}
+
+    def loop_thread_t():
+        try:
+            exporter.run_loop(cfgT, stop_t)
+            loop_end_t["how"] = "returned"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_t["how"] = f"other:{type(e).__name__}"
+
+    exporter.export_once = flaky_pass_t
+    time.monotonic = dying_monotonic_t
+    th_t = threading.Thread(target=loop_thread_t, daemon=True)
+    try:
+        th_t.start()
+        deadline_t = time.time() + 4
+        while len(pass_times_t) < 2 and time.time() < deadline_t:
+            time.sleep(0.02)
+        gap_t = (pass_times_t[1] - pass_times_t[0]
+                 if len(pass_times_t) >= 2 else 0.0)
+    finally:
+        stop_t.set()
+        th_t.join(timeout=5)
+        exporter.export_once = real_export_once_t
+        time.monotonic = real_monotonic_t
+    check("(t) a clock that reads successfully twice and "
+          "then dies drops out of the exit set (governing, "
+          "not vetoing): the recovery wait ends on the wall "
+          "clock's accumulation, a second pass runs with a "
+          "gap >= 0.8x the recovery interval, and run_loop "
+          "returns cleanly on stop",
+          len(pass_times_t) >= 2
+          and gap_t >= 0.8 * exporter.RECOVERY_SLEEP_SEC
+          and loop_end_t.get("how") == "returned"
+          and not th_t.is_alive())
+
+    # ---- (u) READING VALIDATION: a clock reading that is
+    #           not a number at all — monotonic returns a
+    #           STRING on its first read, valid values
+    #           afterwards — is treated as NO reading: it
+    #           cannot become a baseline and no arithmetic
+    #           is ever attempted on it. The wait completes
+    #           by the valid readings and the loop carries
+    #           on. (On the round-5 loop the string became
+    #           the clock's baseline and the NEXT read's
+    #           subtraction raised TypeError, escaping the
+    #           recovery handler and killing run_loop.)
+    dirU = os.path.join(tmp, "caseU")
+    os.makedirs(dirU)
+    cfgU = {"db_path": os.path.join(dirU, "site.db"),
+            "inbox_dir": os.path.join(dirU, "inbox"),
+            "ledger_path": os.path.join(dirU, "ledger.json"),
+            "poll_sec": 0.05}
+    real_export_once_u = exporter.export_once
+    real_monotonic_u = time.monotonic
+    pass_times_u = []
+    loop_end_u = {}
+
+    class FlakyEventU:
+        """A stop event whose first wait() raises; later
+        waits are real short waits on an inner event."""
+
+        def __init__(self):
+            self._inner = threading.Event()
+            self.wait_calls = 0
+
+        def is_set(self):
+            return self._inner.is_set()
+
+        def set(self):
+            self._inner.set()
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise RuntimeError("simulated interval-wait "
+                                   "failure")
+            return self._inner.wait(
+                min(timeout if timeout is not None else 0.05,
+                    0.05))
+
+    stop_u = FlakyEventU()
+    mono_calls_u = {"n": 0}
+
+    def stringy_monotonic_u():
+        mono_calls_u["n"] += 1
+        if mono_calls_u["n"] == 1:
+            return "not-a-number"
+        return real_monotonic_u()
+
+    def flaky_pass_u(db_path, inbox_dir, ledger_path):
+        pass_times_u.append(time.time())
+        if len(pass_times_u) == 1:
+            raise RuntimeError("simulated first-pass failure")
+        return {"exported": 0, "errors": 0}
+
+    def loop_thread_u():
+        try:
+            exporter.run_loop(cfgU, stop_u)
+            loop_end_u["how"] = "returned"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_u["how"] = f"other:{type(e).__name__}"
+
+    exporter.export_once = flaky_pass_u
+    time.monotonic = stringy_monotonic_u
+    th_u = threading.Thread(target=loop_thread_u, daemon=True)
+    try:
+        th_u.start()
+        deadline_u = time.time() + 6
+        while len(pass_times_u) < 2 and time.time() < deadline_u:
+            time.sleep(0.02)
+        gap_u = (pass_times_u[1] - pass_times_u[0]
+                 if len(pass_times_u) >= 2 else 0.0)
+    finally:
+        stop_u.set()
+        th_u.join(timeout=5)
+        exporter.export_once = real_export_once_u
+        time.monotonic = real_monotonic_u
+    check("(u) a non-numeric clock reading (a string) is "
+          "no reading at all: it never becomes a baseline, "
+          "no subtraction is attempted on it, the recovery "
+          "wait completes by the valid readings (gap >= "
+          "0.8x the recovery interval), and run_loop "
+          "returns cleanly on stop",
+          len(pass_times_u) >= 2
+          and gap_u >= 0.8 * exporter.RECOVERY_SLEEP_SEC
+          and loop_end_u.get("how") == "returned"
+          and not th_u.is_alive())
+
+    # ---- (v) the handler embeds only SANITIZED type
+    #           names: _describe must return an exact plain
+    #           str even when the exception's type name is a
+    #           hostile str SUBCLASS whose __format__ raises
+    #           (supplied by a hostile metaclass as the
+    #           class's __name__), and the loop must survive
+    #           such an exception raised by the interval
+    #           wait. (On the round-5 loop, _describe
+    #           returned the hostile subclass object itself
+    #           — isinstance passed — and the handler's
+    #           f-string raised on __format__ BEFORE the
+    #           never-raising log wrapper was reached,
+    #           killing run_loop on the first bad wait.)
+    class TrapNameV(str):
+        def __format__(self, format_spec=""):
+            raise RuntimeError("trapped __format__")
+
+    class TrapMetaV(type):
+        @property
+        def __name__(cls):
+            return TrapNameV("TrapErrorV")
+
+    class TrapErrorV(Exception, metaclass=TrapMetaV):
+        pass
+
+    # Unit arm: the label is an exact plain str and a
+    # handler-style log line builds without raising.
+    describe_ok_v = False
+    try:
+        label_v = exporter._describe(TrapErrorV())
+        line_v = (f"unexpected loop error ({label_v}); "
+                  f"continuing")
+        describe_ok_v = (type(label_v) is str
+                         and "TrapErrorV" in line_v)
+    except Exception:
+        describe_ok_v = False
+
+    dirV = os.path.join(tmp, "caseV")
+    os.makedirs(dirV)
+    cfgV = {"db_path": os.path.join(dirV, "site.db"),
+            "inbox_dir": os.path.join(dirV, "inbox"),
+            "ledger_path": os.path.join(dirV, "ledger.json"),
+            "poll_sec": 5}
+    real_export_once_v = exporter.export_once
+    real_sleep_v = time.sleep
+    pass_calls_v = {"n": 0}
+    loop_end_v = {}
+
+    def ok_pass_v(db_path, inbox_dir, ledger_path):
+        pass_calls_v["n"] += 1
+        return {"exported": 0, "errors": 0}
+
+    def fake_sleep_v(sec):
+        if sec > 0.2:
+            if pass_calls_v["n"] >= 2:
+                raise KeyboardInterrupt
+            raise TrapErrorV()
+        real_sleep_v(sec)
+
+    def loop_thread_v():
+        try:
+            exporter.run_loop(cfgV)
+            loop_end_v["how"] = "returned"
+        except KeyboardInterrupt:
+            loop_end_v["how"] = "KeyboardInterrupt"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_v["how"] = f"other:{type(e).__name__}"
+
+    exporter.export_once = ok_pass_v
+    time.sleep = fake_sleep_v
+    th_v = threading.Thread(target=loop_thread_v, daemon=True)
+    try:
+        th_v.start()
+        th_v.join(timeout=8)
+    finally:
+        exporter.export_once = real_export_once_v
+        time.sleep = real_sleep_v
+    check("(v) an exception whose type name is a hostile "
+          "str subclass with a trapped __format__ cannot "
+          "escape the handler: _describe returns an exact "
+          "plain str, the handler log line builds, the loop "
+          "completes a second pass, and exits only via "
+          "KeyboardInterrupt",
+          describe_ok_v
+          and pass_calls_v["n"] >= 2
+          and loop_end_v.get("how") == "KeyboardInterrupt"
+          and not th_v.is_alive())
+
     failed = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(failed)}/{len(PASS)} exporter checks pass")
     if failed:

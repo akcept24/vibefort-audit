@@ -67,32 +67,50 @@ so no value can make `time.sleep` overflow), and an
 outermost guard catches any other exception from an
 iteration (the pass, the interval wait, the backoff sleep).
 A failed iteration always waits out its recovery deadline:
-the handler's recovery wait is a DUAL-CLOCK deadline wait.
-Elapsed time is tracked on `time.monotonic` and `time.time`
-independently — every clock read is guarded, each clock's
-elapsed accumulates as a high-water mark — and the wait
-ends only when BOTH clocks have accumulated the full
-recovery interval. A forward jump of one clock therefore
-cannot end the wait early (the other clock has not
-accumulated); a backward jump only extends the wait; a
-clock that raises simply reports no new elapsed for that
-slice while the other governs, and a clock that has never
-read successfully does not block the exit. If neither
-clock can be read at all, the wait hangs — never spins,
-never dies — until the stop event or an interrupt
-intervenes. The wait keeps attempting small sleeps,
-swallowing their failures, so no failure of the sleep
-primitive itself can make the loop spin either. The
-handler never formats the exception it caught: its log
-lines carry only the exception's TYPE name, obtained
-through a guarded helper, so a broken `__repr__`/`__str__`
-on the exception cannot raise inside the handler before
-the log call is reached. Logging failures inside
-run_loop's own machinery cannot kill it either: startup
-sanitization runs inside the guarded structure, and every
-log call in run_loop's machinery goes through a
-never-raising wrapper. No failure count and no
-bad config value can terminate the exporter. The exporter never creates the inbox
+the handler's recovery wait is a DUAL-CLOCK deadline wait,
+with exactly these scoped semantics. Elapsed time is
+tracked on `time.monotonic` and `time.time` independently
+— every clock read is guarded, and readings are validated
+at the read boundary: only a finite, non-bool number is a
+reading (a raising clock, or a reading of any other shape —
+string, NaN, infinity — is no reading at all), so all
+arithmetic on readings only ever sees validated numbers.
+Each clock's elapsed accumulates as a high-water mark of
+displacement from its first successful reading. The wait
+is governed by the clocks whose LAST reading succeeded —
+the exit set: it ends when every clock in the exit set has
+accumulated the full recovery interval and the exit set is
+non-empty. (i) The wait is therefore never shorter than
+its duration as measured by any clock live at exit: a
+forward jump of one clock cannot end it while another
+live clock is short, and a backward jump only extends it
+(accumulated elapsed never decreases, and a revived clock
+resumes from its preserved baseline and high-water mark).
+(ii) A clock that stops reading drops out of the exit set
+and the other clock governs; if NO clock is live, the wait
+hangs — the safe direction — until a clock revives or the
+stop event fires. (iii) The wait keeps attempting small
+sleeps, swallowing their failures; if every sleep
+primitive fails while a clock remains healthy, the loop
+may busy-iterate INSIDE the bounded recovery window — the
+window is 1s against a poll cycle of at least 15s, so the
+worst-case duty cycle of such spinning is bounded by that
+ratio. Survival and the never-shorter property are the
+guaranteed claims; unconditional freedom from
+busy-iteration is NOT claimed. The handler never formats
+the exception it caught: its log lines carry only the
+exception's TYPE name, obtained through a guarded helper
+and sanitized into an exact plain string (round-tripped
+through bytes, so not even a str subclass with a trapped
+`__format__` can raise when the name is interpolated), so
+a broken `__repr__`/`__str__` — or a hostile type name —
+cannot raise inside the handler before the log call is
+reached. Logging failures inside run_loop's own machinery
+cannot kill it either: startup sanitization runs inside
+the guarded structure, and every log call in run_loop's
+machinery goes through a never-raising wrapper. No failure
+count and no bad config value can terminate the exporter.
+The exporter never creates the inbox
 directory (a missing mount must stay a visible, logged retry —
 not a silently created local folder).
 

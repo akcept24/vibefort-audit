@@ -92,53 +92,97 @@ def _describe(exc):
     defensively — never repr()/str()/format() of the instance
     itself, which a broken __repr__/__str__ could turn into a
     second raise inside the handler, before any never-raising
-    log wrapper is reached. Any failure yields the constant
-    "unknown". The result is a plain str, safe to interpolate
-    into a log line."""
+    log wrapper is reached. The name itself is SANITIZED
+    before it is returned: a hostile metaclass can supply a
+    str SUBCLASS whose __format__ raises, so merely holding
+    the name would leave the handler's interpolation able to
+    raise on it. The name is therefore round-tripped through
+    bytes — encode (guarded), then decode of the resulting
+    bytes, which yields an exact plain str — and the result
+    is returned only if its type is exactly str. Any failure
+    at any step yields the constant "unknown"."""
     try:
         name = type(exc).__name__
     except Exception:
         return "unknown"
-    return name if isinstance(name, str) else "unknown"
+    if not isinstance(name, str):
+        return "unknown"
+    try:
+        plain = name.encode("utf-8", "replace").decode(
+            "utf-8", "replace")
+    except Exception:
+        return "unknown"
+    return plain if type(plain) is str else "unknown"
 
 
 def _read_clock(fn):
-    """One guarded clock read: the reading, or None if the
-    clock raised. A raising clock simply reports no new
-    elapsed for that slice; the other clock governs."""
+    """One guarded clock read: a VALIDATED reading, or None.
+    A clock that raises reports no reading. A clock that
+    returns an unusable value also reports no reading:
+    readings are validated HERE, at the boundary — only a
+    non-bool int/float that is finite is a reading; anything
+    else (str, None, arbitrary objects, NaN, infinities) is
+    no reading at all. All arithmetic downstream (deltas,
+    comparisons) therefore only ever operates on validated
+    finite numbers and cannot raise on a reading's type."""
     try:
-        return fn()
+        value = fn()
     except Exception:
         return None
+    if isinstance(value, bool) \
+            or not isinstance(value, (int, float)):
+        return None
+    try:
+        finite = math.isfinite(value)
+    except Exception:
+        return None
+    return value if finite else None
 
 
 def _recovery_wait(stop_event=None):
     """The loop's rate guarantee for failed iterations: a
-    DUAL-CLOCK deadline wait. Elapsed time is tracked on TWO
-    clocks independently — time.monotonic and time.time —
-    each as a high-water mark over guarded reads, and the
-    wait ends only when BOTH clocks have accumulated at
-    least RECOVERY_SLEEP_SEC. Every clock read is guarded:
-    a clock that raises reports no new elapsed for that
-    slice and the other clock governs; a clock that has
-    never read successfully does not block the exit (the
-    other governs alone); if NEITHER clock ever reads, the
-    wait hangs — never spins, never dies — until the stop
-    event or a BaseException intervenes. All consequences
-    are in the safe direction: a forward jump of ONE clock
-    cannot end the wait early (the other clock has not
-    accumulated), and a backward jump only extends the wait
-    (a clock's accumulated elapsed never decreases). Small
-    sleep attempts pace the wait, and every failed attempt
-    is swallowed — a sleep that raises immediately on every
-    call cannot bypass the wait. Returns early only if
-    stop_event is set. BaseExceptions from a sleep attempt
-    (KeyboardInterrupt / SystemExit) still propagate."""
+    DUAL-CLOCK deadline wait, with exactly the semantics
+    BRIDGE.md states — no more, no less. Elapsed time is
+    tracked on TWO clocks independently — time.monotonic
+    and time.time — each as a high-water mark of
+    displacement from its first successful reading, over
+    guarded, validated reads (see _read_clock: a raising
+    clock, or a reading that is not a finite non-bool
+    number, is no reading at all, and all arithmetic here
+    only ever sees validated numbers).
+
+    GOVERNING RULE: a clock belongs to the exit set only
+    while its LAST reading succeeded. The wait ends when
+    every clock currently in the exit set has accumulated
+    at least RECOVERY_SLEEP_SEC and the exit set is
+    non-empty. Consequences, all in the safe direction:
+    the wait is never shorter than its duration as measured
+    by any clock live at exit — a forward jump of ONE clock
+    cannot end the wait while another live clock is short;
+    a backward jump only extends the wait (a clock's
+    accumulated elapsed never decreases, and a revived
+    clock resumes from its preserved baseline and
+    high-water); a clock that stops reading drops out of
+    the exit set and the other clock governs; if NO clock
+    is live, the wait hangs — the safe direction — until a
+    clock revives or the stop event fires.
+
+    Pacing: small sleep attempts pace the wait, and every
+    failed attempt is swallowed. If every sleep primitive
+    fails while a clock remains healthy, the loop may
+    busy-iterate INSIDE this bounded window (BRIDGE.md
+    states the duty-cycle bound); survival and the
+    never-shorter property above are the guaranteed claims
+    — unconditional freedom from busy-iteration is NOT
+    claimed. Returns early only if stop_event is set.
+    BaseExceptions from a sleep attempt (KeyboardInterrupt
+    / SystemExit) still propagate."""
     duration = RECOVERY_SLEEP_SEC
     # Per clock: [read fn, baseline reading or None,
-    # accumulated elapsed (high-water mark)].
-    clocks = [[time.monotonic, None, 0.0],
-              [time.time, None, 0.0]]
+    # accumulated elapsed (high-water mark),
+    # last reading succeeded].
+    clocks = [[time.monotonic, None, 0.0, False],
+              [time.time, None, 0.0, False]]
     while True:
         if stop_event is not None:
             try:
@@ -149,16 +193,23 @@ def _recovery_wait(stop_event=None):
         for clock in clocks:
             now = _read_clock(clock[0])
             if now is None:
+                # No reading this slice: the clock drops out
+                # of the exit set — it does not veto, the
+                # other clock governs. Its baseline and
+                # high-water are preserved for a revival.
+                clock[3] = False
                 continue
+            clock[3] = True
             if clock[1] is None:
                 clock[1] = now
             elif now - clock[1] > clock[2]:
                 clock[2] = now - clock[1]
-        live = [c for c in clocks if c[1] is not None]
+        live = [c for c in clocks if c[3]]
         if live and all(c[2] >= duration for c in live):
             return
         # Pace by the least-satisfied live clock; with no
-        # live clock yet, probe again after a short slice.
+        # live clock at this slice, probe again after a
+        # short slice.
         remaining = duration
         if live:
             remaining = max(duration - min(c[2] for c in live),
@@ -503,8 +554,9 @@ def run_loop(cfg, stop_event=None):
     guarded _describe (never repr/str of the instance). The
     handler's recovery wait is _recovery_wait — a dual-clock
     deadline wait (time.monotonic AND time.time, every read
-    guarded, exit only when both clocks agree the interval
-    has elapsed) — so ANY exception inside an iteration (the
+    guarded and validated, exit governed by the clocks
+    whose last reading succeeded — see _recovery_wait) — so
+    ANY exception inside an iteration (the
     pass, the interval wait, the backoff sleep) lands in the
     same handler, and every failed iteration is guaranteed
     its recovery delay no matter how the sleep primitive or
@@ -539,15 +591,17 @@ def run_loop(cfg, stop_event=None):
             else:
                 time.sleep(wait)
         except Exception as e:
-            # The handler itself cannot die and cannot spin:
-            # it never formats the exception it caught (only
-            # its type name, via the guarded _describe — a
-            # broken __repr__/__str__ on the exception cannot
-            # raise in here), its log call goes through
-            # _safe_log (which never raises — a failing log
-            # inside the pass may be WHY we are here), and its
-            # recovery wait is the dual-clock _recovery_wait,
-            # the single rate guarantee for failed iterations.
+            # The handler itself cannot die, and cannot
+            # shorten the recovery delay: it never formats
+            # the exception it caught (only its type name,
+            # via the guarded, sanitizing _describe — a
+            # broken __repr__/__str__ on the exception, or a
+            # hostile type name, cannot raise in here), its
+            # log call goes through _safe_log (which never
+            # raises — a failing log inside the pass may be
+            # WHY we are here), and its recovery wait is the
+            # dual-clock _recovery_wait, the single rate
+            # guarantee for failed iterations.
             _safe_log(f"unexpected loop error "
                       f"({_describe(e)}); continuing")
             _recovery_wait(stop_event)
