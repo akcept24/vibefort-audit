@@ -1395,6 +1395,355 @@ S._scan_with_timeout = real_scan33
 check("W33b direct call is a force-run",
       calls33["n"] == 1 and row33()["last_digest"] is not None)
 
+# ---- Round 16 catalog (added 2026-11-10, notification exactly-once
+#      incident — Codex/Sol v4b/v5b) ----
+# The fulfilment ROW was already unique in every interleaving; the
+# notification layer was not: the Deep Scan hook re-logged
+# DEEPSCAN_QUEUED and re-sent the HQ Telegram on recovery re-entry
+# (F1), ignored a failed send and recorded completion anyway (F2),
+# the receipt re-sent when its PAID_EMAIL_SENT record failed to
+# persist (F3), and the monitor sent before its durable
+# acknowledgement, so a crash re-delivered (F4). The stubs below
+# COUNT sends — the older stubs never did, which is exactly how
+# the exactly-once gap stayed invisible to the catalog.
+N_TG = {"attempts": [], "delivered": []}
+N_TG_MODE = {"ok": True, "raise": False}
+_prev_tg16 = S.send_telegram
+
+
+def tg16(text):
+    N_TG["attempts"].append(text)
+    if N_TG_MODE["raise"]:
+        raise RuntimeError("simulated crash inside the send")
+    if N_TG_MODE["ok"]:
+        N_TG["delivered"].append(text)
+    return N_TG_MODE["ok"], "stub"
+
+
+def tg16_pings(oid):
+    return [t for t in N_TG["delivered"]
+            if f"Deep Scan order #{oid} is PAID" in t]
+
+
+S.send_telegram = tg16
+_prev_resend16 = S.send_resend
+N_MAIL = {"calls": []}
+
+
+def mail16(to, subject, text, html=None):
+    N_MAIL["calls"].append((to, subject))
+    return True, "stub-id"
+
+
+S.send_resend = mail16
+_prev_scan16 = S._scan_with_timeout
+real_log16 = S.log_event
+
+
+def mon_row16(oid):
+    c = db()
+    m = dict(c.execute("SELECT * FROM monitors WHERE order_id=?",
+                       (oid,)).fetchone())
+    c.close()
+    return m
+
+
+# N1: the v4b interleave — the webhook transition's hook
+#     completes, then, BEFORE its completion marker, an admin
+#     advance's recovery ensure re-enters the hook. Exactly one
+#     row, one DEEPSCAN_QUEUED, one delivered HQ ping; both
+#     callers succeed and the order advances.
+o16a = mk_order("n1@test.dev", "Deep Scan", 29)
+c = db()
+row16a = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o16a,)).fetchone())
+c.close()
+real_hook16 = S.on_deep_scan_paid
+hook16 = {"n": 0}
+
+
+def interleave_hook(row):
+    hook16["n"] += 1
+    out = real_hook16(row)
+    if hook16["n"] == 1:
+        # The admin advance lands here: after the hook returns,
+        # before _record_effects_ok (v4b steps 2–4).
+        S.ensure_paid_side_effects(row)
+    return out
+
+
+S.on_deep_scan_paid = interleave_hook
+won16a = S.transition_order_status(row16a, "PAID")
+S.on_deep_scan_paid = real_hook16
+row16a["status"] = "PAID"
+adv16a = S.transition_order_status(row16a, "IN_PROGRESS")
+check("N1 overlap: fulfilment notification exactly once",
+      won16a is True and adv16a is True
+      and order_status(o16a) == "IN_PROGRESS"
+      and count("fulfilment_requests", "order_id=?", (o16a,)) == 1
+      and count("events", "order_id=? AND event='DEEPSCAN_QUEUED'",
+                (o16a,)) == 1
+      and len(tg16_pings(o16a)) == 1)
+
+# N2: crash after the fulfilment row and its notification, before
+#     SIDE_EFFECTS_OK persists — the recovery re-entry repeats
+#     neither the log nor the ping.
+o16b = mk_order("n2@test.dev", "Deep Scan", 29)
+c = db()
+row16b = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o16b,)).fetchone())
+c.close()
+real_rec16 = S._record_effects_ok
+rec16 = {"n": 0}
+
+
+def crashing_rec(oid, tier, note=""):
+    rec16["n"] += 1
+    if rec16["n"] == 1:
+        raise RuntimeError("simulated crash at the marker")
+    return real_rec16(oid, tier, note)
+
+
+S._record_effects_ok = crashing_rec
+raised16b = False
+try:
+    S.transition_order_status(row16b, "PAID")
+except RuntimeError:
+    raised16b = True
+S._record_effects_ok = real_rec16
+S.ensure_paid_side_effects(row16b)
+check("N2 crash before marker: no repeated notification",
+      raised16b and order_status(o16b) == "PAID"
+      and count("fulfilment_requests", "order_id=?", (o16b,)) == 1
+      and count("events", "order_id=? AND event='DEEPSCAN_QUEUED'",
+                (o16b,)) == 1
+      and len(tg16_pings(o16b)) == 1
+      and count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
+                (o16b,)) == 1)
+
+# N3: the zero-delivery arm (F2) — a failed HQ send must NOT
+#     record completion: the transition raises, the order stays
+#     PAID and recoverable, and recovery delivers exactly one
+#     ping once the channel heals.
+o16c = mk_order("n3@test.dev", "Deep Scan", 29)
+c = db()
+row16c = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o16c,)).fetchone())
+c.close()
+N_TG_MODE["ok"] = False
+raised16c = False
+try:
+    S.transition_order_status(row16c, "PAID")
+except RuntimeError:
+    raised16c = True
+N_TG_MODE["ok"] = True
+pre16c = (count("fulfilment_requests", "order_id=?", (o16c,)),
+          count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
+                (o16c,)),
+          len(tg16_pings(o16c)))
+S.ensure_paid_side_effects(row16c)
+check("N3 failed send: no completion, recovery delivers once",
+      raised16c and order_status(o16c) == "PAID"
+      and pre16c == (1, 0, 0)
+      and len(tg16_pings(o16c)) == 1
+      and count("events", "order_id=? AND event='DEEPSCAN_QUEUED'",
+                (o16c,)) == 1
+      and count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
+                (o16c,)) == 1)
+
+# N4: the ping is delivered but its DEEPSCAN_NOTIFIED record
+#     fails to persist — the durable sent-unconfirmed state on
+#     the lock row stops a later re-entry from sending it again;
+#     the record reconciles on that re-entry.
+o16d = mk_order("n4@test.dev", "Deep Scan", 29)
+c = db()
+row16d = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o16d,)).fetchone())
+c.close()
+drop16 = {"notified": True}
+
+
+def dropping_log16(order_id, event, detail=""):
+    if drop16["notified"] and event == "DEEPSCAN_NOTIFIED":
+        return  # the write is lost, as log_event swallows failures
+    return real_log16(order_id, event, detail)
+
+
+S.log_event = dropping_log16
+won16d = S.transition_order_status(row16d, "PAID")
+drop16["notified"] = False
+S.log_event = real_log16
+S.on_deep_scan_paid(row16d)
+check("N4 delivered ping, lost record: no resend",
+      won16d is True
+      and len(tg16_pings(o16d)) == 1
+      and count("events", "order_id=? AND event='DEEPSCAN_NOTIFIED'",
+                (o16d,)) == 1
+      and count("fulfilment_requests", "order_id=?", (o16d,)) == 1)
+
+# N5: the receipt email is delivered but PAID_EMAIL_SENT fails
+#     to persist (F3) — the first ensure reports the send on the
+#     strength of the durable sent-unconfirmed record, and the
+#     consult never sends a second copy.
+o16e = mk_order("n5@test.dev", "Deep Scan", 29)
+c = db()
+row16e = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o16e,)).fetchone())
+c.close()
+drop16e = {"sent": True}
+
+
+def dropping_log16e(order_id, event, detail=""):
+    if drop16e["sent"] and event == "PAID_EMAIL_SENT":
+        return
+    return real_log16(order_id, event, detail)
+
+
+S.log_event = dropping_log16e
+first16e = S._ensure_paid_receipt(row16e, 2900)
+drop16e["sent"] = False
+S.log_event = real_log16
+second16e = S._ensure_paid_receipt(row16e, 2900)
+check("N5 receipt delivered, record lost: consult honours it",
+      first16e is True and second16e is True
+      and len([1 for (to, _subj) in N_MAIL["calls"]
+               if to == "n5@test.dev"]) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o16e,)) == 1)
+
+# N6: a retained monitoring alert is delivered, then the process
+#     dies before clearing pending_alert (F4) — after the
+#     restart the delivered alert is not delivered again.
+o16f = mk_order("n6@test.dev", "Monitoring", 79, status="PAID")
+pend16f = {"new": ["MEDIUM|N6 hole"], "gone": [], "grade": "B",
+           "score": 88,
+           "digest_after": ["LOW|base", "MEDIUM|N6 hole"],
+           "attempts": 1, "since": S.utcnow()}
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o16f, "example.com", "n6@test.dev", "N6", S.utcnow(),
+           time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend16f)))
+c.commit()
+c.close()
+S._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"},
+     {"severity": "medium", "title": "N6 hole"}],
+    {"host": "example.com", "errors": []})
+N6_MAIL = {"n": 0, "crash": True}
+
+
+def mail16f(to, subject, text, html=None):
+    if "Monitoring: changes detected" in subject:
+        N6_MAIL["n"] += 1
+        if N6_MAIL["crash"]:
+            N6_MAIL["crash"] = False
+            raise RuntimeError(
+                "simulated crash after remote acceptance")
+    return True, "stub-id"
+
+
+S.send_resend = mail16f
+crashed16f = False
+try:
+    S._run_monitor(mon_row16(o16f))
+except RuntimeError:
+    crashed16f = True
+S._run_monitor(mon_row16(o16f))
+m16f = mon_row16(o16f)
+check("N6 retained alert: crash after delivery, no redelivery",
+      crashed16f and N6_MAIL["n"] == 1
+      and m16f["pending_alert"] is None
+      and json.loads(m16f["last_digest"])
+      == ["LOW|base", "MEDIUM|N6 hole"])
+S.send_resend = mail16
+
+# N7: a fresh monitoring alert is delivered, then the process
+#     dies before the state commit (F4) — the alert was retained
+#     with its delivery intent first, so the next run reconciles
+#     it instead of delivering it again.
+o16g = mk_order("n7@test.dev", "Monitoring", 79, status="PAID")
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest) VALUES(?,?,?,?,?,?,?)",
+          (o16g, "example.com", "n7@test.dev", "N7", S.utcnow(),
+           time.time(), json.dumps(["LOW|base"])))
+c.commit()
+c.close()
+S._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"},
+     {"severity": "medium", "title": "N7 hole"}],
+    {"host": "example.com", "errors": []})
+N7_MAIL = {"n": 0, "crash": True}
+
+
+def mail16g(to, subject, text, html=None):
+    if "Monitoring: changes detected" in subject:
+        N7_MAIL["n"] += 1
+        if N7_MAIL["crash"]:
+            N7_MAIL["crash"] = False
+            raise RuntimeError(
+                "simulated crash after remote acceptance")
+    return True, "stub-id"
+
+
+S.send_resend = mail16g
+crashed16g = False
+try:
+    S._run_monitor(mon_row16(o16g))
+except RuntimeError:
+    crashed16g = True
+S._run_monitor(mon_row16(o16g))
+m16g = mon_row16(o16g)
+check("N7 fresh alert: crash after delivery, no redelivery",
+      crashed16g and N7_MAIL["n"] == 1
+      and m16g["pending_alert"] is None
+      and json.loads(m16g["last_digest"])
+      == ["LOW|base", "MEDIUM|N7 hole"])
+S.send_resend = mail16
+
+# N8: the attempt-3 escalation Telegram is delivered, then the
+#     process dies before 'escalated' persists (F4) — the next
+#     run treats the escalation as delivered: no second
+#     escalation, weekly cadence.
+o16h = mk_order("n8@test.dev", "Monitoring", 79, status="PAID")
+pend16h = {"new": ["MEDIUM|N8 hole"], "gone": [], "grade": "B",
+           "score": 88,
+           "digest_after": ["LOW|base", "MEDIUM|N8 hole"],
+           "attempts": 2, "since": S.utcnow()}
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o16h, "example.com", "n8@test.dev", "N8", S.utcnow(),
+           time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend16h)))
+c.commit()
+c.close()
+S.send_resend = lambda to, subject, text, html=None: (False, "down")
+N_TG_MODE["raise"] = True
+crashed16h = False
+try:
+    S._run_monitor(mon_row16(o16h))
+except RuntimeError:
+    crashed16h = True
+N_TG_MODE["raise"] = False
+S._run_monitor(mon_row16(o16h))
+m16h = mon_row16(o16h)
+p16h = json.loads(m16h["pending_alert"])
+esc16h = [t for t in N_TG["attempts"]
+          if "UNDELIVERED after 3 attempts" in t]
+check("N8 escalation: crash after delivery, no re-escalation",
+      crashed16h and len(esc16h) == 1
+      and p16h["attempts"] == 4 and p16h.get("escalated") is True
+      and abs(m16h["next_run_at"] - time.time() - 7 * 86400) < 120)
+
+S.send_telegram = _prev_tg16
+S.send_resend = _prev_resend16
+S._scan_with_timeout = _prev_scan16
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

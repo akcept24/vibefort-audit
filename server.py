@@ -2705,6 +2705,35 @@ def _lock_still_mine(key, token):
         conn.close()
 
 
+def _lock_purpose(key):
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT purpose FROM event_locks WHERE event_id=?",
+            (key,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def _set_lock_purpose(key, token, purpose):
+    """Owner-scoped purpose update on a held event lock: the
+    durable 'sent, unconfirmed' record for a fire whose event-log
+    record did not persist (round 16, 2026-11-10 incident). The
+    write commits like every lock operation and is verified by
+    rowcount — unlike log_event, it cannot fail silently."""
+    with _db_lock:
+        conn = db_connect()
+        try:
+            cur = conn.execute(
+                "UPDATE event_locks SET purpose=? WHERE event_id=? "
+                "AND owner=?", (purpose, key, token))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
 def _unmatched_logged(event_id):
     conn = db_connect()
     try:
@@ -2766,13 +2795,25 @@ def _ensure_paid_receipt(order, amount_cents):
     the resend this call performs). The send is single-fire PER
     ORDER (the completion record is per order — Codex delta-9
     #1): two events of one payment, in any processes, contend on
-    the same "receipt:<order_id>" lock. A send whose PAID_EMAIL_
-    SENT record does not persist counts as not sent (delta-9
-    #6). If another holder is mid-send, this returns the
-    on-record state and the caller's retry logic re-checks."""
+    the same "receipt:<order_id>" lock. If another holder is
+    mid-send, this returns the on-record state and the caller's
+    retry logic re-checks.
+
+    Round 16 refines the delta-9 #6 arm: a send that SUCCEEDED
+    but whose PAID_EMAIL_SENT record did not persist is not
+    treated as unsent — releasing the lock made the next consult
+    send a duplicate receipt (2026-11-10 incident). The held
+    lock instead becomes the durable 'sent, unconfirmed' record
+    (purpose receipt-sent-unconfirmed), and the consult below
+    honours it: reconcile the log, never resend."""
     if _receipt_logged(order["id"]):
         return True
     key = f"receipt:{order['id']}"
+    if _lock_purpose(key) == "receipt-sent-unconfirmed":
+        log_event(order["id"], "PAID_EMAIL_SENT",
+                  "reconciled from the durable sent-unconfirmed "
+                  "record; the original send was delivered")
+        return True
     token = _claim_event_lock(key, "receipt")
     if not token:
         return _receipt_logged(order["id"])
@@ -2780,6 +2821,9 @@ def _ensure_paid_receipt(order, amount_cents):
         return _receipt_logged(order["id"])
     ok = _send_paid_receipt(order, amount_cents)
     if ok and not _receipt_logged(order["id"]):
+        if _set_lock_purpose(key, token,
+                             "receipt-sent-unconfirmed"):
+            return True
         ok = False
     if not ok:
         _release_event_lock(key, token)
@@ -2813,6 +2857,28 @@ def _stripe_signature_ok(raw, header, secret):
         return False
 
 
+def _deepscan_queued_logged(order_id):
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM events WHERE order_id=? AND "
+            "event='DEEPSCAN_QUEUED'",
+            (order_id,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def _deepscan_notified(order_id):
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM events WHERE order_id=? AND "
+            "event='DEEPSCAN_NOTIFIED'",
+            (order_id,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def on_deep_scan_paid(order):
     payload = {"order_id": order["id"], "tier": order["tier"],
                "name": order["name"], "email": order["email"],
@@ -2827,12 +2893,65 @@ def on_deep_scan_paid(order):
              utcnow()))
         conn.commit()
         conn.close()
-    log_event(order["id"], "DEEPSCAN_QUEUED",
-              "fulfilment request recorded for the engine worker")
-    send_telegram(
-        f"ShipAudit Lab: Deep Scan order #{order['id']} is PAID — "
+    _fire_deep_scan_notification(order)
+
+
+def _fire_deep_scan_notification(order):
+    """The notification half of the Deep Scan hook, exactly once
+    (round 16, 2026-11-10 incident): the DEEPSCAN_QUEUED log line
+    and the HQ Telegram fire under the receipts' single-fire
+    discipline — a durable DEEPSCAN_NOTIFIED record, verified by
+    reading it back after the send. A FAILED send records no
+    completion and raises, so the caller's SIDE_EFFECTS_OK stays
+    unwritten and the recovery paths re-fire (the previous code
+    ignored the failure and recorded completion anyway: zero
+    delivered pings, recovery suppressed). A send whose record
+    does not persist leaves the held lock as the durable 'sent,
+    unconfirmed' record instead of releasing into a re-fire;
+    re-entry honours it and reconciles the log."""
+    oid = order["id"]
+    if _deepscan_notified(oid):
+        return
+    key = f"notify:{oid}"
+    if _lock_purpose(key) == "deepscan-notified-unconfirmed":
+        log_event(oid, "DEEPSCAN_NOTIFIED",
+                  "reconciled from the durable sent-unconfirmed "
+                  "record; the original ping was delivered")
+        return
+    token = _claim_event_lock(key, "deepscan-notify")
+    if not token:
+        if _deepscan_notified(oid) or \
+                _lock_purpose(key) == \
+                "deepscan-notified-unconfirmed":
+            return
+        raise RuntimeError(
+            "Deep Scan HQ notification in flight in another "
+            "process")
+    if not _lock_still_mine(key, token):
+        if _deepscan_notified(oid):
+            return
+        raise RuntimeError(
+            "Deep Scan HQ notification lock lost before firing")
+    if not _deepscan_queued_logged(oid):
+        log_event(oid, "DEEPSCAN_QUEUED",
+                  "fulfilment request recorded for the engine "
+                  "worker")
+    ok, det = send_telegram(
+        f"ShipAudit Lab: Deep Scan order #{oid} is PAID — "
         f"fulfilment queued for {order['url']} "
         f"(client {order['email']}).")
+    if not ok:
+        _release_event_lock(key, token)
+        raise RuntimeError(
+            f"Deep Scan HQ notification failed: {det}")
+    log_event(oid, "DEEPSCAN_NOTIFIED", det)
+    if not _deepscan_notified(oid):
+        if _set_lock_purpose(key, token,
+                             "deepscan-notified-unconfirmed"):
+            return
+        _release_event_lock(key, token)
+        raise RuntimeError(
+            "Deep Scan HQ notification record did not persist")
 
 
 # ---------------------------------------------------------------------------
@@ -3021,6 +3140,61 @@ def _run_monitor_locked(mon):
         except Exception:
             _pending = None
     if _pending:
+        # Reconcile interrupted deliveries BEFORE anything is
+        # re-sent (round 16): an intent field on record means a
+        # previous run persisted its intent and died before the
+        # outcome was persisted — the send may already have been
+        # accepted remotely, and re-sending would duplicate a
+        # delivered message. (The residual ambiguity — a crash
+        # between the intent write and the send itself — is the
+        # transport case of the 2026-11-10 incident record;
+        # exactly-once over that channel cannot be had from this
+        # side.) The escalation intent is only ever written
+        # together with the persisted attempt bookkeeping, after
+        # the delivery intent was already cleared, so the two
+        # reconciliations never compete.
+        if _pending.get("escalation_intent") and \
+                not _pending.get("escalated"):
+            _pending["escalated"] = True
+            del _pending["escalation_intent"]
+            log_event(order_id, "MONITOR_ALERT_ESCALATED",
+                      "escalation intent on record from an "
+                      "interrupted run; treated as delivered, "
+                      "not re-sent")
+        if _pending.get("send_intent"):
+            log_event(order_id, "MONITOR_ALERT_SENT",
+                      "retained alert treated as delivered: "
+                      "delivery intent on record from an "
+                      "interrupted run; not re-sent")
+            send_telegram(
+                f"ShipAudit Lab: retained monitoring alert for "
+                f"{mon['url']} delivered "
+                f"({len(_pending['new'])} new, "
+                f"{len(_pending['gone'])} resolved).")
+            with _db_lock:
+                conn = db_connect()
+                conn.execute(
+                    "UPDATE monitors SET pending_alert=NULL, "
+                    "last_digest=? WHERE id=?",
+                    (json.dumps(_pending["digest_after"]),
+                     mon["id"]))
+                conn.commit()
+                conn.close()
+            mon["pending_alert"] = None
+            mon["last_digest"] = json.dumps(_pending["digest_after"])
+            _pending = None
+    if _pending:
+        # Durable delivery intent BEFORE the send (round 16):
+        # what a crash can leave behind is the intent, never a
+        # silent second delivery.
+        _pending["send_intent"] = utcnow()
+        with _db_lock:
+            conn = db_connect()
+            conn.execute(
+                "UPDATE monitors SET pending_alert=? WHERE id=?",
+                (json.dumps(_pending), mon["id"]))
+            conn.commit()
+            conn.close()
         _pbody, _phtml = _monitor_alert_parts(
             mon, host, order_id, _pending["new"], _pending["gone"],
             _pending["grade"], _pending["score"])
@@ -3030,9 +3204,35 @@ def _run_monitor_locked(mon):
         if not _pok:
             _attempts = int(_pending.get("attempts", 1)) + 1
             _pending["attempts"] = _attempts
+            _pending.pop("send_intent", None)
+            # The outcome is known: persist it FIRST, so a crash
+            # from here on cannot be misread by the
+            # reconciliation above as an interrupted delivery.
+            with _db_lock:
+                conn = db_connect()
+                conn.execute(
+                    "UPDATE monitors SET pending_alert=? "
+                    "WHERE id=?",
+                    (json.dumps(_pending), mon["id"]))
+                conn.commit()
+                conn.close()
             log_event(order_id, "MONITOR_ALERT_FAILED",
                       f"retained alert attempt {_attempts}: {_pdet}")
             if _attempts >= 3 and not _pending.get("escalated"):
+                # Durable escalation intent, persisted with the
+                # attempt bookkeeping, BEFORE the send (round
+                # 16): a crash after delivery must not
+                # re-escalate.
+                _pending["escalation_intent"] = True
+                with _db_lock:
+                    conn = db_connect()
+                    conn.execute(
+                        "UPDATE monitors SET pending_alert=?, "
+                        "next_run_at=? WHERE id=?",
+                        (json.dumps(_pending),
+                         time.time() + 3600, mon["id"]))
+                    conn.commit()
+                    conn.close()
                 _tok, _ = send_telegram(
                     f"ShipAudit Lab: monitoring alert for "
                     f"{mon['url']} UNDELIVERED after 3 attempts "
@@ -3044,6 +3244,7 @@ def _run_monitor_locked(mon):
                               "retained alert undelivered after 3 "
                               "attempts; hourly retries stop, weekly "
                               "retries continue")
+                del _pending["escalation_intent"]
             with _db_lock:
                 conn = db_connect()
                 conn.execute(
@@ -3171,7 +3372,23 @@ def _run_monitor_locked(mon):
     log_event(order_id, "MONITOR_CHANGED",
               f"new={len(new)} resolved={len(gone)} "
               f"grade={grade} score={score}")
+    # Durable intent BEFORE the send (round 16): the retained
+    # record — with its delivery intent — is persisted first, so
+    # a crash after delivery leaves the evidence the retained
+    # path at the top of the next run reconciles, instead of a
+    # second delivery. The outcome is persisted the moment the
+    # send returns, before any other post-send work.
+    retained = {"new": new, "gone": gone, "grade": grade,
+                "score": score, "digest_after": digest,
+                "attempts": 1, "since": utcnow(),
+                "send_intent": utcnow()}
+    _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
     ok, detail = _attempt(new, gone, grade, score)
+    if ok:
+        _save_mon(json.dumps(digest), now + MONITOR_INTERVAL, None)
+    else:
+        del retained["send_intent"]
+        _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
     log_event(order_id,
               "MONITOR_ALERT_SENT" if ok else "MONITOR_ALERT_FAILED",
               detail)
@@ -3180,13 +3397,7 @@ def _run_monitor_locked(mon):
         f"{len(new)} new, {len(gone)} resolved; grade {grade} "
         f"({score}). Client alert: "
         f"{'SENT' if ok else 'FAILED - ' + detail}")
-    if ok:
-        _save_mon(json.dumps(digest), now + MONITOR_INTERVAL, None)
-    else:
-        retained = {"new": new, "gone": gone, "grade": grade,
-                    "score": score, "digest_after": digest,
-                    "attempts": 1, "since": utcnow()}
-        _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
+    if not ok:
         log_event(order_id, "MONITOR_ALERT_RETRY",
                   "attempt 1; alert retained, digest held")
 
