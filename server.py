@@ -814,8 +814,25 @@ _HTTPS_CONTEXT_FACTORY = http.client._create_https_context
 # exist before any exchange, and no gated send ever
 # creates either. An opener a host process installed
 # before importing this module is never clobbered.
+#
+# Round 29 (Codex delta-27 finding 1): the install is
+# NOT unconditional. The built opener is held in a
+# local and installed only if the global is STILL
+# unset at install time, so a host opener installed
+# concurrently — while build_opener() was running —
+# is never clobbered either. This double-check
+# strictly exceeds stdlib's own lazy discipline:
+# urlopen's lazy branch is a single check-then-act
+# (urllib/request.py ~211) with no re-check and no
+# lock. The one residual is a host install landing
+# between the final check and the assignment itself —
+# a single bytecode-store window, narrower than the
+# pattern stdlib itself ships; no atomicity is
+# claimed for it.
 if urllib.request._opener is None:
-    urllib.request.install_opener(urllib.request.build_opener())
+    _warmed_opener = urllib.request.build_opener()
+    if urllib.request._opener is None:
+        urllib.request.install_opener(_warmed_opener)
 
 # Round 28 (Codex delta-26 finding 3): there is NO
 # cache of factory contexts. Round 27 cached them

@@ -5690,6 +5690,162 @@ _HSRV28A.server_close()
 _HSRV28B.shutdown()
 _HSRV28B.server_close()
 
+# ============================================================
+# ROUND 29 — Codex delta-27: NO-SHIP on 383272a, two
+# findings, both at the round-28 warm-up's edges.
+# Certified (untouched): the host-keyed resolution
+# cache; the context-cache removal; contract change
+# #2; N78's specimen; catalog integrity. Findings:
+# (1) the import-time warm-up was check-then-act — it
+# tested _opener is None, built, then installed
+# UNCONDITIONALLY, so a host opener installed
+# concurrently during build_opener() was clobbered.
+# Fix: build into a local, install only if the global
+# is STILL None at install time (a re-check stdlib's
+# own lazy branch does not perform). (2) The bound's
+# "context creation never occurs inside a gated
+# exchange" was broader than the mechanism: a
+# pre-installed host opener (preserved by design) may
+# create contexts inside its OWN machinery, and
+# foreign direct constructions during an armed window
+# follow stdlib on their own account. The statement is
+# narrowed to the gated sends' OWN operation set with
+# both exclusions named (JOURNAL round 29). N80 pins
+# (1); N81 pins the pre-installed-opener guard that
+# exclusion (i) of the narrowed statement relies on.
+
+import re as _re29
+import subprocess as _sp29
+import tempfile as _tf29
+
+# N80 (1): warm-up race — a FRESH SUBPROCESS specimen
+# in N78's pattern. The driver patches
+# urllib.request.build_opener BEFORE importing the
+# server module: the patched builder builds a real
+# opener, then installs a SENTINEL opener (simulating
+# a host thread installing its own opener WHILE the
+# warm-up's build is in flight), and returns the built
+# opener. After the import, the driver reports whether
+# the process-global opener is the sentinel. Pre-fix
+# (check-then-act): the warm-up's unconditional
+# install_opener(built) overwrites the sentinel —
+# opener=other, the check fails. Post-fix (build into
+# a local, re-check at install time): the warm-up sees
+# the global is no longer None and does not install —
+# opener=sentinel.
+_DRIVER80 = '''import os
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+dbpath = sys.argv[2]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+_real_build_opener = urllib.request.build_opener
+_SENTINEL = _real_build_opener()
+
+
+def _racing_build_opener(*a, **kw):
+    built = _real_build_opener(*a, **kw)
+    # A host install landing DURING the build: by the
+    # time build_opener() returns, the global opener
+    # is the sentinel.
+    urllib.request.install_opener(_SENTINEL)
+    return built
+
+
+urllib.request.build_opener = _racing_build_opener
+
+import server as SRV
+
+print("RACE80 opener=%s" % (
+    "sentinel" if urllib.request._opener is _SENTINEL
+    else "other"), flush=True)
+'''
+
+_drvdir29 = _tf29.mkdtemp(prefix="vf-n80-")
+_drvfile80 = os.path.join(_drvdir29, "driver80.py")
+with open(_drvfile80, "w") as _fdrv80:
+    _fdrv80.write(_DRIVER80)
+_run80 = _sp29.run(
+    [sys.executable, _drvfile80,
+     os.path.dirname(os.path.abspath(__file__)),
+     os.path.join(_drvdir29, "n80.db")],
+    capture_output=True, text=True, timeout=180)
+_out80 = _run80.stdout or ""
+print("N80 driver rc=%d stdout:\n%s"
+      % (_run80.returncode, _out80))
+if _run80.stderr:
+    print("N80 driver stderr (tail):\n"
+          + _run80.stderr[-2000:])
+_mrace80 = _re29.search(r"RACE80 opener=(sentinel|other)",
+                        _out80)
+check("N80 (1): fresh subprocess — an opener installed "
+      "concurrently DURING the warm-up's build_opener() "
+      "survives the import: the warm-up builds into a "
+      "local and installs only if the global opener is "
+      "still unset at install time",
+      _run80.returncode == 0
+      and _mrace80 is not None
+      and _mrace80.group(1) == "sentinel")
+
+# N81 (1): guard regression pin — a FRESH SUBPROCESS
+# specimen. The driver installs its own custom opener
+# BEFORE importing the server module and asserts the
+# global opener's identity is unchanged after import.
+# This pin is GREEN on 383272a too: the warm-up's
+# is-None guard already preserves a pre-installed
+# opener; the pin exists because the narrowed
+# statement's exclusion (i) — a host opener installed
+# before import is preserved untouched by design —
+# relies on exactly this guard. It is a regression
+# pin, not a defect specimen.
+_DRIVER81 = '''import os
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+dbpath = sys.argv[2]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+_HOST_OPENER = urllib.request.build_opener()
+urllib.request.install_opener(_HOST_OPENER)
+
+import server as SRV
+
+print("GUARD81 opener=%s" % (
+    "preserved" if urllib.request._opener is _HOST_OPENER
+    else "replaced"), flush=True)
+'''
+
+_drvfile81 = os.path.join(_drvdir29, "driver81.py")
+with open(_drvfile81, "w") as _fdrv81:
+    _fdrv81.write(_DRIVER81)
+_run81 = _sp29.run(
+    [sys.executable, _drvfile81,
+     os.path.dirname(os.path.abspath(__file__)),
+     os.path.join(_drvdir29, "n81.db")],
+    capture_output=True, text=True, timeout=180)
+_out81 = _run81.stdout or ""
+print("N81 driver rc=%d stdout:\n%s"
+      % (_run81.returncode, _out81))
+if _run81.stderr:
+    print("N81 driver stderr (tail):\n"
+          + _run81.stderr[-2000:])
+_mguard81 = _re29.search(
+    r"GUARD81 opener=(preserved|replaced)", _out81)
+check("N81 (1): fresh subprocess — an opener a host "
+      "process installed BEFORE importing the server "
+      "module is preserved untouched by the import-time "
+      "warm-up (guard regression pin; pins the is-None "
+      "guard the narrowed statement's host-opener "
+      "exclusion relies on)",
+      _run81.returncode == 0
+      and _mguard81 is not None
+      and _mguard81.group(1) == "preserved")
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
