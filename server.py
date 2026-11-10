@@ -171,6 +171,15 @@ def db_connect():
     lcols = [r[1] for r in conn.execute("PRAGMA table_info(event_locks)")]
     if "owner" not in lcols:
         conn.execute("ALTER TABLE event_locks ADD COLUMN owner TEXT")
+    try:
+        # One payment can win exactly ONE order, atomically, across
+        # processes (Codex delta-10 #1): the partial unique index
+        # is the fence; transition_order_status also pre-checks.
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_paid_pi "
+            "ON orders(paid_pi) WHERE paid_pi IS NOT NULL")
+    except Exception as e:
+        log(f"paid_pi unique index not created: {e!r}")
     conn.execute("""CREATE TABLE IF NOT EXISTS fulfilment_requests(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER UNIQUE NOT NULL,
@@ -1712,6 +1721,7 @@ class Handler(BaseHTTPRequestHandler):
                 tier = AMOUNT_TO_TIER.get(amount)
         order = None
         ambiguous = False
+        lost_claim = False
         if tier and email:
             conn = db_connect()
             conn.row_factory = sqlite3.Row
@@ -1771,13 +1781,42 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     conn.close()
                 if pi and winner_pi != pi:
-                    with _db_lock:
-                        conn = db_connect()
-                        conn.execute(
-                            "UPDATE stripe_events SET order_id=NULL "
-                            "WHERE event_id=?", (eid,))
-                        conn.commit()
+                    # Did THIS payment win a DIFFERENT order (the
+                    # paid_pi fence rejected a second claim —
+                    # delta-10 #1)? Then this is that payment's
+                    # second event: link it to the order it
+                    # actually paid for and ack as a duplicate.
+                    won_order = None
+                    conn = db_connect()
+                    try:
+                        grow = conn.execute(
+                            "SELECT id FROM orders WHERE paid_pi=?",
+                            (pi,)).fetchone()
+                        if grow:
+                            won_order = grow[0]
+                    finally:
                         conn.close()
+                    if won_order is not None:
+                        with _db_lock:
+                            conn = db_connect()
+                            conn.execute(
+                                "UPDATE stripe_events SET order_id=? "
+                                "WHERE event_id=? AND claim=?",
+                                (won_order, eid, claim))
+                            conn.commit()
+                            conn.close()
+                        log_event(won_order, "STRIPE_DUP_EVENT",
+                                  f"event={eid} pi={pi} already "
+                                  "matched to this order")
+                        self._send_json(200, {"ok": True,
+                                              "duplicate": True})
+                        return
+                    # A genuinely different winner: this payment
+                    # is unmatched. Do NOT unlink yet — the link
+                    # is the sweep's evidence until the alert
+                    # below is on record (delta-10 #2); the tail
+                    # unlinks after a successful alert.
+                    lost_claim = True
                     order = None
                 else:
                     ensure_paid_side_effects(order)
@@ -1814,6 +1853,16 @@ class Handler(BaseHTTPRequestHandler):
             f"event={eid} tier={tier} email={email} "
             f"amount={amount} currency={currency} "
             f"ambiguous={ambiguous}")
+        if lost_claim:
+            # The alert is on record; only now may the provisional
+            # link come off (delta-10 #2).
+            with _db_lock:
+                conn = db_connect()
+                conn.execute(
+                    "UPDATE stripe_events SET order_id=NULL "
+                    "WHERE event_id=?", (eid,))
+                conn.commit()
+                conn.close()
         self._send_json(200, {"ok": True, "matched": False})
 
     def _api_admin_post(self, path):
@@ -2198,18 +2247,33 @@ def transition_order_status(row, new_status, paid_event_id=None,
     with _db_lock:
         conn = db_connect()
         try:
-            if new_status == "PAID" and paid_event_id is not None:
-                cur = conn.execute(
-                    "UPDATE orders SET status=?, paid_event_id=?, "
-                    "paid_pi=? WHERE id=? AND status=?",
-                    (new_status, paid_event_id, paid_pi, oid,
-                     row["status"]))
-            else:
-                cur = conn.execute(
-                    "UPDATE orders SET status=? WHERE id=? AND "
-                    "status=?", (new_status, oid, row["status"]))
-            conn.commit()
-            won = cur.rowcount > 0
+            won = None
+            if new_status == "PAID" and paid_pi is not None:
+                # The same payment must never win a second order
+                # (Codex delta-10 #1): pre-check for a clean loss,
+                # the partial unique index on paid_pi is the
+                # atomic fence behind it.
+                clash = conn.execute(
+                    "SELECT 1 FROM orders WHERE paid_pi=? AND "
+                    "id<>?", (paid_pi, oid)).fetchone()
+                if clash:
+                    won = False
+            if won is None:
+                if new_status == "PAID" and paid_event_id is not None:
+                    cur = conn.execute(
+                        "UPDATE orders SET status=?, paid_event_id=?, "
+                        "paid_pi=? WHERE id=? AND status=?",
+                        (new_status, paid_event_id, paid_pi, oid,
+                         row["status"]))
+                else:
+                    cur = conn.execute(
+                        "UPDATE orders SET status=? WHERE id=? AND "
+                        "status=?", (new_status, oid, row["status"]))
+                conn.commit()
+                won = cur.rowcount > 0
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            won = False
         finally:
             conn.close()
     if not won:
@@ -2469,9 +2533,10 @@ def _claim_event_lock(key, purpose):
     processes (Codex delta-8 #1/#4), keyed by a namespaced string
     ("alert:<event_id>", "receipt:<order_id>" — the namespaces
     keep the two purposes from blocking each other, delta-9 #6).
-    The primary key admits one holder; a lock older than 300 s
-    belongs to a crashed (or impossibly slow) holder and is
-    reclaimed once. Returns the holder's owner token, or None.
+    The primary key admits one holder; a lock older than 3600 s
+    belongs to a crashed holder and is reclaimed once (the send
+    calls take seconds; an hour of suspension is beyond plausible
+    for a live holder — delta-10 #3). Returns the owner token.
     A lock taken for a SUCCESSFUL fire is never released — it is
     the fired record; a failed fire releases it — scoped to the
     owner's token, so a reclaimed lock is never deleted by its
@@ -2494,7 +2559,7 @@ def _claim_event_lock(key, purpose):
                     row = conn.execute(
                         "SELECT claimed_at FROM event_locks "
                         "WHERE event_id=?", (key,)).fetchone()
-                    if row is None or now - row[0] <= 300:
+                    if row is None or now - row[0] <= 3600:
                         return None
                     conn.execute(
                         "DELETE FROM event_locks WHERE event_id=? "
@@ -2515,6 +2580,17 @@ def _release_event_lock(key, token):
             conn.commit()
         finally:
             conn.close()
+
+
+def _lock_still_mine(key, token):
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT owner FROM event_locks WHERE event_id=?",
+            (key,)).fetchone()
+        return row is not None and row[0] == token
+    finally:
+        conn.close()
 
 
 def _unmatched_logged(event_id):
@@ -2544,6 +2620,9 @@ def _fire_unmatched_alert(event_id, telegram_text, log_detail):
             return "duplicate"
         raise RuntimeError(
             "unmatched alert in flight in another process")
+    if not _lock_still_mine(key, token):
+        raise RuntimeError(
+            "unmatched alert lock lost before firing")
     tok, _ = send_telegram(telegram_text)
     if not tok:
         _release_event_lock(key, token)
@@ -2584,6 +2663,8 @@ def _ensure_paid_receipt(order, amount_cents):
     key = f"receipt:{order['id']}"
     token = _claim_event_lock(key, "receipt")
     if not token:
+        return _receipt_logged(order["id"])
+    if not _lock_still_mine(key, token):
         return _receipt_logged(order["id"])
     ok = _send_paid_receipt(order, amount_cents)
     if ok and not _receipt_logged(order["id"]):

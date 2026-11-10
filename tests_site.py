@@ -930,6 +930,88 @@ check("A5 receipt lands once the lock clears",
                 (o23,)) == 1)
 S.send_resend = keep_resend
 
+# ---- Delta-10 catalog (added 2026-11-09, round 10) ----
+# W23: one payment wins exactly one order. Payment pi_w23 already
+#      won order A; a second event for it candidating order B is
+#      rejected by the paid_pi fence and acked as a duplicate of
+#      A — B is never fulfilled, no false unmatched alert.
+o23a = mk_order("other23@test.dev", "Deep Scan", 29)
+c = db()
+row_23a = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                         (o23a,)).fetchone())
+c.close()
+S.transition_order_status(row_23a, "PAID",
+                          paid_event_id="evt_w23_a",
+                          paid_pi="pi_w23")
+o23b = mk_order("w23@test.dev", "Deep Scan", 29)
+r = stripe_call(evt("evt_w23_b"),
+                sess(2900, "w23@test.dev", pi="pi_w23"))
+c = db()
+link23 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w23_b'").fetchone()[0]
+c.close()
+check("W23 one payment, one order (paid_pi fence)",
+      r[1].get("duplicate") is True and link23 == o23a
+      and order_status(o23b) == "NEW"
+      and count("fulfilment_requests", "order_id=?", (o23b,)) == 0
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w23_b%'", ()) == 0)
+
+# W23b: the transition-level fence — a second identity transition
+#       carrying an already-won payment_intent loses cleanly.
+o23c = mk_order("w23c@test.dev", "Deep Scan", 29)
+c = db()
+row_23c = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                         (o23c,)).fetchone())
+c.close()
+won23 = S.transition_order_status(row_23c, "PAID",
+                                  paid_event_id="evt_w23_c",
+                                  paid_pi="pi_w23")
+check("W23b second claim on one payment loses",
+      won23 is False and order_status(o23c) == "NEW")
+
+# W24: the fresh-match loser keeps its link until the alert is on
+#      record. With Telegram down the delivery fails and the link
+#      survives; the boot sweep settles it afterwards.
+o24 = mk_order("w24@test.dev", "Deep Scan", 29)
+race24 = {"fired": False}
+
+
+def racing_t24(row, new_status, **kw):
+    if not race24["fired"] and row["id"] == o24:
+        race24["fired"] = True
+        real_t(row, new_status, paid_event_id="evt_w24_win",
+               paid_pi="pi_w24_win")
+    return real_t(row, new_status, **kw)
+
+
+S.transition_order_status = racing_t24
+STATE["telegram_ok"] = False
+r = stripe_call(evt("evt_w24"), sess(2900, "w24@test.dev",
+                                     pi="pi_w24_lose"))
+S.transition_order_status = real_t
+STATE["telegram_ok"] = True
+c = db()
+link24 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w24'").fetchone()[0]
+c.close()
+check("W24 failed loser alert keeps the link", r[0] == 500
+      and link24 == o24
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w24%'", ()) == 0)
+S.sweep_paid_side_effects()
+c = db()
+link24 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w24'").fetchone()[0]
+c.close()
+check("W24 sweep settles the preserved link",
+      link24 is None
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w24%'", ()) == 1)
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
