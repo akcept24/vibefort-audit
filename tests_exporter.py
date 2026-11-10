@@ -1186,6 +1186,220 @@ def main():
           and loop_end_v.get("how") == "KeyboardInterrupt"
           and not th_v.is_alive())
 
+    # ---- (w) EXACT-FLOAT BOUNDARY: a clock reading that is
+    #           a float SUBCLASS whose __sub__ raises must be
+    #           disarmed at the read boundary — the accepted
+    #           reading is converted to an exact plain float
+    #           inside the guard, so no downstream operation
+    #           can ever invoke the reading's own operators.
+    #           (On the round-6 loop the subclass passed
+    #           validation untouched; its trapped __sub__
+    #           then raised in the wait's displacement
+    #           arithmetic, escaped the recovery handler and
+    #           killed run_loop.) Driven like (q)/(t): a
+    #           flaky stop event whose first wait() raises
+    #           lands the failed first pass in the handler.
+    class HostileFloatW(float):
+        def __sub__(self, other):
+            raise RuntimeError("trapped __sub__")
+
+        def __rsub__(self, other):
+            raise RuntimeError("trapped __rsub__")
+
+    converted_w = exporter._read_clock(
+        lambda: HostileFloatW(1.5))
+    unit_w = type(converted_w) is float and converted_w == 1.5
+
+    dirW = os.path.join(tmp, "caseW")
+    os.makedirs(dirW)
+    cfgW = {"db_path": os.path.join(dirW, "site.db"),
+            "inbox_dir": os.path.join(dirW, "inbox"),
+            "ledger_path": os.path.join(dirW, "ledger.json"),
+            "poll_sec": 0.05}
+    real_export_once_w = exporter.export_once
+    real_monotonic_w = time.monotonic
+    pass_times_w = []
+    loop_end_w = {}
+
+    class FlakyEventW:
+        """A stop event whose first wait() raises; later
+        waits are real short waits on an inner event."""
+
+        def __init__(self):
+            self._inner = threading.Event()
+            self.wait_calls = 0
+
+        def is_set(self):
+            return self._inner.is_set()
+
+        def set(self):
+            self._inner.set()
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise RuntimeError("simulated interval-wait "
+                                   "failure")
+            return self._inner.wait(
+                min(timeout if timeout is not None else 0.05,
+                    0.05))
+
+    stop_w = FlakyEventW()
+
+    def hostile_monotonic_w():
+        return HostileFloatW(real_monotonic_w())
+
+    def flaky_pass_w(db_path, inbox_dir, ledger_path):
+        pass_times_w.append(time.time())
+        if len(pass_times_w) == 1:
+            raise RuntimeError("simulated first-pass failure")
+        return {"exported": 0, "errors": 0}
+
+    def loop_thread_w():
+        try:
+            exporter.run_loop(cfgW, stop_w)
+            loop_end_w["how"] = "returned"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_w["how"] = f"other:{type(e).__name__}"
+
+    exporter.export_once = flaky_pass_w
+    time.monotonic = hostile_monotonic_w
+    th_w = threading.Thread(target=loop_thread_w, daemon=True)
+    try:
+        th_w.start()
+        deadline_w = time.time() + 6
+        while len(pass_times_w) < 2 and time.time() < deadline_w:
+            time.sleep(0.02)
+        gap_w = (pass_times_w[1] - pass_times_w[0]
+                 if len(pass_times_w) >= 2 else 0.0)
+    finally:
+        stop_w.set()
+        th_w.join(timeout=5)
+        exporter.export_once = real_export_once_w
+        time.monotonic = real_monotonic_w
+    check("(w) a float-subclass clock reading whose __sub__ "
+          "raises is converted to an exact plain float at "
+          "the read boundary: _read_clock returns an exact "
+          "float, no subtraction can invoke the trapped "
+          "operator, the recovery wait completes (gap >= "
+          "0.8x the recovery interval), and run_loop returns "
+          "cleanly on stop",
+          unit_w
+          and len(pass_times_w) >= 2
+          and gap_w >= 0.8 * exporter.RECOVERY_SLEEP_SEC
+          and loop_end_w.get("how") == "returned"
+          and not th_w.is_alive())
+
+    # ---- (x) ZERO-PROGRESS DROP: a FROZEN clock — readings
+    #           succeed but the value never advances — is
+    #           excluded the moment the other clock reaches
+    #           the interval, so the wait ENDS on the
+    #           reaching clock instead of spinning in the
+    #           window forever. Driven at the wait itself,
+    #           with every sleep primitive failing (a busy
+    #           window) and a healthy wall clock. (On the
+    #           round-6 loop the frozen clock stayed in the
+    #           exit set with a stale zero accumulation and
+    #           vetoed exit indefinitely.) The frozen fake
+    #           is stateful: cleanup unfreezes it with a
+    #           large forward offset (so a still-waiting
+    #           old-tree thread can exit), which keeps the
+    #           prefix failure a clean FAIL, not a hang.
+    real_monotonic_x = time.monotonic
+    real_sleep_x = time.sleep
+    frozen_x = {"on": True}
+
+    def frozen_monotonic_x():
+        if frozen_x["on"]:
+            return 424242.0
+        return real_monotonic_x() + 500000.0
+
+    def raising_sleep_x(sec):
+        raise RuntimeError("simulated sleep failure")
+
+    wait_end_x = {}
+
+    def wait_thread_x():
+        t0 = time.time()
+        exporter._recovery_wait(None)
+        wait_end_x["elapsed"] = time.time() - t0
+
+    time.monotonic = frozen_monotonic_x
+    time.sleep = raising_sleep_x
+    th_x = threading.Thread(target=wait_thread_x, daemon=True)
+    elapsed_x = None
+    returned_x = False
+    try:
+        th_x.start()
+        th_x.join(timeout=3.0)
+        elapsed_x = wait_end_x.get("elapsed")
+        returned_x = elapsed_x is not None and not th_x.is_alive()
+    finally:
+        frozen_x["on"] = False
+        th_x.join(timeout=5)
+        time.monotonic = real_monotonic_x
+        time.sleep = real_sleep_x
+    check("(x) a frozen clock (readings succeed, value "
+          "never advances) is dropped once the other clock "
+          "reaches the interval: with all sleep primitives "
+          "failing, the recovery wait still ENDS at ~the "
+          "wall duration (0.8x-3x the recovery interval) "
+          "instead of spinning in the window forever",
+          returned_x
+          and elapsed_x >= 0.8 * exporter.RECOVERY_SLEEP_SEC
+          and elapsed_x <= 3.0
+          and not th_x.is_alive())
+
+    # ---- (y) PARTIAL-PROGRESS VETO (semantics pin, NOT a
+    #           defect specimen): a SLOW clock advancing at
+    #           1/4 rate has progressed but not reached the
+    #           interval when the wall clock reaches it, so
+    #           it KEEPS its veto — the wait trusts the
+    #           slowest progressing clock and ends only
+    #           when the slow clock reaches the interval
+    #           (~4x the wall duration). This pins the
+    #           semantics disclosed in BRIDGE.md; the
+    #           round-6 loop already behaved this way, so
+    #           (y) is expected to pass on BOTH trees.
+    real_time_y = time.time
+    real_monotonic_y = time.monotonic
+    y_t0 = real_time_y()
+    y_mono0 = real_monotonic_y()
+
+    def slow_monotonic_y():
+        return y_mono0 + (real_time_y() - y_t0) / 4.0
+
+    wait_end_y = {}
+
+    def wait_thread_y():
+        t0 = real_time_y()
+        exporter._recovery_wait(None)
+        wait_end_y["elapsed"] = real_time_y() - t0
+
+    time.monotonic = slow_monotonic_y
+    th_y = threading.Thread(target=wait_thread_y, daemon=True)
+    vetoed_y = False
+    elapsed_y = None
+    try:
+        th_y.start()
+        time.sleep(2.0)
+        vetoed_y = "elapsed" not in wait_end_y and th_y.is_alive()
+        th_y.join(timeout=4.0)
+        elapsed_y = wait_end_y.get("elapsed")
+    finally:
+        th_y.join(timeout=5)
+        time.monotonic = real_monotonic_y
+    check("(y) a slow clock at 1/4 rate keeps its "
+          "partial-progress veto: the recovery wait has NOT "
+          "ended at 2s (past the wall duration) and ends "
+          "only at ~the slow clock's duration (elapsed "
+          ">= 3s, generous bounds) — the disclosed "
+          "slowest-progressing-clock semantics",
+          vetoed_y
+          and elapsed_y is not None
+          and elapsed_y >= 3.0
+          and not th_y.is_alive())
+
     failed = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(failed)}/{len(PASS)} exporter checks pass")
     if failed:

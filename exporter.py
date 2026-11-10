@@ -119,12 +119,20 @@ def _read_clock(fn):
     """One guarded clock read: a VALIDATED reading, or None.
     A clock that raises reports no reading. A clock that
     returns an unusable value also reports no reading:
-    readings are validated HERE, at the boundary — only a
-    non-bool int/float that is finite is a reading; anything
-    else (str, None, arbitrary objects, NaN, infinities) is
-    no reading at all. All arithmetic downstream (deltas,
-    comparisons) therefore only ever operates on validated
-    finite numbers and cannot raise on a reading's type."""
+    readings are validated AND CONVERTED here, at the
+    boundary — only a non-bool int/float that is finite is
+    a reading; anything else (str, None, arbitrary objects,
+    NaN, infinities) is no reading at all. An accepted
+    reading is converted with float() INSIDE the guard and
+    only that exact plain float is returned (a conversion
+    failure — e.g. a hostile subclass whose __float__
+    raises — is no reading). All arithmetic downstream
+    (baselines, high-waters, deltas, comparisons) therefore
+    only ever operates on exact floats stored from this
+    function's outputs: plain-float arithmetic cannot raise
+    and cannot be overridden, so a reading's own operators
+    (a float subclass with a trapped __sub__) are disarmed
+    at this boundary and can never fire downstream."""
     try:
         value = fn()
     except Exception:
@@ -136,7 +144,12 @@ def _read_clock(fn):
         finite = math.isfinite(value)
     except Exception:
         return None
-    return value if finite else None
+    if not finite:
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 def _recovery_wait(stop_event=None):
@@ -146,43 +159,62 @@ def _recovery_wait(stop_event=None):
     tracked on TWO clocks independently — time.monotonic
     and time.time — each as a high-water mark of
     displacement from its first successful reading, over
-    guarded, validated reads (see _read_clock: a raising
-    clock, or a reading that is not a finite non-bool
-    number, is no reading at all, and all arithmetic here
-    only ever sees validated numbers).
+    guarded reads (see _read_clock: a raising clock, or a
+    reading that is not a finite non-bool number, is no
+    reading at all; an accepted reading is converted to
+    an exact plain float at that boundary, and every
+    value stored or compared here derives from those
+    outputs alone — plain-float arithmetic cannot raise
+    and cannot be overridden).
 
     GOVERNING RULE: a clock belongs to the exit set only
     while its LAST reading succeeded. The wait ends when
-    every clock currently in the exit set has accumulated
-    at least RECOVERY_SLEEP_SEC and the exit set is
-    non-empty. Consequences, all in the safe direction:
-    the wait is never shorter than its duration as measured
-    by any clock live at exit — a forward jump of ONE clock
-    cannot end the wait while another live clock is short;
-    a backward jump only extends the wait (a clock's
+    some clock in the exit set has accumulated at least
+    RECOVERY_SLEEP_SEC and every OTHER clock in the exit
+    set has either also accumulated it or shown ZERO
+    progress since the wait began (its accumulated
+    elapsed still equals its value at the wait's start,
+    field [4]): a zero-progress clock — e.g. a frozen
+    clock whose readings succeed but never advance — is
+    excluded at that moment and the wait ends on the
+    reaching clock. Consequences, all in the safe
+    direction: the wait is never shorter than its
+    duration as measured by any governing clock — a
+    forward jump of ONE clock cannot end the wait while
+    another live clock has progressed but is short; a
+    backward jump only extends the wait (a clock's
     accumulated elapsed never decreases, and a revived
     clock resumes from its preserved baseline and
-    high-water); a clock that stops reading drops out of
-    the exit set and the other clock governs; if NO clock
-    is live, the wait hangs — the safe direction — until a
-    clock revives or the stop event fires.
+    high-water); a live clock that HAS progressed but
+    not reached the duration keeps its veto — the wait
+    trusts the slowest progressing clock, and a slow
+    clock extends the wait; a clock that stops reading
+    drops out of the exit set and the other clock
+    governs; if NO clock is live, or none has progressed
+    and none has reached the duration, the wait hangs —
+    the safe direction — until a clock revives or the
+    stop event fires.
 
     Pacing: small sleep attempts pace the wait, and every
     failed attempt is swallowed. If every sleep primitive
     fails while a clock remains healthy, the loop may
-    busy-iterate INSIDE this bounded window (BRIDGE.md
-    states the duty-cycle bound); survival and the
-    never-shorter property above are the guaranteed claims
-    — unconditional freedom from busy-iteration is NOT
-    claimed. Returns early only if stop_event is set.
-    BaseExceptions from a sleep attempt (KeyboardInterrupt
-    / SystemExit) still propagate."""
+    busy-iterate inside this window and across consecutive
+    recovery windows for the failure's duration, bounded
+    to this thread's clock-read loop; normal pacing
+    resumes when any primitive or the failure clears.
+    Survival and the never-shorter property above are the
+    guaranteed claims — unconditional freedom from
+    busy-iteration is NOT claimed. Returns early only if
+    stop_event is set. BaseExceptions from a sleep attempt
+    (KeyboardInterrupt / SystemExit) still propagate."""
     duration = RECOVERY_SLEEP_SEC
     # Per clock: [read fn, baseline reading or None,
     # accumulated elapsed (high-water mark),
-    # last reading succeeded].
-    clocks = [[time.monotonic, None, 0.0, False],
-              [time.time, None, 0.0, False]]
+    # last reading succeeded,
+    # accumulated elapsed at the wait's start ([2]'s
+    # initial value — the zero-progress reference)].
+    clocks = [[time.monotonic, None, 0.0, False, 0.0],
+              [time.time, None, 0.0, False, 0.0]]
     while True:
         if stop_event is not None:
             try:
@@ -205,14 +237,25 @@ def _recovery_wait(stop_event=None):
             elif now - clock[1] > clock[2]:
                 clock[2] = now - clock[1]
         live = [c for c in clocks if c[3]]
-        if live and all(c[2] >= duration for c in live):
-            return
-        # Pace by the least-satisfied live clock; with no
-        # live clock at this slice, probe again after a
-        # short slice.
-        remaining = duration
+        blocking = []
         if live:
-            remaining = max(duration - min(c[2] for c in live),
+            reached = any(c[2] >= duration for c in live)
+            # A live clock blocks the exit only while it
+            # has PARTIAL progress: progressed past its
+            # start value but short of the duration. A
+            # reached clock does not block; a zero-progress
+            # clock is dropped the moment another reaches.
+            blocking = [c for c in live
+                        if c[4] < c[2] < duration]
+            if reached and not blocking:
+                return
+        # Pace by the least-satisfied blocking clock; with
+        # no blocking clock at this slice (nobody has
+        # progressed, or nobody is live), probe again after
+        # a short slice.
+        remaining = duration
+        if live and blocking:
+            remaining = max(duration - min(c[2] for c in blocking),
                             0.01)
         slice_sec = min(remaining, 0.1)
         try:
@@ -554,8 +597,9 @@ def run_loop(cfg, stop_event=None):
     guarded _describe (never repr/str of the instance). The
     handler's recovery wait is _recovery_wait — a dual-clock
     deadline wait (time.monotonic AND time.time, every read
-    guarded and validated, exit governed by the clocks
-    whose last reading succeeded — see _recovery_wait) — so
+    guarded, validated and converted to an exact float,
+    exit governed by the clocks whose last reading
+    succeeded — see _recovery_wait) — so
     ANY exception inside an iteration (the
     pass, the interval wait, the backoff sleep) lands in the
     same handler, and every failed iteration is guaranteed

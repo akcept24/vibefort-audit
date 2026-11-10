@@ -71,32 +71,52 @@ the handler's recovery wait is a DUAL-CLOCK deadline wait,
 with exactly these scoped semantics. Elapsed time is
 tracked on `time.monotonic` and `time.time` independently
 — every clock read is guarded, and readings are validated
-at the read boundary: only a finite, non-bool number is a
-reading (a raising clock, or a reading of any other shape —
-string, NaN, infinity — is no reading at all), so all
-arithmetic on readings only ever sees validated numbers.
-Each clock's elapsed accumulates as a high-water mark of
-displacement from its first successful reading. The wait
-is governed by the clocks whose LAST reading succeeded —
-the exit set: it ends when every clock in the exit set has
-accumulated the full recovery interval and the exit set is
-non-empty. (i) The wait is therefore never shorter than
-its duration as measured by any clock live at exit: a
-forward jump of one clock cannot end it while another
-live clock is short, and a backward jump only extends it
-(accumulated elapsed never decreases, and a revived clock
-resumes from its preserved baseline and high-water mark).
-(ii) A clock that stops reading drops out of the exit set
-and the other clock governs; if NO clock is live, the wait
-hangs — the safe direction — until a clock revives or the
-stop event fires. (iii) The wait keeps attempting small
-sleeps, swallowing their failures; if every sleep
-primitive fails while a clock remains healthy, the loop
-may busy-iterate INSIDE the bounded recovery window — the
-window is 1s against a poll cycle of at least 15s, so the
-worst-case duty cycle of such spinning is bounded by that
-ratio. Survival and the never-shorter property are the
-guaranteed claims; unconditional freedom from
+and converted at the read boundary: only a finite, non-bool
+number is a reading, and each reading is converted to an
+exact plain float there (a raising clock, or a reading of
+any other shape — string, NaN, infinity, a value whose
+conversion fails — is no reading at all), so all arithmetic
+downstream operates on exact floats only and cannot invoke
+a reading's own operators. Each clock's elapsed accumulates
+as a high-water mark of displacement from its first
+successful reading. The wait is governed by the clocks
+whose LAST reading succeeded — the exit set. It ends when
+some clock in the exit set has accumulated the full
+recovery interval and every other clock in the exit set
+has either also accumulated the full interval or shown
+zero progress since the wait began (its accumulated
+elapsed still equals its value at the wait's start): a
+zero-progress clock — for example a frozen clock whose
+readings succeed but whose value never advances — is
+excluded at that moment, and the wait ends on the reaching
+clock. (i) The wait is therefore never shorter than its
+duration as measured by any governing clock: a forward
+jump of one clock cannot end it while another live clock
+has progressed but is short of the interval, and a
+backward jump only extends it (accumulated elapsed never
+decreases, and a revived clock resumes from its preserved
+baseline and high-water mark). (ii) A live clock that has
+progressed but not reached the interval keeps its veto:
+the wait trusts the slowest progressing clock, and a
+progressing-but-slow clock extends the wait — that is the
+disclosed semantics, in the safe direction; the stop event
+still exits promptly. (iii) A clock that stops reading
+drops out of the exit set and the other clock governs; if
+NO clock is live — or none has progressed and none has
+reached the interval — the wait hangs, the safe direction,
+until a clock revives or the stop event fires.
+(iv) Iterations are separated by recovery windows that are
+never shorter than their duration on the governing clocks.
+The wait keeps attempting small sleeps, swallowing their
+failures; if every sleep primitive fails, the loop may
+busy-iterate inside a recovery window and across
+consecutive recovery windows for the duration of the
+failure — bounded to this single thread's clock-read loop,
+which performs no I/O while it spins — and normal pacing
+resumes when any sleep primitive, or the failure itself,
+clears. No numerical duty-cycle bound and no poll-interval
+floor are claimed. Survival and the never-shorter property
+are the guaranteed claims; unconditional freedom from
 busy-iteration is NOT claimed. The handler never formats
 the exception it caught: its log lines carry only the
 exception's TYPE name, obtained through a guarded helper
