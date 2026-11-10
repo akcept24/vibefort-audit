@@ -355,6 +355,158 @@ check("S2 sweep transitions linked NEW order",
       order_status(os2) == "PAID"
       and count("fulfilment_requests", "order_id=?", (os2,)) == 1)
 
+# ---- Delta-5 catalog (added 2026-11-09, round 5) ----
+import threading  # noqa: E402
+
+# W11: two DIFFERENT payments delivered concurrently for one NEW
+#      order — exactly one claims it; the other is unmatched, not
+#      silently acked as a second match.
+o11 = mk_order("w11@test.dev", "Deep Scan", 29)
+res11 = []
+
+
+def _w11(tag):
+    res11.append(stripe_call(
+        evt(f"evt_w11_{tag}"),
+        sess(2900, "w11@test.dev", pi=f"pi_w11_{tag}")))
+
+
+ts = [threading.Thread(target=_w11, args=(t,)) for t in ("a", "b")]
+[t.start() for t in ts]
+[t.join() for t in ts]
+matched11 = [r for r in res11 if r[1].get("order_id") == o11]
+unmatched11 = [r for r in res11 if r[1].get("matched") is False]
+check("W11 concurrent payments: single claim",
+      len(matched11) == 1 and len(unmatched11) == 1
+      and count("fulfilment_requests", "order_id=?", (o11,)) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o11,)) == 1)
+
+# W12: the SAME payment delivered concurrently as two events —
+#      one match, one quiet duplicate, one receipt (W5 under race).
+o12 = mk_order("w12@test.dev", "Deep Scan", 29)
+res12 = []
+
+
+def _w12(tag, etype):
+    res12.append(stripe_call(
+        evt(f"evt_w12_{tag}", etype),
+        sess(2900, "w12@test.dev", pi="pi_w12")))
+
+
+ts = [threading.Thread(target=_w12, args=("a", "checkout.session.completed")),
+      threading.Thread(target=_w12,
+                       args=("b", "checkout.session.async_payment_succeeded"))]
+[t.start() for t in ts]
+[t.join() for t in ts]
+check("W12 concurrent same-payment duplicate",
+      len([r for r in res12 if r[1].get("order_id") == o12]) == 1
+      and len([r for r in res12 if r[1].get("duplicate")]) == 1
+      and count("fulfilment_requests", "order_id=?", (o12,)) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o12,)) == 1)
+
+# A1: an admin move may not skip PAID — the side effects live there.
+oa1 = mk_order("a1@test.dev", "Deep Scan", 29)
+c = db()
+row_a1 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (oa1,)).fetchone())
+c.close()
+refused = False
+try:
+    S.transition_order_status(row_a1, "IN_PROGRESS")
+except ValueError:
+    refused = True
+check("A1 skipping PAID refused", refused
+      and order_status(oa1) == "NEW")
+
+# A2: leaving PAID re-fires missing side effects first.
+oa2 = mk_order("a2@test.dev", "Deep Scan", 29)
+c = db()
+row_a2 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (oa2,)).fetchone())
+c.close()
+S.transition_order_status(row_a2, "PAID")
+c = S.db_connect()
+c.execute("DELETE FROM fulfilment_requests WHERE order_id=?", (oa2,))
+c.execute("DELETE FROM events WHERE order_id=? AND "
+          "event='SIDE_EFFECTS_OK'", (oa2,))
+c.commit()
+c.close()
+row_a2["status"] = "PAID"
+won = S.transition_order_status(row_a2, "IN_PROGRESS")
+check("A2 leaving PAID ensures effects first", won is True
+      and count("fulfilment_requests", "order_id=?", (oa2,)) == 1)
+
+# A2b: leaving PAID with broken effects is refused; the order
+#      stays PAID where the recovery paths can see it.
+oa3 = mk_order("a3@test.dev", "Deep Scan", 29, status="PAID")
+real_hook = S.on_deep_scan_paid
+S.on_deep_scan_paid = lambda row: (_ for _ in ()).throw(
+    RuntimeError("boom"))
+c = db()
+row_a3 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (oa3,)).fetchone())
+c.close()
+refused = False
+try:
+    S.transition_order_status(row_a3, "IN_PROGRESS")
+except RuntimeError:
+    refused = True
+S.on_deep_scan_paid = real_hook
+check("A2b broken effects block leaving PAID", refused
+      and order_status(oa3) == "PAID")
+
+# S3: sweep ordering — a linked NEW order whose transition effects
+#     fail once is recovered within the SAME sweep (snapshot after
+#     transitions), and its receipt follows the recovered effects.
+os3 = mk_order("s3@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_s3','checkout.session.completed',?,?,?,2900)",
+          (os3, S.utcnow(), "pi_s3"))
+c.commit()
+c.close()
+calls = {"n": 0}
+
+
+def flaky_hook(row):
+    calls["n"] += 1
+    if calls["n"] == 1:
+        raise RuntimeError("first attempt fails")
+    return real_hook(row)
+
+
+S.on_deep_scan_paid = flaky_hook
+S.sweep_paid_side_effects()
+S.on_deep_scan_paid = real_hook
+check("S3 sweep recovers flaky transition in one run",
+      order_status(os3) == "PAID"
+      and count("fulfilment_requests", "order_id=?", (os3,)) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (os3,)) == 1)
+
+# S3b: with effects permanently broken, the sweep sends NO receipt
+#      (never tell a payer "queued" while the queueing failed).
+os4 = mk_order("s4@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_s4','checkout.session.completed',?,?,?,2900)",
+          (os4, S.utcnow(), "pi_s4"))
+c.commit()
+c.close()
+S.on_deep_scan_paid = lambda row: (_ for _ in ()).throw(
+    RuntimeError("always broken"))
+S.sweep_paid_side_effects()
+S.on_deep_scan_paid = real_hook
+check("S3b no receipt while effects broken",
+      order_status(os4) == "PAID"
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (os4,)) == 0
+      and count("fulfilment_requests", "order_id=?", (os4,)) == 0)
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

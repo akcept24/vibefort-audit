@@ -113,6 +113,7 @@ EMAIL_RX = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$")
 # Persistence
 # ---------------------------------------------------------------------------
 _db_lock = threading.Lock()
+_webhook_lock = threading.RLock()
 
 
 def db_connect():
@@ -1444,6 +1445,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"ok": False, "error": "processing"})
 
     def _stripe_process(self, event, session):
+        # One delivery at a time: candidate selection, event linking
+        # and the transition must be atomic as a unit — two
+        # concurrent deliveries could otherwise both claim the same
+        # NEW order (Codex delta-5 finding 1). Payment volume is
+        # small; correctness beats parallelism here.
+        with _webhook_lock:
+            self._stripe_process_locked(event, session)
+
+    def _stripe_process_locked(self, event, session):
         etype = event.get("type") or ""
         eid = event.get("id") or ""
         amount = session.get("amount_total")
@@ -1659,7 +1669,20 @@ class Handler(BaseHTTPRequestHandler):
             row = dict(row)
         finally:
             conn.close()
-        if not transition_order_status(row, new_status):
+        try:
+            won = transition_order_status(row, new_status)
+        except ValueError as e:
+            self._send_json(400, {"ok": False, "error": str(e)})
+            return
+        except Exception as e:
+            log(f"admin transition {oid} -> {new_status} blocked: "
+                f"{e!r}")
+            self._send_json(500, {"ok": False,
+                                  "error": "paid side effects are "
+                                           "incomplete; fix those "
+                                           "before advancing"})
+            return
+        if not won:
             self._send_json(409, {"ok": False,
                                   "error": "concurrent transition; "
                                            "status already moved"})
@@ -1968,6 +1991,20 @@ def transition_order_status(row, new_status):
     hook). Callers validate the move first (admin API: forward-only;
     webhook: a signature-verified payment for a NEW order)."""
     oid = row["id"]
+    if row["status"] == "NEW" and new_status != "PAID" and \
+            ORDER_STATUSES.index(new_status) > \
+            ORDER_STATUSES.index("PAID"):
+        # Skipping PAID skips its side effects, and every recovery
+        # path (consult, sweep) keys on PAID — the order would
+        # strand, paid and unfulfilled (Codex delta-5 finding 2).
+        raise ValueError(
+            f"cannot move NEW -> {new_status}: an order must pass "
+            "through PAID, where its side effects live")
+    if row["status"] == "PAID" and new_status != "PAID":
+        # Leaving PAID is allowed only once the paid side effects
+        # are complete; past PAID no recovery path can see the
+        # order (Codex delta-5 finding 2).
+        ensure_paid_side_effects(row)
     with _db_lock:
         conn = db_connect()
         try:
@@ -2030,19 +2067,13 @@ def ensure_paid_side_effects(order):
 
 
 def sweep_paid_side_effects():
-    """Boot sweep: every PAID Deep Scan / Monitoring order gets its
-    side-effect completion verified (and re-fired if missing), and
+    """Boot sweep: every PAID order gets its side-effect completion
+    verified (and re-fired if missing), and
     every matched Stripe event gets its receipt email verified (and
     resent if it never landed). Idempotent; runs once at startup."""
     conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            "SELECT * FROM orders WHERE status='PAID' AND "
-            "tier IN ('Deep Scan','Monitoring')").fetchall()
-        evs = conn.execute(
-            "SELECT event_id, order_id, amount FROM stripe_events "
-            "WHERE order_id IS NOT NULL").fetchall()
         linked_new = conn.execute(
             "SELECT o.* FROM stripe_events se JOIN orders o "
             "ON o.id = se.order_id WHERE o.status='NEW'").fetchall()
@@ -2057,6 +2088,19 @@ def sweep_paid_side_effects():
         except Exception as e:
             log(f"boot sweep: transition for linked order "
                 f"{row['id']} failed: {e!r}")
+    # Snapshot AFTER the transitions: an order that landed PAID a
+    # moment ago must be effect-checked in this same run, not wait
+    # for the next restart (Codex delta-5 finding 3).
+    conn = db_connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE status='PAID'").fetchall()
+        evs = conn.execute(
+            "SELECT event_id, order_id, amount FROM stripe_events "
+            "WHERE order_id IS NOT NULL").fetchall()
+    finally:
+        conn.close()
     for row in rows:
         try:
             ensure_paid_side_effects(dict(row))
@@ -2065,6 +2109,11 @@ def sweep_paid_side_effects():
                 f"failed: {e!r}")
     for ev in evs:
         try:
+            # Never tell a payer the audit is queued while the
+            # queueing itself failed (Codex delta-5 finding 3):
+            # the receipt goes only once the effects are on record.
+            if not _paid_effects_done(ev["order_id"]):
+                continue
             conn = db_connect()
             conn.row_factory = sqlite3.Row
             orow = conn.execute("SELECT * FROM orders WHERE id=?",
