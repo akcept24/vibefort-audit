@@ -6052,6 +6052,251 @@ check("N82 (1): fresh subprocess — a FUNCTIONAL foreign "
 _SRV30.shutdown()
 _SRV30.server_close()
 
+# ROUND 31 — Codex delta-29: NO-SHIP on 87840b4, ONE
+# finding, statement-layer only. Certified (untouched):
+# the no-code-change round itself (server.py the same
+# git blob), pin N82, the catalog chain, the generalized
+# exclusion (i), the corrected window phrase, and
+# everything behavioural through delta-28. The finding:
+# the round-30 positive claim scoped the no-creation
+# guarantee to the default opener "built by this
+# module's warm-up OR the identical one built by
+# urlopen's lazy branch" — but the lazy branch builds
+# DURING the call, creating its handler's context
+# inside the exchange, so the claim exceeded its scope
+# for that sub-case. THIS ROUND CHANGES NO PRODUCTION
+# CODE: the JOURNAL statement is corrected again — the
+# claim's default-opener scope is narrowed to the
+# module-warmed opener ALONE, and the lazy-build event
+# is named in the bound as a residual: with the warm-up
+# in place the process-global opener is built from
+# process start, so urlopen's lazy branch can run
+# inside a gated call ONLY if the process's own code
+# reset the private global urllib.request._opener to
+# None after import; the FIRST gated call after such a
+# reset then contains stdlib's lazy build (once per
+# reset, performed by stdlib itself), and subsequent
+# calls ride the built opener under the claim. N83
+# below is that residual's factual basis. N83 is GREEN
+# on 87840b4 by design — the round-30 defect was in the
+# claim's scope, in the text, not in behaviour; it is a
+# basis pin, not a defect specimen.
+
+import http.server as _hs31
+import re as _re31
+import ssl as _ssl31
+import subprocess as _sp31
+import tempfile as _tf31
+
+_certdir31 = _tf31.mkdtemp(prefix="vf-tls31-")
+_ca31 = os.path.join(_certdir31, "ca.pem")
+_cakey31 = os.path.join(_certdir31, "ca.key")
+_sp31.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+           "-keyout", _cakey31, "-out", _ca31, "-days", "2",
+           "-nodes", "-subj", "/CN=vf-ca31",
+           "-addext", "basicConstraints=critical,CA:TRUE",
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+          check=True, capture_output=True, timeout=60)
+_cert31 = os.path.join(_certdir31, "cert.pem")
+_key31 = os.path.join(_certdir31, "key.pem")
+_csr31 = os.path.join(_certdir31, "srv.csr")
+_ext31 = os.path.join(_certdir31, "srv.ext")
+_sp31.run(["openssl", "req", "-newkey", "rsa:2048",
+           "-keyout", _key31, "-out", _csr31, "-nodes",
+           "-subj", "/CN=127.0.0.1"],
+          check=True, capture_output=True, timeout=60)
+with open(_ext31, "w") as _fext31:
+    _fext31.write("subjectAltName=IP:127.0.0.1\n")
+_sp31.run(["openssl", "x509", "-req", "-in", _csr31,
+           "-CA", _ca31, "-CAkey", _cakey31,
+           "-CAcreateserial", "-out", _cert31, "-days", "2",
+           "-extfile", _ext31],
+          check=True, capture_output=True, timeout=60)
+_srvctx31 = _ssl31.SSLContext(_ssl31.PROTOCOL_TLS_SERVER)
+_srvctx31.load_cert_chain(_cert31, _key31)
+
+
+class _TlsHandler31(_hs31.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        if self.path == "/tls-ok":
+            body = b'{"id": "mail-n83-ok"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_SRV31 = _hs31.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _TlsHandler31)
+_SRV31.socket = _srvctx31.wrap_socket(_SRV31.socket,
+                                      server_side=True)
+_PORT31 = _SRV31.server_address[1]
+_th31srv = threading.Thread(
+    target=_SRV31.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th31srv.start()
+
+# N83 (1): the lazy-build residual — a FRESH SUBPROCESS
+# specimen in N78's pattern. The driver imports the
+# server module (the warm-up installs the global opener
+# at process start), then the driver itself RESETS
+# urllib.request._opener to None — simulating the
+# process's own code dropping the private global after
+# import, the only route by which urlopen's lazy branch
+# can still run inside a gated call. The driver wraps
+# the stdlib context creators (http.client's and ssl's)
+# in one counter and runs TWO gated sends to the local
+# CA-signed TLS server (the child's environment carries
+# SSL_CERT_FILE=<the local CA>, N78's arrangement, so
+# the default context — whenever built — trusts the
+# server and both sends run on production mechanics):
+# the FIRST send must classify delivered AND record at
+# least one context creation inside the call (the lazy
+# build: opener construction, including its HTTPS
+# handler's context creation, performed by stdlib
+# itself during that call); the SECOND send must
+# classify delivered with ZERO creations (it rides the
+# opener the lazy branch built). Together they are the
+# exact shape the corrected statement names: one
+# creation-bearing call per reset, excluded from the
+# no-creation claim; every later call under the claim.
+_DRIVER83 = '''import http.client
+import os
+import ssl
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+port = int(sys.argv[2])
+dbpath = sys.argv[3]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+import server as SRV
+
+print("WARMED83 opener=%s" % (
+    "set" if urllib.request._opener is not None
+    else "unset"), flush=True)
+
+# The foreign reset: the process's own code drops the
+# private global opener AFTER import (the warm-up had
+# installed one at process start). urlopen's lazy branch
+# is now the only way the next call can obtain an
+# opener — and it builds one DURING that call.
+urllib.request._opener = None
+
+_created = [0]
+_real_hc = http.client._create_https_context
+_real_ssl = ssl._create_default_https_context
+
+
+def _counting_hc(http_version):
+    _created[0] += 1
+    return _real_hc(http_version)
+
+
+def _counting_ssl(*a, **kw):
+    _created[0] += 1
+    return _real_ssl(*a, **kw)
+
+
+http.client._create_https_context = _counting_hc
+ssl._create_default_https_context = _counting_ssl
+
+SRV.RESEND_API_KEY = "catalog-test-key"
+SRV._GATED_SEND_DEADLINE = 10.0
+SRV._RESEND_API_URL = "https://127.0.0.1:%d/tls-ok" % port
+_conn = SRV.db_connect()
+_cur = _conn.execute(
+    "INSERT INTO orders(created_at,name,email,url,tier,"
+    "notes,amount,status) VALUES(?,?,?,?,?,?,?,?)",
+    (SRV.utcnow(), "Cat T", "n83@test.dev",
+     "https://example.com", "Deep Scan", "", 29, "PAID"))
+_oid = _cur.lastrowid
+_conn.commit()
+_conn.close()
+_res1 = SRV._gated_send(_oid, SRV.send_resend,
+                        "n83@test.dev",
+                        "Payment received — Deep Scan", "body")
+print("SEND1 status=%s id=%s created=%d" % (
+    SRV._send_status(_res1), _res1[1],
+    _created[0]), flush=True)
+_created[0] = 0
+_res2 = SRV._gated_send(_oid, SRV.send_resend,
+                        "n83@test.dev",
+                        "Payment received — Deep Scan", "body")
+print("SEND2 status=%s id=%s created=%d" % (
+    SRV._send_status(_res2), _res2[1],
+    _created[0]), flush=True)
+'''
+
+_drvdir31 = _tf31.mkdtemp(prefix="vf-n83-")
+_drvfile83 = os.path.join(_drvdir31, "driver83.py")
+with open(_drvfile83, "w") as _fdrv83:
+    _fdrv83.write(_DRIVER83)
+_env83 = dict(os.environ)
+_env83["SSL_CERT_FILE"] = _ca31
+_run83 = _sp31.run(
+    [sys.executable, _drvfile83,
+     os.path.dirname(os.path.abspath(__file__)),
+     str(_PORT31), os.path.join(_drvdir31, "n83.db")],
+    env=_env83, capture_output=True, text=True, timeout=180)
+_out83 = _run83.stdout or ""
+print("N83 driver rc=%d stdout:\n%s"
+      % (_run83.returncode, _out83))
+if _run83.stderr:
+    print("N83 driver stderr (tail):\n"
+          + _run83.stderr[-2000:])
+_mwarm83 = _re31.search(r"WARMED83 opener=(set|unset)",
+                        _out83)
+_msnd83a = _re31.search(
+    r"SEND1 status=(\S+) id=(\S+) created=(\d+)", _out83)
+_msnd83b = _re31.search(
+    r"SEND2 status=(\S+) id=(\S+) created=(\d+)", _out83)
+check("N83 (1): fresh subprocess — the warm-up leaves "
+      "the global opener set at import; after the "
+      "process's own code resets urllib.request._opener "
+      "to None, the FIRST gated send contains stdlib's "
+      "lazy build (delivered, provider id returned, and "
+      ">=1 stdlib context creation recorded inside the "
+      "call) and the SECOND gated send rides the built "
+      "opener (delivered, zero creations) — the factual "
+      "basis of the statement's lazy-build residual "
+      "(basis pin, green by design on the pre-round "
+      "tree: the round-30 defect was in the claim's "
+      "scope, not in behaviour)",
+      _run83.returncode == 0
+      and _mwarm83 is not None
+      and _mwarm83.group(1) == "set"
+      and _msnd83a is not None
+      and _msnd83a.group(1) == "delivered"
+      and _msnd83a.group(2) == "mail-n83-ok"
+      and int(_msnd83a.group(3)) >= 1
+      and _msnd83b is not None
+      and _msnd83b.group(1) == "delivered"
+      and _msnd83b.group(2) == "mail-n83-ok"
+      and int(_msnd83b.group(3)) == 0)
+_SRV31.shutdown()
+_SRV31.server_close()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
