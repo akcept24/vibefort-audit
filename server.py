@@ -45,6 +45,23 @@ TIER_PRICES = {"Free scan": 0, "Deep Scan": 29, "Quick Audit": 299,
                "Full Audit": 899, "Deep Audit": 2999, "Monitoring": 79}
 ORDER_STATUSES = ["NEW", "PAID", "IN_PROGRESS", "VERIFYING", "DELIVERED",
                   "RETEST"]
+# Stripe (live links created 2026-11-09 in acct_1UXEPmL0Rfi91QqA).
+# STRIPE_LINKS mirrors CHECKOUT_URLS in app.js — keep the two in sync.
+STRIPE_LINKS = {
+    "Deep Scan": "https://buy.stripe.com/8x2aEY3HTbe171xe3hdjO00",
+    "Quick Audit": "https://buy.stripe.com/cNi6oI1zLci571xe3hdjO01",
+    "Full Audit": "https://buy.stripe.com/8x28wQa6h2HvgC77ETdjO02",
+    "Deep Audit": "https://buy.stripe.com/6oU28sa6hbe1fy34sHdjO03",
+    "Monitoring": "https://buy.stripe.com/bJeaEYfqB6XL71xgbpdjO04",
+}
+# Webhook signing secret (whsec_...) — set in the app env once the
+# endpoint is registered in the Stripe dashboard. While unset the
+# webhook route answers 503 and payment matching stays manual.
+STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+# Paid amounts (cents) are unique per tier, so a completed checkout
+# identifies its tier by amount alone.
+AMOUNT_TO_TIER = {price * 100: tier for tier, price in TIER_PRICES.items()
+                  if price > 0}
 
 
 def log(msg):
@@ -140,6 +157,11 @@ def db_connect():
         payload TEXT NOT NULL,
         status TEXT NOT NULL DEFAULT 'queued',
         created_at TEXT NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS stripe_events(
+        event_id TEXT PRIMARY KEY,
+        type TEXT NOT NULL,
+        order_id INTEGER,
+        received_at TEXT NOT NULL)""")
     return conn
 
 
@@ -259,6 +281,7 @@ def validate_brief(data):
 # ---------------------------------------------------------------------------
 import base64
 import hashlib as _hl
+import hmac
 import http.client
 import secrets as _secrets
 import socket
@@ -1232,6 +1255,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_brief()
             elif path == "/api/scan":
                 self._api_scan()
+            elif path == "/api/stripe-webhook":
+                self._api_stripe_webhook()
             elif path.startswith("/api/orders/"):
                 self._api_admin_post(path)
             else:
@@ -1347,6 +1372,102 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+    def _api_stripe_webhook(self):
+        """Stripe webhook: a signature-verified checkout completion
+        marks the matching NEW order PAID through the same transition
+        path as the admin API. Matching is deliberately conservative:
+        the tier comes from the paid amount (unique per tier) and the
+        order is chosen by payer email among NEW orders of that tier;
+        exactly one candidate auto-pays — anything else goes to HQ as
+        an alert and a human matches it. Events dedupe by id.
+        Fail-closed: while STRIPE_WEBHOOK_SECRET is unset the route
+        answers 503 and payment matching stays manual."""
+        if not STRIPE_WEBHOOK_SECRET:
+            self._send_json(503, {"ok": False,
+                                  "error": "webhook not configured"})
+            return
+        raw = getattr(self, "_raw_body", b"")
+        sig = self.headers.get("Stripe-Signature") or ""
+        if not _stripe_signature_ok(raw, sig, STRIPE_WEBHOOK_SECRET):
+            self._send_json(400, {"ok": False, "error": "bad signature"})
+            return
+        try:
+            event = json.loads(raw.decode("utf-8"))
+        except Exception:
+            self._send_json(400, {"ok": False, "error": "bad payload"})
+            return
+        etype = event.get("type") or ""
+        eid = event.get("id") or ""
+        if etype not in ("checkout.session.completed",
+                         "checkout.session.async_payment_succeeded"):
+            self._send_json(200, {"ok": True, "ignored": etype})
+            return
+        session = (event.get("data") or {}).get("object") or {}
+        if session.get("payment_status") != "paid":
+            self._send_json(200, {"ok": True, "ignored": "not paid"})
+            return
+        with _db_lock:
+            conn = db_connect()
+            try:
+                cur = conn.execute(
+                    "INSERT OR IGNORE INTO stripe_events(event_id, type,"
+                    " order_id, received_at) VALUES(?,?,NULL,?)",
+                    (eid, etype, utcnow()))
+                conn.commit()
+                fresh = cur.rowcount > 0
+            finally:
+                conn.close()
+        if not fresh:
+            self._send_json(200, {"ok": True, "duplicate": True})
+            return
+        amount = session.get("amount_total")
+        tier = AMOUNT_TO_TIER.get(amount)
+        email = _s((session.get("customer_details") or {}).get("email")
+                   or session.get("customer_email") or "").lower()
+        order = None
+        ambiguous = False
+        if tier and email:
+            conn = db_connect()
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    "SELECT * FROM orders WHERE status='NEW' AND tier=? "
+                    "AND lower(email)=? ORDER BY id",
+                    (tier, email)).fetchall()
+            finally:
+                conn.close()
+            if len(rows) == 1:
+                order = dict(rows[0])
+            elif len(rows) > 1:
+                ambiguous = True
+        if order is not None:
+            with _db_lock:
+                conn = db_connect()
+                try:
+                    conn.execute(
+                        "UPDATE stripe_events SET order_id=? "
+                        "WHERE event_id=?", (order["id"], eid))
+                    conn.commit()
+                finally:
+                    conn.close()
+            transition_order_status(order, "PAID")
+            log_event(order["id"], "STRIPE_PAID",
+                      f"event={eid} amount={amount} tier={tier}")
+            send_telegram(
+                f"ShipAudit Lab: Stripe payment matched — order "
+                f"#{order['id']} ({tier}, ${amount / 100:.2f}) marked "
+                f"PAID automatically.")
+            self._send_json(200, {"ok": True, "order_id": order["id"]})
+            return
+        log_event(None, "STRIPE_UNMATCHED",
+                  f"event={eid} tier={tier} email={email} "
+                  f"amount={amount} ambiguous={ambiguous}")
+        send_telegram(
+            f"ShipAudit Lab: Stripe payment NOT matched — tier={tier} "
+            f"email={email} amount={amount} ambiguous={ambiguous} "
+            f"event={eid}. Match it manually in the admin register.")
+        self._send_json(200, {"ok": True, "matched": False})
+
     def _api_admin_post(self, path):
         if not self._admin_ok():
             self._send_json(404, {"ok": False, "error": "not found"})
@@ -1382,17 +1503,10 @@ class Handler(BaseHTTPRequestHandler):
                                       "error": f"cannot move {cur_status} "
                                                f"-> {new_status} (forward only)"})
                 return
-            with _db_lock:
-                conn.execute("UPDATE orders SET status=? WHERE id=?",
-                             (new_status, oid))
-                conn.commit()
+            row = dict(row)
         finally:
             conn.close()
-        log_event(oid, "STATUS_CHANGED", f"{cur_status} -> {new_status}")
-        if new_status == "PAID" and row["tier"] == "Monitoring":
-            activate_monitor(dict(row))
-        if new_status == "PAID" and row["tier"] == "Deep Scan":
-            on_deep_scan_paid(dict(row))
+        transition_order_status(row, new_status)
         self._send_json(200, {"ok": True, "id": oid, "status": new_status})
 
     def _api_admin_delete(self, path):
@@ -1496,14 +1610,23 @@ class Handler(BaseHTTPRequestHandler):
         log_event(order_id, "ALERT_EMAIL_SENT" if alert_ok
                   else "ALERT_EMAIL_FAILED", alert_detail)
 
+        pay_url = STRIPE_LINKS.get(clean["tier"])
+        if pay_url:
+            pay_step_text = (
+                f"1. Pay whenever you are ready, here: {pay_url}\n"
+                "   We have not charged you anything — no charge "
+                "happens until you complete that payment.\n")
+        else:
+            pay_step_text = "1. No payment is needed for a free scan.\n"
         confirm_text = (
             f"Hi {clean['name']},\n\n"
             f"Thanks — we've received your brief for a {clean['tier']} of "
             f"{clean['url']}.\n\n"
             "What happens next:\n"
-            "1. We review the scope of your app (within one business day).\n"
-            "2. We then email you a secure payment link. We have not charged "
-            "you anything.\n"
+            + pay_step_text +
+            "2. We confirm the scope of your app within one business "
+            "day. If the work cannot run as briefed, we write to you "
+            "before starting — and refund any payment in full.\n"
             "3. Your audit starts as soon as the payment lands — the delivery "
             "clock in the pricing section of our site runs from payment, not from this brief.\n\n"
             "If anything in the brief needs correcting, just reply to this "
@@ -1522,22 +1645,34 @@ class Handler(BaseHTTPRequestHandler):
                     ("Reference", f"Brief #{order_id}"),
                     ("Service", f"{clean['tier']} ({amount_label})"),
                     ("Target", clean["url"]),
-                    ("Status", "Received — awaiting scope review"),
+                    ("Status", "Received — ready for payment"
+                     if pay_url else "Received"),
                 ])
                 + email_template.list_heading("What happens next")
                 + email_template.steps([
-                    ("Scope review.",
-                     "We review the scope of your app (within one "
-                     "business day)."),
-                    ("Payment link.",
-                     "We then email you a secure payment link. We "
-                     "have not charged you anything."),
+                    ("Pay whenever you're ready.",
+                     "Use the secure Stripe link below. We have not "
+                     "charged you anything — no charge happens until "
+                     "you complete that payment."
+                     if pay_url else
+                     "No payment is needed for a free scan."),
+                    ("Scope confirmed.",
+                     "We confirm the scope of your app within one "
+                     "business day. If the work cannot run as "
+                     "briefed, we write to you before starting — and "
+                     "refund any payment in full."),
                     ("Audit starts at payment.",
                      "Your audit starts as soon as the payment "
                      "lands — the delivery clock in the pricing "
                      "section of our site runs from payment, not "
                      "from this brief."),
                 ])
+                + (f'<p style="font-family:{email_template.SANS};'
+                   f'font-size:15px;line-height:1.65;margin:0 0 16px 0;">'
+                   f'<a href="{pay_url}" style="color:'
+                   f'{email_template.RED};font-weight:bold;">'
+                   f"Continue to secure payment</a></p>"
+                   if pay_url else "")
                 + email_template.para(
                     "If anything in the brief needs correcting, just "
                     "reply to this email.")),
@@ -1670,6 +1805,54 @@ class Handler(BaseHTTPRequestHandler):
 # transport between this register and the engine host is wired on
 # activation day (the payload is the contract, not the channel).
 # ---------------------------------------------------------------------------
+def transition_order_status(row, new_status):
+    """The one status-transition path: DB update + event log + the
+    PAID side effects (monitoring activation, Deep Scan fulfilment
+    hook). Callers validate the move first (admin API: forward-only;
+    webhook: a signature-verified payment for a NEW order)."""
+    oid = row["id"]
+    with _db_lock:
+        conn = db_connect()
+        try:
+            conn.execute("UPDATE orders SET status=? WHERE id=?",
+                         (new_status, oid))
+            conn.commit()
+        finally:
+            conn.close()
+    log_event(oid, "STATUS_CHANGED", f"{row['status']} -> {new_status}")
+    if new_status == "PAID" and row["tier"] == "Monitoring":
+        activate_monitor(row)
+    if new_status == "PAID" and row["tier"] == "Deep Scan":
+        on_deep_scan_paid(row)
+
+
+def _stripe_signature_ok(raw, header, secret):
+    """Verify a Stripe-Signature header against the raw body:
+    HMAC-SHA256 of "<t>.<body>" with the endpoint secret, 5-minute
+    tolerance, constant-time compare. Any v1 candidate may match
+    (Stripe sends two during secret rotation)."""
+    try:
+        stamps = []
+        sigs = []
+        for part in header.split(","):
+            key, _, value = part.partition("=")
+            if key.strip() == "t":
+                stamps.append(value.strip())
+            elif key.strip() == "v1":
+                sigs.append(value.strip())
+        if not stamps or not sigs:
+            return False
+        ts = stamps[0]
+        if abs(time.time() - int(ts)) > 300:
+            return False
+        signed = ts.encode() + b"." + raw
+        expect = hmac.new(secret.encode(), signed,
+                          _hl.sha256).hexdigest()
+        return any(hmac.compare_digest(expect, s) for s in sigs)
+    except Exception:
+        return False
+
+
 def on_deep_scan_paid(order):
     payload = {"order_id": order["id"], "tier": order["tier"],
                "name": order["name"], "email": order["email"],
@@ -1833,33 +2016,15 @@ def _run_monitor(mon):
             prev = json.loads(mon["last_digest"])
         except Exception:
             prev = None
-    now = time.time()
-    with _db_lock:
-        conn = db_connect()
-        conn.execute(
-            "UPDATE monitors SET last_run_at=?, last_scan_id=?, "
-            "last_digest=?, next_run_at=? WHERE id=?",
-            (now, scan_id, json.dumps(digest), now + MONITOR_INTERVAL,
-             mon["id"]))
-        conn.commit()
-        conn.close()
-    if prev is None:
-        log_event(order_id, "MONITOR_BASELINE",
-                  f"grade={grade} score={score} findings={len(digest)}")
-        send_telegram(
-            f"ShipAudit Lab: monitoring baseline set for {mon['url']} - "
-            f"grade {grade} ({score}), {len(digest)} findings. "
-            "Weekly rescans from here.")
-        return
-    new = [d for d in digest if d not in prev]
-    gone = [d for d in prev if d not in digest]
-    if not new and not gone:
-        log_event(order_id, "MONITOR_RESCAN",
-                  f"no changes; grade={grade} score={score}")
-        return
-    log_event(order_id, "MONITOR_CHANGED",
-              f"new={len(new)} resolved={len(gone)} "
-              f"grade={grade} score={score}")
+    new = [d for d in digest if d not in prev] if prev is not None else []
+    gone = [d for d in prev if d not in digest] if prev is not None else []
+    changed = prev is not None and bool(new or gone)
+    alert_ok = None
+    alert_detail = ""
+    if changed:
+        log_event(order_id, "MONITOR_CHANGED",
+                  f"new={len(new)} resolved={len(gone)} "
+                  f"grade={grade} score={score}")
     body = (
         f"Hi {mon['name']},\n\n"
         f"Our weekly rescan of {mon['url']} found changes since the "
@@ -1897,16 +2062,50 @@ def _run_monitor(mon):
                 "updated report.")),
         reason="You received this email because Monitoring is active "
                "for this app on your ShipAudit Lab account.")
-    ok, detail = send_resend(
-        mon["email"], f"Monitoring: changes detected on {host}", body,
-        html=body_html)
-    log_event(order_id,
-              "MONITOR_ALERT_SENT" if ok else "MONITOR_ALERT_FAILED",
-              detail)
-    send_telegram(
-        f"ShipAudit Lab: monitoring changes on {mon['url']} - "
-        f"{len(new)} new, {len(gone)} resolved; grade {grade} ({score}). "
-        f"Client alert: {'SENT' if ok else 'FAILED - ' + detail}")
+    if changed:
+        alert_ok, alert_detail = send_resend(
+            mon["email"], f"Monitoring: changes detected on {host}",
+            body, html=body_html)
+        log_event(order_id,
+                  "MONITOR_ALERT_SENT" if alert_ok
+                  else "MONITOR_ALERT_FAILED",
+                  alert_detail)
+        send_telegram(
+            f"ShipAudit Lab: monitoring changes on {mon['url']} - "
+            f"{len(new)} new, {len(gone)} resolved; grade {grade} "
+            f"({score}). Client alert: "
+            f"{'SENT' if alert_ok else 'FAILED - ' + alert_detail}")
+    # The digest advances only after the client alert is delivered.
+    # Advancing it earlier (the pre-2026-11-09 order) lost alerts
+    # forever when the send failed: the next rescan compared against
+    # the new digest and reported "no changes". A failed alert now
+    # holds the old digest and retries in an hour.
+    hold = changed and not alert_ok
+    now = time.time()
+    with _db_lock:
+        conn = db_connect()
+        conn.execute(
+            "UPDATE monitors SET last_run_at=?, last_scan_id=?, "
+            "last_digest=?, next_run_at=? WHERE id=?",
+            (now, scan_id,
+             mon["last_digest"] if hold else json.dumps(digest),
+             now + (3600 if hold else MONITOR_INTERVAL),
+             mon["id"]))
+        conn.commit()
+        conn.close()
+    if hold:
+        log_event(order_id, "MONITOR_ALERT_RETRY",
+                  "alert failed; digest held, rescan in 1h")
+    if prev is None:
+        log_event(order_id, "MONITOR_BASELINE",
+                  f"grade={grade} score={score} findings={len(digest)}")
+        send_telegram(
+            f"ShipAudit Lab: monitoring baseline set for {mon['url']} - "
+            f"grade {grade} ({score}), {len(digest)} findings. "
+            "Weekly rescans from here.")
+    elif not changed:
+        log_event(order_id, "MONITOR_RESCAN",
+                  f"no changes; grade={grade} score={score}")
 
 
 def _monitor_loop():
