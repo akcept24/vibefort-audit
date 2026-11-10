@@ -2502,6 +2502,15 @@ def sweep_paid_side_effects():
             if orow is None:
                 continue
             order_d = dict(orow)
+            if order_d["status"] == "NEW":
+                # A link to a still-NEW order is in-flight or
+                # recoverable state, owned by the delivery, its
+                # retry consult and the linked-NEW loop above —
+                # never settled here. Settling it would race a
+                # live payment in another process, and would
+                # terminally ack a payment whose transition is
+                # only fenced off (Codex delta-12 #1/#2).
+                continue
             winner_pi = order_d.get("paid_pi")
             proven = bool(winner_pi and ev["payment_intent"]
                           and ev["payment_intent"] == winner_pi)

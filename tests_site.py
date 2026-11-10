@@ -1109,6 +1109,69 @@ c.commit()
 c.close()
 S.db_connect().close()  # recreates the index now that data is clean
 
+# ---- Delta-12 catalog (added 2026-11-09, round 12) ----
+# W28: the sweep never settles a link to a still-NEW order — that
+#      state is in-flight/recoverable, owned by the delivery, its
+#      consult and the linked-NEW loop.
+o28 = mk_order("w28@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w28','checkout.session.completed',?,?,?,2900)",
+          (o28, S.utcnow(), "pi_w28"))
+c.commit()
+c.close()
+S.sweep_paid_side_effects()
+c = db()
+link28 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w28'").fetchone()[0]
+c.close()
+check("W28 sweep leaves NEW links alone",
+      link28 == o28
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w28%'", ()) == 0)
+# (the same sweep transitioned o28 via the linked-NEW loop, so
+# the link is now a proven winner's — settle state is consistent)
+
+# W28b: with the fence DOWN (legacy duplicate paid_pi), a NEW
+#       link survives the sweep unsettled; once the data is
+#       cleaned and the index returns, the next sweep completes
+#       the payment automatically.
+o28b = mk_order("w28b@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w28b','checkout.session.completed',?,?,?,2900)",
+          (o28b, S.utcnow(), "pi_w28b"))
+c.execute("DROP INDEX idx_orders_paid_pi")
+c.execute("UPDATE orders SET paid_pi='pi_w28b_dup' WHERE id=?",
+          (o25a,))
+c.execute("UPDATE orders SET paid_pi='pi_w28b_dup' WHERE id=?",
+          (o26a,))
+c.commit()
+c.close()
+S.sweep_paid_side_effects()
+c = db()
+link28b = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w28b'").fetchone()[0]
+c.close()
+check("W28b fenced-off link survives the sweep",
+      link28b == o28b and order_status(o28b) == "NEW"
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w28b%'", ()) == 0)
+c = S.db_connect()
+c.execute("UPDATE orders SET paid_pi='pi_w25' WHERE id=?", (o25a,))
+c.execute("UPDATE orders SET paid_pi='pi_w26' WHERE id=?", (o26a,))
+c.commit()
+c.close()
+S.db_connect().close()  # index recreated on clean data
+S.sweep_paid_side_effects()
+check("W28b payment recovers once the fence returns",
+      order_status(o28b) == "PAID"
+      and count("fulfilment_requests", "order_id=?", (o28b,)) == 1)
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
