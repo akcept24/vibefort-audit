@@ -472,10 +472,14 @@ _MAIL_IDEM = contextvars.ContextVar("vf_mail_idem", default=None)
 # context is used verbatim on both connect paths, and
 # the factory serves context=None constructions only.
 # (2) The factory ran per connection, inside the
-# timed path; factory contexts are now cached
-# process-wide per factory (see
-# _cached_factory_context), so context creation is a
-# per-process act, not an exchange operation.
+# timed path. Rounds 27-28: on the gated path the
+# question is structural — the opener is built at
+# import (see the warm-up beside
+# _HTTPS_CONTEXT_FACTORY), so its handler's context
+# exists from process start, and the handler always
+# supplies it; direct context=None constructions
+# create fresh per construction, stdlib semantics,
+# never on the gated path.
 # (3) A redirect inside one exchange opened further
 # connections, each resolving the host again; armed
 # resolutions are now cached per exchange (see
@@ -794,40 +798,40 @@ _SEND_TIMEOUT_DEFAULT = http.client.socket \
 # control factory consultations.
 _HTTPS_CONTEXT_FACTORY = http.client._create_https_context
 
-# Round 27 (Codex delta-25 finding 2): factory contexts
-# are cached process-wide, keyed by (factory, HTTP
-# version). The first context=None construction under
-# a given factory creates the context; every later one
-# reuses the cached object, so context creation —
-# which loads trust configuration and cannot be
-# deadline-capped — happens once per factory per
-# process instead of inside every timed exchange.
-# Sharing one SSLContext across connections is the
-# stdlib's own pattern on the urllib path: the global
-# opener's HTTPS handler creates ONE context and
-# passes that same object to every connection it
-# builds, and a context's verification posture does
-# not change by being shared.
-_HTTPS_CONTEXT_CACHE = {}
-_HTTPS_CONTEXT_CACHE_LOCK = threading.Lock()
+# Round 28 (Codex delta-26 finding 1): opener warm-up.
+# urllib.request.urlopen builds the process-global
+# opener LAZILY on its first call, and building it
+# constructs the HTTPS handler, whose __init__ creates
+# a default TLS context. On a process's FIRST gated
+# send that lazy build would happen INSIDE the timed
+# exchange, uncapped. Perform exactly that act here,
+# at import: urlopen's lazy branch is the literal
+# `_opener = opener = build_opener()` (urllib/request
+# .py), so installing build_opener() with no arguments
+# — when, and only when, the global opener is still
+# unset — is the identical construction, moved to
+# process start. The handler and its context then
+# exist before any exchange, and no gated send ever
+# creates either. An opener a host process installed
+# before importing this module is never clobbered.
+if urllib.request._opener is None:
+    urllib.request.install_opener(urllib.request.build_opener())
 
-
-def _cached_factory_context(http_vsn):
-    """The process-cached TLS context for the module
-    factory's product at the given HTTP version,
-    creating it on first use under the CURRENT factory
-    (the module global is read by name at call time —
-    the module's ordinary patch seam)."""
-    factory = _HTTPS_CONTEXT_FACTORY
-    key = (factory, http_vsn)
-    ctx = _HTTPS_CONTEXT_CACHE.get(key)
-    if ctx is None:
-        with _HTTPS_CONTEXT_CACHE_LOCK:
-            ctx = _HTTPS_CONTEXT_CACHE.get(key)
-            if ctx is None:
-                ctx = factory(http_vsn)
-                _HTTPS_CONTEXT_CACHE[key] = ctx
-    return ctx
+# Round 28 (Codex delta-26 finding 3): there is NO
+# cache of factory contexts. Round 27 cached them
+# process-wide, which handed ONE MUTABLE context
+# object to separate context=None callers — a caller's
+# mutation, or a trust-store change between
+# constructions, then diverged from the stdlib
+# constructor's fresh-per-construction semantics.
+# context=None in the deadline __init__ therefore
+# calls the factory fresh on every construction,
+# exactly as http.client.HTTPSConnection does. The
+# gated path is structurally unaffected: the opener's
+# handler always supplies its context (delta-26 (b)
+# certified the factory is consulted 0 times there),
+# and the warm-up above keeps that handler's creation
+# out of the exchange.
 
 
 def _armed_remaining_or_raise():
@@ -854,25 +858,36 @@ def _deadline_tcp_connect(conn):
     a spent budget refuses the next attempt before it
     starts. Round 27 (delta-25 finding 1): the
     resolution consults the per-exchange cache
-    _send_urlopen installs (keyed by (host, port); the
-    call's family/type arguments are this call site's
-    constants), so a host already resolved in this
-    exchange — e.g. by the connection a redirect
-    started from — is not resolved again; with no
-    cache installed the resolution is the legacy
-    per-connection one."""
+    _send_urlopen installs (keyed by host ALONE — round
+    28, delta-26 finding 2; the call's family/type
+    arguments are this call site's constants), so a
+    host already resolved in this exchange — e.g. by
+    the connection a redirect started from, even one
+    the redirect retargets to another port — is not
+    resolved again; the cached address set is reused
+    with THIS connection's port substituted (see the
+    loop below). With no cache installed the resolution
+    is the legacy per-connection one."""
     sys.audit("http.client.connect", conn, conn.host,
               conn.port)
     cache = _SEND_RESOLUTION_CACHE.get()
-    key = (conn.host, conn.port)
-    infos = cache.get(key) if cache is not None else None
+    infos = cache.get(conn.host) if cache is not None else None
     if infos is None:
         infos = socket.getaddrinfo(conn.host, conn.port, 0,
                                    socket.SOCK_STREAM)
         if cache is not None:
-            cache[key] = infos
+            cache[conn.host] = infos
     last_exc = None
     for family, socktype, proto, _canon, sockaddr in infos:
+        # A cached sockaddr carries the port of the
+        # resolution that produced it; a connection to a
+        # DIFFERENT port on the same host (a redirect)
+        # substitutes its own port — everything past the
+        # port (an IPv6 sockaddr's flowinfo/scope tail)
+        # is the host's and is preserved verbatim.
+        if sockaddr[1] != conn.port:
+            sockaddr = (sockaddr[0], conn.port) \
+                + sockaddr[2:]
         remaining = _armed_remaining_or_raise()
         sock = socket.socket(family, socktype, proto)
         try:
@@ -1010,15 +1025,22 @@ class _DeadlineHTTPSConnection(_ORIG_HTTPS_CONNECTION):
         # SUPPLIED context is used verbatim (self._context
         # IS the caller's object; on the urllib path this
         # is the opener handler's context, which is how
-        # trust actually arrives), and the module factory
-        # serves context=None constructions only, through
-        # the process-wide cache. The original __init__
-        # itself still never runs — its explicit-super
-        # lookup is exactly what broke under the swap —
-        # but everything it would have decided about the
-        # context is decided here, identically.
+        # trust actually arrives), and context=None takes
+        # a FRESH factory context, exactly as the stdlib
+        # constructor creates one per construction (round
+        # 28, Codex delta-26 finding 3: round 27's
+        # process-wide cache handed one mutable object to
+        # separate callers; the cache is removed — see
+        # the note beside _HTTPS_CONTEXT_FACTORY). The
+        # factory is read as the module global of that
+        # name — the module's ordinary patch seam. The
+        # original __init__ itself still never runs — its
+        # explicit-super lookup is exactly what broke
+        # under the swap — but everything it would have
+        # decided about the context is decided here,
+        # identically.
         if context is None:
-            context = _cached_factory_context(self._http_vsn)
+            context = _HTTPS_CONTEXT_FACTORY(self._http_vsn)
         self._context = context
 
     def connect(self):
@@ -4575,8 +4597,17 @@ def _gated_send(order_id, send_fn, *args, **kwargs):
     getaddrinfo per distinct host WITHIN the exchange
     (per-exchange resolution cache, see
     _SEND_RESOLUTION_CACHE) — and a supplied TLS
-    context is used verbatim, factory contexts being
-    process-cached (see _DeadlineHTTPSConnection).
+    context is used verbatim (see
+    _DeadlineHTTPSConnection). Round 28 (Codex
+    delta-26): the resolution cache is keyed by host
+    alone (a same-host redirect to another port reuses
+    the resolution, its own port substituted); the
+    round-27 factory-context cache is REMOVED (fresh
+    context per context=None construction, stdlib
+    semantics); and the global opener is built at
+    module import, so a first gated call never builds
+    the opener — or its handler's context — inside the
+    exchange.
     Returns
     None when the gate aborts; otherwise the send
     function's own result."""

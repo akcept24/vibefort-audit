@@ -5305,19 +5305,31 @@ check("N76 (1): redirected gated exchange — the final "
       and len(_gai27) == 1)
 _ureq18.urlopen = _saved_open27
 
-# N77 (1): factory-context cache — two context=None
-# constructions of the deadline HTTPS class under one
-# counting factory consult it exactly once, both
-# constructions carry the same cached context object,
-# and the cached context is functionally used (the
-# first construction completes a TLS exchange).
-_ctxobj77 = _ssl27._create_unverified_context()
+# N77 (1): fresh factory contexts — CONTRACT CHANGE #2
+# (parent ruling, JOURNAL round 28). This pin was added
+# in the round-27 wave to pin the process-wide factory
+# cache (one consultation, one shared object); delta-26
+# refuted the cache itself (finding 3: ONE MUTABLE
+# context handed to separate context=None callers
+# diverges from stdlib's fresh-per-construction
+# semantics), so the cache is removed and this pin is
+# REWRITTEN to pin the replacement semantics: two
+# context=None constructions under one counting factory
+# consult it exactly TWICE (once per construction),
+# carry DISTINCT context objects (the ones the factory
+# made, in order), and both objects functionally
+# complete real TLS exchanges. The pin was added in an
+# uncertified wave (no SHIP ever certified it); every
+# other pin is untouched by this change.
+_made77 = []
 _calls77 = []
 
 
 def _factory77(vsn):
     _calls77.append(vsn)
-    return _ctxobj77
+    _ctx = _ssl27._create_unverified_context()
+    _made77.append(_ctx)
+    return _ctx
 
 
 SR._HTTPS_CONTEXT_FACTORY = _factory77
@@ -5327,16 +5339,22 @@ _c77a.request("GET", "/ok")
 _resp77 = _c77a.getresponse()
 _body77 = _resp77.read()
 _c77a.close()
+_c77b.request("GET", "/ok")
+_resp77b = _c77b.getresponse()
+_body77b = _resp77b.read()
 _c77b.close()
 SR._HTTPS_CONTEXT_FACTORY = _saved_factory27
 check("N77 (1): two context=None constructions under one "
-      "factory consult it exactly once; both carry the "
-      "cached context object, which completes a real TLS "
-      "exchange",
-      len(_calls77) == 1
-      and _c77a._context is _ctxobj77
-      and _c77b._context is _ctxobj77
-      and _body77 == b'{"id": "mail-n27-ok"}')
+      "factory consult it once per construction and "
+      "carry distinct fresh context objects, both of "
+      "which complete real TLS exchanges",
+      len(_calls77) == 2
+      and len(_made77) == 2
+      and _c77a._context is _made77[0]
+      and _c77b._context is _made77[1]
+      and _c77a._context is not _c77b._context
+      and _body77 == b'{"id": "mail-n27-ok"}'
+      and _body77b == b'{"id": "mail-n27-ok"}')
 
 SR._RESEND_API_URL = _saved_url27
 SR._GATED_SEND_DEADLINE = _saved_dl27
@@ -5344,6 +5362,333 @@ _SRV27.shutdown()
 _SRV27.server_close()
 _RSRV27.shutdown()
 _RSRV27.server_close()
+
+# ============================================================
+# Round 28 (Codex delta-26): WARM-UP, HOST-KEYED
+# RESOLUTIONS, FRESH FACTORY CONTEXTS — delta-26
+# certified round 27's Option A seam move, the
+# caller-context fidelity (factory consulted 0 times on
+# the wrapper path), the resolution cache's bracketing
+# and the catalog chain to 150, and refuted three
+# points, all in round 27's additions: (1) on a
+# process's FIRST gated call with urllib's global
+# opener still unset, urlopen lazily built the opener
+# and its HTTPS handler created a default context
+# INSIDE the timed exchange; a cold context=None
+# construction could likewise create during an armed
+# exchange. (2) The per-exchange resolution cache was
+# keyed (host, port): a same-host redirect to another
+# port resolved again, contradicting "per distinct
+# host". (3) The process-wide factory-context cache
+# handed ONE MUTABLE context to separate context=None
+# callers, diverging from stdlib's fresh-per-
+# construction semantics. Fixes: the module installs
+# the global opener at import when unset (exactly
+# urlopen's lazy build_opener() act, moved to process
+# start); the resolution cache is keyed by host alone
+# and each connection substitutes its own port into
+# the cached sockaddrs; the context cache is removed
+# (fresh factory context per context=None construction
+# — pinned by the rewritten N77 above, contract change
+# #2). N78 and N79 below pin (1) and (2).
+
+import re as _re28
+import socket as _sock28
+import ssl as _ssl28
+import subprocess as _sp28
+import tempfile as _tf28
+
+_certdir28 = _tf28.mkdtemp(prefix="vf-tls28-")
+_ca28 = os.path.join(_certdir28, "ca.pem")
+_cakey28 = os.path.join(_certdir28, "ca.key")
+_sp28.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+           "-keyout", _cakey28, "-out", _ca28, "-days", "2",
+           "-nodes", "-subj", "/CN=vf-ca28",
+           "-addext", "basicConstraints=critical,CA:TRUE",
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+          check=True, capture_output=True, timeout=60)
+_cert28 = os.path.join(_certdir28, "cert.pem")
+_key28 = os.path.join(_certdir28, "key.pem")
+_csr28 = os.path.join(_certdir28, "srv.csr")
+_ext28 = os.path.join(_certdir28, "srv.ext")
+_sp28.run(["openssl", "req", "-newkey", "rsa:2048",
+           "-keyout", _key28, "-out", _csr28, "-nodes",
+           "-subj", "/CN=127.0.0.1"],
+          check=True, capture_output=True, timeout=60)
+with open(_ext28, "w") as _fext28:
+    _fext28.write("subjectAltName=IP:127.0.0.1\n")
+_sp28.run(["openssl", "x509", "-req", "-in", _csr28,
+           "-CA", _ca28, "-CAkey", _cakey28,
+           "-CAcreateserial", "-out", _cert28, "-days", "2",
+           "-extfile", _ext28],
+          check=True, capture_output=True, timeout=60)
+_srvctx28 = _ssl28.SSLContext(_ssl28.PROTOCOL_TLS_SERVER)
+_srvctx28.load_cert_chain(_cert28, _key28)
+
+
+class _TlsHandler28(_hs25.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        if self.path == "/tls-ok":
+            body = b'{"id": "mail-n78-ok"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_SRV28 = _hs25.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _TlsHandler28)
+_SRV28.socket = _srvctx28.wrap_socket(_SRV28.socket,
+                                      server_side=True)
+_PORT28 = _SRV28.server_address[1]
+_th28srv = threading.Thread(
+    target=_SRV28.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th28srv.start()
+
+
+class _Redir28B(_hs25.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/target":
+            body = b'{"id": "mail-n79-ok"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_HSRV28B = _hs25.ThreadingHTTPServer(("127.0.0.1", 0),
+                                     _Redir28B)
+_HPORT28B = _HSRV28B.server_address[1]
+_th28bsrv = threading.Thread(
+    target=_HSRV28B.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th28bsrv.start()
+
+
+class _Redir28A(_hs25.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        if self.path == "/redir":
+            self.connection.sendall(
+                b"HTTP/1.1 302 Found\r\n"
+                b"Location: http://127.0.0.1:%d/target\r\n"
+                b"Content-Length: 0\r\n\r\n" % _HPORT28B)
+
+
+_HSRV28A = _hs25.ThreadingHTTPServer(("127.0.0.1", 0),
+                                     _Redir28A)
+_HPORT28A = _HSRV28A.server_address[1]
+_th28asrv = threading.Thread(
+    target=_HSRV28A.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th28asrv.start()
+
+# N78 (1): opener warm-up — a FRESH SUBPROCESS specimen
+# (the catalog's own process built its opener long ago;
+# only a child interpreter starts cold). The driver
+# wraps the stdlib context creators with counters
+# BEFORE importing the server module, prints an
+# IMPORT-DONE marker, then performs ONE gated send
+# against the CA-signed local TLS server above and
+# prints the send-phase counts. Trust design: the
+# driver does NOT install a test opener — any install
+# before the send would itself build an opener and
+# mask the very defect under test. Instead the child's
+# environment carries SSL_CERT_FILE=<the local CA>, so
+# the default context — created by whichever opener
+# build happens, at import (post-fix) or lazily inside
+# the first urlopen (pre-fix) — trusts the test server,
+# and the send runs through the installed opener with
+# production mechanics on both trees. The trees differ
+# ONLY in when the handler's context comes into
+# existence: import phase (post-fix) vs inside the
+# timed exchange (pre-fix).
+_DRIVER78 = '''import http.client
+import os
+import ssl
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+port = int(sys.argv[2])
+dbpath = sys.argv[3]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+counts = {"import": 0, "import_ssl": 0,
+          "send": 0, "send_ssl": 0}
+_phase = ["import"]
+_real_hc = http.client._create_https_context
+_real_ssl = ssl._create_default_https_context
+
+
+def _counting_hc(http_version):
+    counts[_phase[0]] += 1
+    return _real_hc(http_version)
+
+
+def _counting_ssl(*a, **kw):
+    counts[_phase[0] + "_ssl"] += 1
+    return _real_ssl(*a, **kw)
+
+
+http.client._create_https_context = _counting_hc
+ssl._create_default_https_context = _counting_ssl
+
+import server as SRV
+
+print("IMPORT-DONE hc=%d ssl=%d opener=%s" % (
+    counts["import"], counts["import_ssl"],
+    "set" if urllib.request._opener is not None
+    else "unset"), flush=True)
+
+_phase[0] = "send"
+SRV.RESEND_API_KEY = "catalog-test-key"
+SRV._GATED_SEND_DEADLINE = 10.0
+SRV._RESEND_API_URL = "https://127.0.0.1:%d/tls-ok" % port
+_conn = SRV.db_connect()
+_cur = _conn.execute(
+    "INSERT INTO orders(created_at,name,email,url,tier,"
+    "notes,amount,status) VALUES(?,?,?,?,?,?,?,?)",
+    (SRV.utcnow(), "Cat T", "n78@test.dev",
+     "https://example.com", "Deep Scan", "", 29, "PAID"))
+_oid = _cur.lastrowid
+_conn.commit()
+_conn.close()
+_res = SRV._gated_send(_oid, SRV.send_resend,
+                       "n78@test.dev",
+                       "Payment received — Deep Scan", "body")
+print("SEND status=%s id=%s hc=%d ssl=%d" % (
+    SRV._send_status(_res), _res[1],
+    counts["send"], counts["send_ssl"]), flush=True)
+'''
+
+_drvdir28 = _tf28.mkdtemp(prefix="vf-n78-")
+_drvfile28 = os.path.join(_drvdir28, "driver78.py")
+with open(_drvfile28, "w") as _fdrv28:
+    _fdrv28.write(_DRIVER78)
+_env78 = dict(os.environ)
+_env78["SSL_CERT_FILE"] = _ca28
+_run78 = _sp28.run(
+    [sys.executable, _drvfile28,
+     os.path.dirname(os.path.abspath(__file__)),
+     str(_PORT28), os.path.join(_drvdir28, "n78.db")],
+    env=_env78, capture_output=True, text=True, timeout=180)
+_out78 = _run78.stdout or ""
+print("N78 driver rc=%d stdout:\n%s"
+      % (_run78.returncode, _out78))
+if _run78.stderr:
+    print("N78 driver stderr (tail):\n"
+          + _run78.stderr[-2000:])
+_mimp78 = _re28.search(
+    r"IMPORT-DONE hc=(\d+) ssl=(\d+) opener=(set|unset)",
+    _out78)
+_msnd78 = _re28.search(
+    r"SEND status=(\S+) id=(\S+) hc=(\d+) ssl=(\d+)",
+    _out78)
+check("N78 (1): fresh subprocess — importing the server "
+      "module builds the global opener at import (its "
+      "HTTPS handler's context is created in the import "
+      "phase and the opener is set), and the first gated "
+      "send creates no context inside the exchange and "
+      "classifies delivered",
+      _run78.returncode == 0
+      and _mimp78 is not None
+      and int(_mimp78.group(1)) >= 1
+      and _mimp78.group(3) == "set"
+      and _msnd78 is not None
+      and _msnd78.group(1) == "delivered"
+      and _msnd78.group(2) == "mail-n78-ok"
+      and int(_msnd78.group(3)) == 0
+      and int(_msnd78.group(4)) == 0)
+
+# N79 (1): host-keyed resolution cache — a genuine
+# wrapper exchange redirected (302) from the host on
+# one port to the SAME host on ANOTHER port opens its
+# second connection against the cached address set
+# (its own port substituted): the host is resolved
+# exactly once for the whole exchange (pre-fix: the
+# (host, port) key missed and the host resolved twice).
+_saved_url28 = SR._RESEND_API_URL
+_saved_dl28 = SR._GATED_SEND_DEADLINE
+_saved_open28 = _ureq18.urlopen
+_real_gai28 = _sock28.getaddrinfo
+_gai28 = []
+
+
+def _counting_gai28(host, port, *a, **kw):
+    if host == "127.0.0.1":
+        _gai28.append((host, port))
+    return _real_gai28(host, port, *a, **kw)
+
+
+_ureq18.urlopen = _real_urlopen18
+SR._GATED_SEND_DEADLINE = 10.0
+SR._RESEND_API_URL = f"http://127.0.0.1:{_HPORT28A}/redir"
+_sock28.getaddrinfo = _counting_gai28
+o79 = mk_order("n79@test.dev", "Deep Scan", 29, status="PAID")
+res79 = SR._gated_send(o79, SR.send_resend, "n79@test.dev",
+                       "Payment received — Deep Scan", "body")
+_sock28.getaddrinfo = _real_gai28
+check("N79 (1): gated exchange redirected from the host "
+      "on one port to the same host on another port — "
+      "the final response classifies delivered and the "
+      "host is resolved exactly once across both "
+      "connections of the exchange",
+      res79 is not None
+      and SR._send_status(res79) == "delivered"
+      and res79[1] == "mail-n79-ok"
+      and len(_gai28) == 1)
+_ureq18.urlopen = _saved_open28
+SR._RESEND_API_URL = _saved_url28
+SR._GATED_SEND_DEADLINE = _saved_dl28
+_SRV28.shutdown()
+_SRV28.server_close()
+_HSRV28A.shutdown()
+_HSRV28A.server_close()
+_HSRV28B.shutdown()
+_HSRV28B.server_close()
 
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
