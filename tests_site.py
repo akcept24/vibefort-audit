@@ -1777,6 +1777,569 @@ check("N9 activation: MONITOR_ACTIVATED exactly once on re-entry",
       and count("events", "order_id=? AND event='MONITOR_ACTIVATED'",
                 (o17,)) == 1)
 
+# ---- Round 18 catalog (added 2026-11-10, Codex delta-17
+#      NO-SHIP: transport truthfulness + guard decoupling) ----
+# Delta-17 refuted the round-16/17 guarantees at the TRANSPORT
+# seam: the wrappers collapsed a post-acceptance exception into
+# a definite failure, so retries duplicated accepted messages
+# (a1); a crash between a successful send and its completion
+# record left the resend unprotected (a2); log_event emitted
+# its process-log line even when the durable insert failed, so
+# the reconcile emitted it a second time (b); and F2's raise
+# let a failed HQ ping wedge an order in PAID (g). The pins
+# below stub the transport BENEATH the wrappers
+# (urllib.request.urlopen) — the round-16 stubs replaced the
+# wrappers themselves, which model definite outcomes only. The
+# genuine wrappers are exercised through a pristine second
+# load of server.py (SR): the catalog above permanently
+# rebinds S.send_*, so the real functions no longer live in
+# S's namespace. SR shares the same throwaway DB.
+import importlib.util as _ilu18
+import io as _io18
+import urllib.error as _uerr18
+import urllib.parse as _uparse18
+import urllib.request as _ureq18
+
+_spec18 = _ilu18.spec_from_file_location(
+    "server_round18", os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "server.py"))
+SR = _ilu18.module_from_spec(_spec18)
+_spec18.loader.exec_module(SR)
+SR.RESEND_API_KEY = "catalog-test-key"
+SR.TELEGRAM_BOT_TOKEN = "catalog-test-token"
+SR.TELEGRAM_CHAT_ID = "-1004396317271"
+SR._guard_public_target = lambda host: None
+
+
+class _Resp18:
+    """A scripted HTTP response. read() returns the body — or
+    raises, modelling a provider that ACCEPTED the request and
+    whose answer was then lost on the wire."""
+
+    def __init__(self, body=b"{}", read_raises=False):
+        self._body = body
+        self._read_raises = read_raises
+
+    def read(self, *a):
+        if self._read_raises:
+            raise OSError("answer lost after acceptance")
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _Provider18:
+    """Scripted Resend + Telegram behind one urlopen. Email
+    deliveries are modelled the way Resend behaves: a request
+    carrying an Idempotency-Key is recorded once per key (a
+    same-key retry is deduped and returns the original id); a
+    request WITHOUT a key is a fresh delivery every time.
+    Telegram has no idempotency: every accepted send counts.
+    Modes per channel: ok / accept-lost (accepted, then the
+    answer is lost) / http4xx (definite rejection, nothing
+    accepted) / http5xx."""
+
+    def __init__(self):
+        self.mail_mode = "ok"
+        self.tg_mode = "ok"
+        self.mail_requests = []      # (idem_key, to) per HTTP call
+        self.mail_deliveries = {}    # dedupe key -> to (one per key)
+        self._mail_seq = 0
+        self.tg_requests = []        # text per HTTP call
+        self.tg_deliveries = []      # text per accepted send
+
+    def urlopen(self, req, timeout=None):
+        if "api.resend.com" in req.full_url:
+            return self._mail(req)
+        if "api.telegram.org" in req.full_url:
+            return self._tg(req)
+        raise AssertionError(
+            f"unexpected urlopen in round-18 pins: {req.full_url}")
+
+    def _mail(self, req):
+        # urllib stores request headers capitalized and its
+        # get_header does an exact lookup — scan case-insensitively,
+        # as the wire itself is case-insensitive.
+        key = None
+        for hk, hv in req.headers.items():
+            if hk.lower() == "idempotency-key":
+                key = hv
+        to = json.loads(req.data.decode())["to"][0]
+        self.mail_requests.append((key, to))
+        if self.mail_mode == "http4xx":
+            raise _uerr18.HTTPError(
+                req.full_url, 422, "Unprocessable Entity", {},
+                _io18.BytesIO(b'{"message":"invalid"}'))
+        if self.mail_mode == "http5xx":
+            raise _uerr18.HTTPError(
+                req.full_url, 500, "Internal Server Error", {},
+                _io18.BytesIO(b'{"message":"boom"}'))
+        dkey = key if key is not None else f"nokey-{self._mail_seq}"
+        self._mail_seq += 1
+        if dkey not in self.mail_deliveries:
+            self.mail_deliveries[dkey] = to
+        if self.mail_mode == "accept-lost":
+            return _Resp18(read_raises=True)
+        return _Resp18(json.dumps({"id": f"mail-{dkey}"}).encode())
+
+    def _tg(self, req):
+        text = _uparse18.parse_qs(req.data.decode())["text"][0]
+        self.tg_requests.append(text)
+        if self.tg_mode == "http4xx":
+            raise _uerr18.HTTPError(
+                req.full_url, 400, "Bad Request", {},
+                _io18.BytesIO(
+                    b'{"ok":false,"description":"bad request"}'))
+        if self.tg_mode == "http5xx":
+            raise _uerr18.HTTPError(
+                req.full_url, 502, "Bad Gateway", {},
+                _io18.BytesIO(b'{"ok":false}'))
+        self.tg_deliveries.append(text)
+        if self.tg_mode == "accept-lost":
+            return _Resp18(read_raises=True)
+        return _Resp18(b'{"ok":true,"result":{"message_id":1}}')
+
+    def mail_keys_to(self, addr):
+        return [k for (k, t) in self.mail_requests if t == addr]
+
+    def mail_delivered_count(self, addr):
+        return sum(1 for t in self.mail_deliveries.values()
+                   if t == addr)
+
+    def tg_pings(self, oid):
+        return [t for t in self.tg_deliveries
+                if f"Deep Scan order #{oid} is PAID" in t]
+
+    def tg_attempts(self, oid):
+        return [t for t in self.tg_requests
+                if f"Deep Scan order #{oid} is PAID" in t]
+
+
+PROV18 = _Provider18()
+_real_urlopen18 = _ureq18.urlopen
+_ureq18.urlopen = PROV18.urlopen
+
+
+def row_of18(oid):
+    c = db()
+    r = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                       (oid,)).fetchone())
+    c.close()
+    return r
+
+
+def lock_row18(key):
+    c = db()
+    r = c.execute("SELECT purpose, claimed_at, owner FROM "
+                  "event_locks WHERE event_id=?",
+                  (key,)).fetchone()
+    c.close()
+    return r
+
+
+class FakeSelf18(SR.Handler):
+    """SR twin of FakeSelf: the real webhook entry point with a
+    captured reply, signed with the catalog secret."""
+
+    def __init__(self, raw):
+        self.replies = []
+        self._raw_body = raw
+        ts = str(int(time.time()))
+        sig = _hmac.new(b"whsec_catalog", ts.encode() + b"." + raw,
+                        hashlib.sha256).hexdigest()
+        self.headers = {"Stripe-Signature": f"t={ts},v1={sig}"}
+
+    def _send_json(self, code, payload):
+        self.replies.append((code, payload))
+
+
+def stripe_call18(event, session):
+    body = dict(event)
+    body["data"] = {"object": session}
+    fs = FakeSelf18(json.dumps(body).encode())
+    SR.Handler._api_stripe_webhook(fs)
+    return fs.replies[-1]
+
+
+class Crash18(BaseException):
+    """A process-death simulation: BaseException, so no
+    exception handler in the send paths can mistake it for a
+    transport outcome."""
+
+
+# N10: the receipt channel at the transport seam (a1) — Resend
+#      accepts, then the answer is lost. The retry must carry
+#      the SAME Idempotency-Key; the provider dedupes it into
+#      exactly one logical delivery.
+o18a = mk_order("n10@test.dev", "Deep Scan", 29, status="PAID")
+row18a = row_of18(o18a)
+PROV18.mail_mode = "accept-lost"
+r18a1 = SR._ensure_paid_receipt(row18a, 2900)
+PROV18.mail_mode = "ok"
+r18a2 = SR._ensure_paid_receipt(row18a, 2900)
+keys18a = PROV18.mail_keys_to("n10@test.dev")
+check("N10 receipt: accept-lost retried with same key, one "
+      "logical delivery",
+      r18a1 is False and r18a2 is True
+      and len(keys18a) == 2
+      and keys18a[0] == keys18a[1] == f"receipt:{o18a}"
+      and PROV18.mail_delivered_count("n10@test.dev") == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o18a,)) == 1)
+
+# N11: the HQ ping at the transport seam (a1) — Telegram
+#      accepts, then the answer is lost. Telegram has no
+#      idempotency, so the ping is at-most-once: one attempt
+#      ever, the durable unknown-outcome state on record, the
+#      notification reconciled as delivered, never re-sent.
+o18b = mk_order("n11@test.dev", "Deep Scan", 29, status="PAID")
+row18b = row_of18(o18b)
+PROV18.tg_mode = "accept-lost"
+raised18b = False
+try:
+    SR._fire_deep_scan_notification(row18b)
+except Exception:
+    raised18b = True
+PROV18.tg_mode = "ok"
+try:
+    SR._fire_deep_scan_notification(row18b)
+    SR.ensure_paid_side_effects(row18b)
+except Exception:
+    raised18b = True
+lr18b = lock_row18(f"notify:{o18b}")
+check("N11 HQ ping: accept-lost -> one attempt ever, treated "
+      "as delivered",
+      not raised18b
+      and len(PROV18.tg_attempts(o18b)) == 1
+      and len(PROV18.tg_pings(o18b)) == 1
+      and count("events",
+                "order_id=? AND event='DEEPSCAN_NOTIFIED'",
+                (o18b,)) == 1
+      and lr18b is not None
+      and lr18b[0] == "deepscan-notify-pending-unknown")
+
+# N12: the HQ ping DEFINITELY rejected (Telegram 400, nothing
+#      accepted) — the failure becomes a durable pending
+#      record, the transition completes (no raise, marker
+#      recorded), and the sweep retries the pending ping to
+#      exactly one delivery.
+o18c = mk_order("n12@test.dev", "Deep Scan", 29)
+row18c = row_of18(o18c)
+PROV18.tg_mode = "http4xx"
+won18c = True
+try:
+    SR.transition_order_status(row18c, "PAID")
+except Exception:
+    won18c = False
+PROV18.tg_mode = "ok"
+SR.sweep_paid_side_effects()
+check("N12 ping definite failure: pending, no raise, sweep "
+      "delivers once",
+      won18c and order_status(o18c) == "PAID"
+      and count("fulfilment_requests", "order_id=?", (o18c,)) == 1
+      and count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
+                (o18c,)) == 1
+      and len(PROV18.tg_attempts(o18c)) == 2
+      and len(PROV18.tg_pings(o18c)) == 1
+      and count("events",
+                "order_id=? AND event='DEEPSCAN_NOTIFIED'",
+                (o18c,)) == 1)
+
+# N13 (g): Telegram hard-down (definite rejections) must never
+#      wedge the order: the payment transition completes, the
+#      admin advance PAID -> IN_PROGRESS succeeds with the ping
+#      still pending, and once the channel heals the sweep
+#      delivers exactly one ping — the order already advanced.
+o18d = mk_order("n13@test.dev", "Deep Scan", 29)
+row18d = row_of18(o18d)
+PROV18.tg_mode = "http4xx"
+won18d = True
+adv18d = True
+try:
+    SR.transition_order_status(row18d, "PAID")
+except Exception:
+    won18d = False
+try:
+    SR.transition_order_status(row_of18(o18d), "IN_PROGRESS")
+except Exception:
+    adv18d = False
+PROV18.tg_mode = "ok"
+SR.sweep_paid_side_effects()
+check("N13 (g): Telegram down never wedges the order; ping "
+      "lands after advance",
+      won18d and adv18d
+      and order_status(o18d) == "IN_PROGRESS"
+      and count("fulfilment_requests", "order_id=?", (o18d,)) == 1
+      and count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
+                (o18d,)) == 1
+      and len(PROV18.tg_pings(o18d)) == 1
+      and count("events",
+                "order_id=? AND event='DEEPSCAN_NOTIFIED'",
+                (o18d,)) == 1)
+
+# N14 (g): the receipt channel hard-down (Resend 422) at the
+#      webhook — the ack discipline is unchanged (500, Stripe
+#      retries), the order still lands PAID and fulfilled and
+#      can advance; once Resend heals, the sweep lands exactly
+#      one receipt, retried under the same idempotency key.
+o18e = mk_order("n14@test.dev", "Deep Scan", 29)
+PROV18.mail_mode = "http4xx"
+PROV18.tg_mode = "ok"
+r18e = stripe_call18(evt("evt_n14"),
+                     sess(2900, "n14@test.dev", pi="pi_n14"))
+adv18e = True
+try:
+    SR.transition_order_status(row_of18(o18e), "IN_PROGRESS")
+except Exception:
+    adv18e = False
+PROV18.mail_mode = "ok"
+SR.sweep_paid_side_effects()
+keys18e = PROV18.mail_keys_to("n14@test.dev")
+check("N14 (g): receipt down -> 500 + PAID, advance allowed, "
+      "sweep lands one receipt (same key)",
+      r18e[0] == 500 and adv18e
+      and order_status(o18e) == "IN_PROGRESS"
+      and count("fulfilment_requests", "order_id=?", (o18e,)) == 1
+      and len(keys18e) == 2
+      and keys18e[0] == keys18e[1] == f"receipt:{o18e}"
+      and PROV18.mail_delivered_count("n14@test.dev") == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o18e,)) == 1)
+
+# N15 (b): the MONITOR_ACTIVATED events insert fails once —
+#      across the fire and the recovery reconcile there is
+#      exactly ONE process-log emission and ONE durable record
+#      (pre-fix log_event emitted the line even when its insert
+#      failed, and the reconcile emitted it again).
+o18f = mk_order("n15@test.dev", "Monitoring", 79)
+row18f = row_of18(o18f)
+EMIT18 = []
+_real_log18 = S.log
+
+
+def _counting_log18(msg):
+    EMIT18.append(msg)
+    return _real_log18(msg)
+
+
+_real_connect18 = S.db_connect
+_arm18 = {"on": True}
+
+
+class _FlakyConn18:
+    """Fails the first INSERT INTO events at the connection
+    seam — the durable write log_event exists to make."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def execute(self, sql, args=()):
+        if _arm18["on"] and sql.lstrip().upper().startswith(
+                "INSERT INTO EVENTS"):
+            _arm18["on"] = False
+            raise sqlite3.OperationalError(
+                "simulated events write failure")
+        return self._real.execute(sql, args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        if name == "_real":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._real, name, value)
+
+
+def _flaky_connect18():
+    return _FlakyConn18(_real_connect18())
+
+
+S.db_connect = _flaky_connect18
+S.log = _counting_log18
+S.activate_monitor(row18f)
+S.db_connect = _real_connect18
+S.activate_monitor(row18f)
+S.log = _real_log18
+_emissions18f = [m for m in EMIT18
+                 if f"order={o18f} event=MONITOR_ACTIVATED" in m]
+check("N15 (b): lost events write -> exactly one process-log "
+      "emission",
+      len(_emissions18f) == 1
+      and count("events",
+                "order_id=? AND event='MONITOR_ACTIVATED'",
+                (o18f,)) == 1
+      and count("monitors", "order_id=?", (o18f,)) == 1)
+
+# N16 (a2): the receipt send is accepted, then the process
+#      dies BEFORE the outcome is written (the completion-log
+#      call itself is the kill point). The held lock goes stale
+#      and is reclaimed; the reclaim resend carries the same
+#      idempotency key, so the provider dedupes it — one
+#      logical delivery, one completion record.
+o18g = mk_order("n16@test.dev", "Deep Scan", 29, status="PAID")
+row18g = row_of18(o18g)
+_real_log_event18g = SR.log_event
+_armed18g = {"on": True}
+
+
+def _crashing_log18g(order_id, event, detail=""):
+    if _armed18g["on"] and event == "PAID_EMAIL_SENT" \
+            and order_id == o18g:
+        _armed18g["on"] = False
+        raise Crash18("crash after provider acceptance")
+    return _real_log_event18g(order_id, event, detail)
+
+
+PROV18.mail_mode = "ok"
+SR.log_event = _crashing_log18g
+crashed18g = False
+try:
+    SR._ensure_paid_receipt(row18g, 2900)
+except Crash18:
+    crashed18g = True
+SR.log_event = _real_log_event18g
+_c18g = S.db_connect()
+_c18g.execute("UPDATE event_locks SET claimed_at=? WHERE "
+              "event_id=?", (time.time() - 3700, f"receipt:{o18g}"))
+_c18g.commit()
+_c18g.close()
+r18g = SR._ensure_paid_receipt(row18g, 2900)
+keys18g = PROV18.mail_keys_to("n16@test.dev")
+check("N16 receipt: crash after acceptance -> same-key "
+      "reclaim, one logical delivery",
+      crashed18g and r18g is True
+      and len(keys18g) == 2
+      and keys18g[0] == keys18g[1] == f"receipt:{o18g}"
+      and PROV18.mail_delivered_count("n16@test.dev") == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o18g,)) == 1)
+
+# N17 (a2): the HQ ping is accepted, then the process dies
+#      BEFORE the outcome is written. The intent record goes
+#      stale and is honoured as delivered (at-most-once) — the
+#      recovery re-entry reconciles the record and never makes
+#      a second attempt.
+o18h = mk_order("n17@test.dev", "Deep Scan", 29, status="PAID")
+row18h = row_of18(o18h)
+_real_log_event18h = SR.log_event
+_armed18h = {"on": True}
+
+
+def _crashing_log18h(order_id, event, detail=""):
+    if _armed18h["on"] and event == "DEEPSCAN_NOTIFIED" \
+            and order_id == o18h:
+        _armed18h["on"] = False
+        raise Crash18("crash after provider acceptance")
+    return _real_log_event18h(order_id, event, detail)
+
+
+PROV18.tg_mode = "ok"
+SR.log_event = _crashing_log18h
+crashed18h = False
+try:
+    SR._fire_deep_scan_notification(row18h)
+except Crash18:
+    crashed18h = True
+except Exception:
+    pass  # pre-fix the hook turns the lost answer into a raise
+SR.log_event = _real_log_event18h
+_c18h = S.db_connect()
+_c18h.execute("UPDATE event_locks SET claimed_at=? WHERE "
+              "event_id=?", (time.time() - 3700, f"notify:{o18h}"))
+_c18h.commit()
+_c18h.close()
+raised18h = False
+try:
+    SR._fire_deep_scan_notification(row18h)
+except Exception:
+    raised18h = True
+check("N17 ping: crash after acceptance -> no second attempt, "
+      "reconciled as delivered",
+      crashed18h and not raised18h
+      and len(PROV18.tg_attempts(o18h)) == 1
+      and count("events",
+                "order_id=? AND event='DEEPSCAN_NOTIFIED'",
+                (o18h,)) == 1)
+
+# N18: a retained monitoring alert whose send ends with the
+#      transport outcome UNKNOWN (Resend accepted, the answer
+#      was lost) — the outcome is recorded as unknown and the
+#      next run retries under the SAME idempotency key (the
+#      provider dedupes), instead of the round-16
+#      reconcile-as-delivered. Exactly one logical delivery;
+#      the digest then advances.
+o18i = mk_order("n18@test.dev", "Monitoring", 79, status="PAID")
+pend18i = {"new": ["MEDIUM|N18 hole"], "gone": [], "grade": "B",
+           "score": 88,
+           "digest_after": ["LOW|base", "MEDIUM|N18 hole"],
+           "attempts": 1, "since": S.utcnow()}
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o18i, "example.com", "n18@test.dev", "N18", S.utcnow(),
+           time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend18i)))
+c.commit()
+c.close()
+SR._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"},
+     {"severity": "medium", "title": "N18 hole"}],
+    {"host": "example.com", "errors": []})
+PROV18.mail_mode = "accept-lost"
+SR._run_monitor(mon_row16(o18i))
+PROV18.mail_mode = "ok"
+SR._run_monitor(mon_row16(o18i))
+m18i = mon_row16(o18i)
+keys18i = PROV18.mail_keys_to("n18@test.dev")
+check("N18 monitor alert: unknown outcome -> same-key retry, "
+      "one logical delivery",
+      len(keys18i) == 2
+      and keys18i[0] is not None and keys18i[0] == keys18i[1]
+      and PROV18.mail_delivered_count("n18@test.dev") == 1
+      and m18i["pending_alert"] is None
+      and json.loads(m18i["last_digest"])
+      == ["LOW|base", "MEDIUM|N18 hole"])
+
+# N19: the attempt-3 escalation Telegram is accepted, then
+#      the answer is lost (UNKNOWN) — at-most-once: the
+#      escalation is treated as delivered and never re-fires,
+#      even though the email channel keeps failing.
+o18j = mk_order("n19@test.dev", "Monitoring", 79, status="PAID")
+pend18j = {"new": ["MEDIUM|N19 hole"], "gone": [], "grade": "B",
+           "score": 88,
+           "digest_after": ["LOW|base", "MEDIUM|N19 hole"],
+           "attempts": 2, "since": S.utcnow()}
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o18j, "example.com", "n19@test.dev", "N19", S.utcnow(),
+           time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend18j)))
+c.commit()
+c.close()
+PROV18.mail_mode = "http4xx"
+PROV18.tg_mode = "accept-lost"
+SR._run_monitor(mon_row16(o18j))
+PROV18.tg_mode = "ok"
+SR._run_monitor(mon_row16(o18j))
+m18j = mon_row16(o18j)
+p18j = json.loads(m18j["pending_alert"])
+esc18j = [t for t in PROV18.tg_requests
+          if "UNDELIVERED after 3 attempts" in t]
+check("N19 escalation: accept-lost -> treated as delivered, "
+      "never re-escalated",
+      len(esc18j) == 1
+      and p18j["attempts"] == 4 and p18j.get("escalated") is True)
+
+_ureq18.urlopen = _real_urlopen18
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

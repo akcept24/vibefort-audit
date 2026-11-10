@@ -17,6 +17,7 @@ Stdlib only. Security headers replicate the old nginx.conf posture exactly
 on every response.
 """
 
+import contextvars
 import datetime
 import ipaddress
 import json
@@ -209,6 +210,15 @@ def db_connect():
 
 
 def log_event(order_id, event, detail=""):
+    """Write-then-emit (round 18, Codex delta-17 (b)): the
+    durable events-table row is the record; the process-log line
+    is its mirror and is emitted ONLY after the insert commits.
+    The old order emitted the line even when the insert failed,
+    so a courtesy log whose write was lost was emitted once by
+    the fire and again by the reconcile that later wrote the
+    record — two observable emissions for one event. Callers
+    that need certainty already verify by reading the table
+    back; nothing load-bearing rides on the stderr line."""
     try:
         with _db_lock:
             conn = db_connect()
@@ -219,6 +229,7 @@ def log_event(order_id, event, detail=""):
             conn.close()
     except Exception as e:
         log(f"event-log write failed: {e!r}")
+        return
     log(f"order={order_id} event={event} {detail}")
 
 
@@ -229,40 +240,106 @@ def utcnow():
 # ---------------------------------------------------------------------------
 # Outbound notifications
 # ---------------------------------------------------------------------------
+class _SendOutcome(tuple):
+    """A send result: the legacy (ok, detail) pair, plus the
+    tri-state classification (.status) the paid/monitor paths
+    judge by (round 18, Codex delta-17 (a1)). Tuple behaviour
+    is unchanged — every existing caller unpacks (ok, detail)
+    exactly as before. The classification:
+
+    "delivered" — the provider definitively accepted the
+        message (Resend 2xx + id; Telegram ok:true).
+    "failed" — DEFINITE non-delivery: the provider rejected
+        the request (HTTP 4xx / ok:false) or the channel is not
+        configured (nothing was sent). A retry is a fresh send,
+        never a duplicate.
+    "unknown" — the transport failed ambiguously (exception,
+        timeout, HTTP 5xx): the provider may have accepted the
+        message before its answer was lost. Retrying blindly
+        duplicates it; the callers' round-18 semantics (Resend
+        idempotency key for email, intent-first at-most-once
+        for Telegram) exist for exactly this arm.
+    """
+
+    def __new__(cls, ok, detail, status):
+        self = super().__new__(cls, (ok, detail))
+        self.status = status
+        return self
+
+
+def _send_status(result):
+    """The tri-state of a send result. The real wrappers attach
+    .status; a plain (ok, detail) tuple — e.g. a test stub —
+    models a DEFINITE outcome: delivered iff ok."""
+    st = getattr(result, "status", None)
+    if st in ("delivered", "failed", "unknown"):
+        return st
+    return "delivered" if result[0] else "failed"
+
+
+# The Resend Idempotency-Key for the logical notification the
+# current call stack is sending, set by the paid/monitor paths
+# (receipt:<order_id>; a per-alert key for monitoring). The
+# wrapper below reads it — deliberately NOT a send_resend
+# parameter, so the function's long-standing signature (and
+# every stub of it) is untouched. A retry of the same logical
+# notification re-sets the same key, and Resend dedupes the
+# retry instead of delivering a second copy (round 18).
+_MAIL_IDEM = contextvars.ContextVar("vf_mail_idem", default=None)
+
+
 def send_resend(to, subject, text, html=None):
-    """Returns (ok, detail). Never raises. When html is given the
-    mail goes out multipart: the plain-text body is preserved
-    byte-for-byte and the branded HTML renders alongside it."""
+    """Returns an _SendOutcome (ok, detail, .status). Never
+    raises. When html is given the mail goes out multipart: the
+    plain-text body is preserved byte-for-byte and the branded
+    HTML renders alongside it. When the caller set an
+    idempotency key for this logical notification it rides as
+    the Idempotency-Key header."""
     if not RESEND_API_KEY:
-        return False, "RESEND_API_KEY not configured"
+        return _SendOutcome(False, "RESEND_API_KEY not configured",
+                            "failed")
     body = {"from": MAIL_FROM, "to": [to],
             "subject": subject, "text": text}
     if html:
         body["html"] = html
     payload = json.dumps(body).encode()
+    headers = {"Authorization": f"Bearer {RESEND_API_KEY}",
+               "Content-Type": "application/json",
+               "User-Agent": "vibefort-server/1.0"}
+    idem = _MAIL_IDEM.get()
+    if idem:
+        headers["Idempotency-Key"] = idem
     req = urllib.request.Request(
         "https://api.resend.com/emails", data=payload, method="POST",
-        headers={"Authorization": f"Bearer {RESEND_API_KEY}",
-                 "Content-Type": "application/json",
-                 "User-Agent": "vibefort-server/1.0"})
+        headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
-            body = json.loads(resp.read().decode("utf-8", "replace"))
-            return True, str(body.get("id", "sent"))
+            rbody = json.loads(resp.read().decode("utf-8", "replace"))
+            return _SendOutcome(True, str(rbody.get("id", "sent")),
+                                "delivered")
     except urllib.error.HTTPError as e:
         try:
             detail = e.read().decode("utf-8", "replace")[:300]
         except Exception:
             detail = ""
-        return False, f"HTTP {e.code}: {detail}"
+        status = "failed" if 400 <= e.code < 500 else "unknown"
+        return _SendOutcome(False, f"HTTP {e.code}: {detail}", status)
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return _SendOutcome(False, f"{type(e).__name__}: {e}",
+                            "unknown")
 
 
 def send_telegram(text):
-    """Known-working pattern on this machine: urllib POST (curl hangs)."""
+    """Returns an _SendOutcome (ok, detail, .status). Never
+    raises. Known-working pattern on this machine: urllib POST
+    (curl hangs). Telegram answers definitively (ok:true /
+    ok:false, including 4xx rejections): those are delivered /
+    failed. A transport exception or a 5xx is "unknown" — the
+    message may have been accepted before the answer was lost,
+    and Telegram offers no idempotency key to retry against."""
     if not TELEGRAM_BOT_TOKEN:
-        return False, "TELEGRAM_BOT_TOKEN not configured"
+        return _SendOutcome(False, "TELEGRAM_BOT_TOKEN not configured",
+                            "failed")
     data = urllib.parse.urlencode(
         {"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
     req = urllib.request.Request(
@@ -271,9 +348,31 @@ def send_telegram(text):
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read().decode("utf-8", "replace"))
-            return bool(body.get("ok")), str(body.get("ok"))
+            if body.get("ok"):
+                return _SendOutcome(True, str(body.get("ok")),
+                                    "delivered")
+            return _SendOutcome(
+                False, str(body.get("description", body.get("ok"))),
+                "failed")
+    except urllib.error.HTTPError as e:
+        detail = ""
+        ok_flag = None
+        try:
+            raw = e.read().decode("utf-8", "replace")
+            parsed = json.loads(raw) if raw else {}
+            ok_flag = parsed.get("ok")
+            detail = str(parsed.get("description", "")) \
+                or f"HTTP {e.code}"
+        except Exception:
+            detail = f"HTTP {e.code}"
+        if e.code >= 500:
+            return _SendOutcome(False, detail, "unknown")
+        if ok_flag is False or 400 <= e.code < 500:
+            return _SendOutcome(False, detail, "failed")
+        return _SendOutcome(False, detail, "unknown")
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        return _SendOutcome(False, f"{type(e).__name__}: {e}",
+                            "unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -2288,7 +2387,15 @@ def transition_order_status(row, new_status, paid_event_id=None,
     if row["status"] == "PAID" and new_status != "PAID":
         # Leaving PAID is allowed only once the paid side effects
         # are complete; past PAID no recovery path can see the
-        # order (Codex delta-5 finding 2).
+        # order (Codex delta-5 finding 2). Round 18: "complete"
+        # means every side effect is DONE or DURABLY QUEUED —
+        # a courtesy notification that failed or whose outcome
+        # is unknown has a durable pending record with a live
+        # retry path (the boot sweep's status-independent
+        # driver), so it no longer blocks the advance; the
+        # guard still blocks when a side effect is neither
+        # (reachable only via a crash mid-hook, which the
+        # consult recovers as before).
         ensure_paid_side_effects(row)
     with _db_lock:
         conn = db_connect()
@@ -2401,6 +2508,50 @@ def ensure_paid_side_effects(order):
     if order["tier"] == "Deep Scan":
         on_deep_scan_paid(order)
     _record_effects_ok(order["id"], order["tier"], "(recovered)")
+
+
+def _drive_pending_notifications():
+    """Drive the durable pending notification states (round 18),
+    independently of the order's status: under the decoupled
+    guard semantics an order leaves PAID with its HQ ping
+    durably QUEUED, and this driver — not the order's status —
+    is what resolves the queue. Every state on a notify:<id>
+    row is dispatched by _fire_deep_scan_notification itself
+    (definite-pending rows are taken over and re-fired; stale
+    intents and unknown-outcome rows are reconciled, never
+    re-sent). Receipt pending states need no row here: they are
+    the absence of PAID_EMAIL_SENT under a live stripe_events
+    link and are driven by the sweep's event loop below."""
+    conn = db_connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT event_id FROM event_locks WHERE "
+            "event_id LIKE 'notify:%' AND purpose IN "
+            "('deepscan-notify-pending', 'deepscan-notify-intent', "
+            "'deepscan-notify-pending-unknown', "
+            "'deepscan-notified-unconfirmed')").fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        try:
+            oid = int(r["event_id"].split(":", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        conn = db_connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            orow = conn.execute("SELECT * FROM orders WHERE id=?",
+                                (oid,)).fetchone()
+        finally:
+            conn.close()
+        if orow is None:
+            continue
+        try:
+            _fire_deep_scan_notification(dict(orow))
+        except Exception as e:
+            log(f"pending-notification driver: order {oid} "
+                f"deferred: {e!r}")
 
 
 def sweep_paid_side_effects():
@@ -2580,12 +2731,27 @@ def sweep_paid_side_effects():
         except Exception as e:
             log(f"boot sweep: receipt for event {ev['event_id']} "
                 f"failed: {e!r}")
+    # Round 18: orders that already left PAID can still hold a
+    # durably queued notification (the decoupled guard let them
+    # advance); the driver resolves those queues here, where
+    # the order's status no longer matters.
+    try:
+        _drive_pending_notifications()
+    except Exception as e:
+        log(f"boot sweep: pending-notification driver failed: "
+            f"{e!r}")
 
 
 def _send_paid_receipt(order, amount_cents):
-    """The payment-received email. Logged either way; a failure is
-    recoverable — while no PAID_EMAIL_SENT is on record, the boot
-    sweep and the webhook recovery consult resend it."""
+    """The payment-received email; returns the tri-state send
+    status (round 18). Logged either way; a non-delivered
+    outcome is recoverable — while no PAID_EMAIL_SENT is on
+    record, the boot sweep and the webhook recovery consult
+    resend it. Every attempt carries the same Resend
+    idempotency key (receipt:<order_id>, set as the context
+    below), so an attempt the provider accepted before its
+    answer was lost is deduped by the retry, never delivered
+    twice."""
     tier = order["tier"]
     if amount_cents:
         amt_label = f"${amount_cents / 100:,.2f}"
@@ -2631,13 +2797,20 @@ def _send_paid_receipt(order, amount_cents):
                 "Questions — just reply to this email.")),
         reason="You received this email because a payment "
                "was completed for your ShipAudit Lab order.")
-    eok, edet = send_resend(
-        order["email"], f"Payment received — {tier}",
-        rcpt_text, html=rcpt_html)
+    _idem_tok = _MAIL_IDEM.set(f"receipt:{order['id']}")
+    try:
+        res = send_resend(
+            order["email"], f"Payment received — {tier}",
+            rcpt_text, html=rcpt_html)
+    finally:
+        _MAIL_IDEM.reset(_idem_tok)
+    status = _send_status(res)
     log_event(order["id"],
-              "PAID_EMAIL_SENT" if eok else "PAID_EMAIL_FAILED",
-              edet)
-    return eok
+              "PAID_EMAIL_SENT" if status == "delivered"
+              else "PAID_EMAIL_FAILED",
+              res[1] if status != "unknown"
+              else f"transport outcome unknown: {res[1]}")
+    return status
 
 
 def _claim_event_lock(key, purpose):
@@ -2734,6 +2907,60 @@ def _set_lock_purpose(key, token, purpose):
             conn.close()
 
 
+def _lock_row(key):
+    """The full event-lock row (purpose, claimed_at, owner), or
+    None when no row exists (round 18 state dispatch)."""
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT purpose, claimed_at, owner FROM event_locks "
+            "WHERE event_id=?", (key,)).fetchone()
+    finally:
+        conn.close()
+
+
+def _cas_lock_purpose(key, owner, from_purpose, to_purpose):
+    """Owner+purpose compare-and-swap on an event-lock row
+    (round 18): the transition lands only when the row still
+    carries exactly the owner and purpose the caller observed,
+    so two drivers resolving the same durable state cannot both
+    act on it. Verified by rowcount, like _set_lock_purpose."""
+    with _db_lock:
+        conn = db_connect()
+        try:
+            cur = conn.execute(
+                "UPDATE event_locks SET purpose=? WHERE event_id=? "
+                "AND owner IS ? AND purpose=?",
+                (to_purpose, key, owner, from_purpose))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+
+def _takeover_event_lock(key, from_purpose, to_purpose, seen_owner):
+    """Take ownership of a durable PENDING event-lock row
+    (round 18): owner, purpose and claimed_at are swapped in
+    one update guarded by the owner and purpose the caller
+    observed. Returns the new owner token, or None when
+    another driver won the swap — the single-flight discipline
+    for retries of a recorded pending notification."""
+    token = _secrets.token_hex(8)
+    with _db_lock:
+        conn = db_connect()
+        try:
+            cur = conn.execute(
+                "UPDATE event_locks SET owner=?, purpose=?, "
+                "claimed_at=? WHERE event_id=? AND owner IS ? "
+                "AND purpose=?",
+                (token, to_purpose, time.time(), key, seen_owner,
+                 from_purpose))
+            conn.commit()
+            return token if cur.rowcount > 0 else None
+        finally:
+            conn.close()
+
+
 def _unmatched_logged(event_id):
     conn = db_connect()
     try:
@@ -2805,7 +3032,23 @@ def _ensure_paid_receipt(order, amount_cents):
     send a duplicate receipt (2026-11-10 incident). The held
     lock instead becomes the durable 'sent, unconfirmed' record
     (purpose receipt-sent-unconfirmed), and the consult below
-    honours it: reconcile the log, never resend."""
+    honours it: reconcile the log, never resend.
+
+    Round 18 (delta-17 (a1)/(a2)): the send outcome is tri-state
+    now. A DEFINITE failure releases the lock and reports False
+    exactly as before. An UNKNOWN outcome (the provider may
+    have accepted before its answer was lost) does the same —
+    the retry this invites is safe because every attempt
+    carries the same Resend idempotency key: the provider
+    dedupes an accepted first attempt. A crash between an
+    accepted send and this function's bookkeeping leaves the
+    lock held; once it goes stale the reclaim resend is
+    likewise deduped by the key. The receipt's pending state
+    deliberately does NOT live in the lock row: it is the
+    absence of PAID_EMAIL_SENT under a live stripe_events link,
+    driven by the webhook consults and the boot sweep (both
+    status-independent) — and pin A5 fixes the lock lifecycle
+    (a failed send leaves no row)."""
     if _receipt_logged(order["id"]):
         return True
     key = f"receipt:{order['id']}"
@@ -2819,15 +3062,16 @@ def _ensure_paid_receipt(order, amount_cents):
         return _receipt_logged(order["id"])
     if not _lock_still_mine(key, token):
         return _receipt_logged(order["id"])
-    ok = _send_paid_receipt(order, amount_cents)
-    if ok and not _receipt_logged(order["id"]):
+    status = _send_paid_receipt(order, amount_cents)
+    if status == "delivered" and not _receipt_logged(order["id"]):
         if _set_lock_purpose(key, token,
                              "receipt-sent-unconfirmed"):
             return True
-        ok = False
-    if not ok:
+        status = "failed"
+    if status != "delivered":
         _release_event_lock(key, token)
-    return ok
+        return False
+    return True
 
 
 def _stripe_signature_ok(raw, header, secret):
@@ -2897,61 +3141,148 @@ def on_deep_scan_paid(order):
 
 
 def _fire_deep_scan_notification(order):
-    """The notification half of the Deep Scan hook, exactly once
-    (round 16, 2026-11-10 incident): the DEEPSCAN_QUEUED log line
-    and the HQ Telegram fire under the receipts' single-fire
-    discipline — a durable DEEPSCAN_NOTIFIED record, verified by
-    reading it back after the send. A FAILED send records no
-    completion and raises, so the caller's SIDE_EFFECTS_OK stays
-    unwritten and the recovery paths re-fire (the previous code
-    ignored the failure and recorded completion anyway: zero
-    delivered pings, recovery suppressed). A send whose record
-    does not persist leaves the held lock as the durable 'sent,
-    unconfirmed' record instead of releasing into a re-fire;
-    re-entry honours it and reconciles the log."""
+    """The notification half of the Deep Scan hook. Round 16
+    made it exactly-once for the outcomes it modelled; round 18
+    (Codex delta-17 (a1)/(a2)/(g)) completes the semantics at
+    the transport seam and decouples it from the order
+    workflow. Telegram has no idempotency key, so the ping is
+    AT-MOST-ONCE, intent-first: the durable state lives on the
+    "notify:<order_id>" lock row —
+
+      (no row)                       not started; the claim
+                                     itself, purpose
+                                     deepscan-notify-intent, IS
+                                     the intent record, written
+                                     before any send.
+      deepscan-notify-intent         a fire is in flight, or
+                                     its owner died around the
+                                     send; a STALE intent is an
+                                     unknown outcome and is
+                                     honoured as delivered.
+      deepscan-notify-pending        the send was DEFINITELY
+                                     rejected; retryable — the
+                                     boot sweep's driver takes
+                                     the row over and re-fires.
+      deepscan-notify-pending-unknown  the transport outcome
+                                     was UNKNOWN (the answer
+                                     was lost after possible
+                                     acceptance); reconciled as
+                                     delivered, NEVER re-sent.
+      deepscan-notified-unconfirmed  the send reported success
+                                     but its DEEPSCAN_NOTIFIED
+                                     record did not persist
+                                     (round 16); reconciled,
+                                     never re-sent.
+
+    A failed or unknown ping writes its durable state and
+    RETURNS — it never raises out of the hook, so it can no
+    longer block SIDE_EFFECTS_OK or wedge the order in PAID;
+    the marker now means 'done, or durably queued with a live
+    retry path'. Only a state that cannot be established
+    durably at all (the database itself failing) still raises.
+    """
     oid = order["id"]
     if _deepscan_notified(oid):
         return
     key = f"notify:{oid}"
-    if _lock_purpose(key) == "deepscan-notified-unconfirmed":
-        log_event(oid, "DEEPSCAN_NOTIFIED",
-                  "reconciled from the durable sent-unconfirmed "
-                  "record; the original ping was delivered")
-        return
-    token = _claim_event_lock(key, "deepscan-notify")
+    token = None
+    for _try in range(2):
+        row = _lock_row(key)
+        purpose = row[0] if row else None
+        if purpose == "deepscan-notified-unconfirmed":
+            log_event(oid, "DEEPSCAN_NOTIFIED",
+                      "reconciled from the durable sent-unconfirmed "
+                      "record; the original ping was delivered")
+            return
+        if purpose == "deepscan-notify-pending-unknown":
+            log_event(oid, "DEEPSCAN_NOTIFIED",
+                      "the original ping's transport outcome was "
+                      "unknown; treated as delivered, not re-sent")
+            return
+        if purpose == "deepscan-notify-intent":
+            if row[1] and time.time() - row[1] <= 3600:
+                # A fire is in flight in another process. Its
+                # intent is durable, so this caller may treat
+                # the notification as queued: the state resolves
+                # there, or goes stale and is reconciled.
+                return
+            # A stale intent: the firing process died around
+            # its send. The outcome is unknowable; at-most-once
+            # honours the intent as delivered.
+            if _cas_lock_purpose(
+                    key, row[2], "deepscan-notify-intent",
+                    "deepscan-notify-pending-unknown"):
+                log_event(oid, "DEEPSCAN_NOTIFIED",
+                          "delivery intent on record from an "
+                          "interrupted fire; treated as "
+                          "delivered, not re-sent")
+            return
+        if purpose == "deepscan-notify-pending":
+            token = _takeover_event_lock(
+                key, "deepscan-notify-pending",
+                "deepscan-notify-intent", row[2])
+            if not token:
+                return  # another driver took the retry
+            break
+        if row is None:
+            token = _claim_event_lock(key, "deepscan-notify-intent")
+            if token:
+                break
+            continue  # lost a claim race; re-dispatch once
+        return  # a row in a state this code does not own
     if not token:
-        if _deepscan_notified(oid) or \
-                _lock_purpose(key) == \
-                "deepscan-notified-unconfirmed":
-            return
         raise RuntimeError(
-            "Deep Scan HQ notification in flight in another "
-            "process")
+            "Deep Scan HQ notification state could not be "
+            "established")
     if not _lock_still_mine(key, token):
-        if _deepscan_notified(oid):
-            return
-        raise RuntimeError(
-            "Deep Scan HQ notification lock lost before firing")
+        # The state moved under us (a stale reclaim or a CAS
+        # resolution); whatever it is now, it is durable.
+        return
     if not _deepscan_queued_logged(oid):
         log_event(oid, "DEEPSCAN_QUEUED",
                   "fulfilment request recorded for the engine "
                   "worker")
-    ok, det = send_telegram(
+    res = send_telegram(
         f"ShipAudit Lab: Deep Scan order #{oid} is PAID — "
         f"fulfilment queued for {order['url']} "
         f"(client {order['email']}).")
-    if not ok:
-        _release_event_lock(key, token)
+    status = _send_status(res)
+    det = res[1]
+    if status == "delivered":
+        log_event(oid, "DEEPSCAN_NOTIFIED", det)
+        if not _deepscan_notified(oid):
+            if _set_lock_purpose(key, token,
+                                 "deepscan-notified-unconfirmed"):
+                return
+            # Neither the record nor the durable fallback could
+            # be written. Leave the intent row standing —
+            # staleness resolves it as an interrupted fire and
+            # at-most-once holds — and raise rather than
+            # releasing into a re-fire.
+            raise RuntimeError(
+                "Deep Scan HQ notification record did not persist")
+        return
+    if status == "unknown":
+        if not _cas_lock_purpose(
+                key, token, "deepscan-notify-intent",
+                "deepscan-notify-pending-unknown"):
+            raise RuntimeError(
+                "Deep Scan HQ notification state did not persist")
+        log_event(oid, "DEEPSCAN_NOTIFIED",
+                  "transport outcome unknown; treated as "
+                  "delivered, not re-sent")
+        return
+    # Definite rejection: nothing was delivered. Record the
+    # durable pending state and return WITHOUT raising (the
+    # round-16 raise is what wedged orders in PAID, delta-17
+    # (g)); the boot sweep's driver retries from the row.
+    if not _cas_lock_purpose(
+            key, token, "deepscan-notify-intent",
+            "deepscan-notify-pending"):
         raise RuntimeError(
-            f"Deep Scan HQ notification failed: {det}")
-    log_event(oid, "DEEPSCAN_NOTIFIED", det)
-    if not _deepscan_notified(oid):
-        if _set_lock_purpose(key, token,
-                             "deepscan-notified-unconfirmed"):
-            return
-        _release_event_lock(key, token)
-        raise RuntimeError(
-            "Deep Scan HQ notification record did not persist")
+            "Deep Scan HQ notification state did not persist")
+    log_event(oid, "DEEPSCAN_NOTIFY_FAILED",
+              f"definite rejection; delivery pending retry: {det}")
 
 
 # ---------------------------------------------------------------------------
@@ -3139,6 +3470,40 @@ def _monitor_alert_parts(mon, host, order_id, d_new, d_gone,
     return body, body_html
 
 
+def _monitor_alert_idem(mon, pending):
+    """The stable Resend idempotency key for one logical
+    monitoring alert (round 18): derived from the monitor, the
+    retained record's creation stamp and its exact diff, so
+    every retry of THIS alert carries the same key (the same
+    alert retried keeps the key) and a genuinely new alert —
+    a different diff, or the same diff in a later week under a
+    new record — gets a new one."""
+    raw = json.dumps(
+        [mon["id"], pending.get("since"), pending.get("new"),
+         pending.get("gone"), pending.get("digest_after")],
+        sort_keys=True)
+    return "monitor-alert:" + _hl.sha256(raw.encode()).hexdigest()[:32]
+
+
+def _send_monitor_alert(mon, host, order_id, pending):
+    """One monitoring change-alert send, under the alert's
+    idempotency key (round 18). Returns the wrapper's
+    tri-state-carrying result."""
+    body, body_html = _monitor_alert_parts(
+        mon, host, order_id, pending["new"], pending["gone"],
+        pending["grade"], pending["score"])
+    _idem_tok = _MAIL_IDEM.set(
+        pending.get("idem")
+        or _monitor_alert_idem(mon, pending))
+    try:
+        return send_resend(
+            mon["email"],
+            f"Monitoring: changes detected on {host}",
+            body, html=body_html)
+    finally:
+        _MAIL_IDEM.reset(_idem_tok)
+
+
 def _run_monitor(mon, scheduled=False):
     # One run per monitor across processes (Codex delta-13 #2):
     # two interleaved runs read the same baseline, and the later
@@ -3191,8 +3556,8 @@ def _run_monitor_locked(mon):
             _pending = None
     if _pending:
         # Reconcile interrupted deliveries BEFORE anything is
-        # re-sent (round 16): an intent field on record means a
-        # previous run persisted its intent and died before the
+        # re-sent (round 16): a BARE intent field on record means
+        # a previous run persisted its intent and died before the
         # outcome was persisted — the send may already have been
         # accepted remotely, and re-sending would duplicate a
         # delivered message. (The residual ambiguity — a crash
@@ -3203,6 +3568,17 @@ def _run_monitor_locked(mon):
         # together with the persisted attempt bookkeeping, after
         # the delivery intent was already cleared, so the two
         # reconciliations never compete.
+        #
+        # Round 18 adds the recorded-outcome arm: an intent
+        # whose last_outcome is "unknown" is NOT an interrupted
+        # run — the previous run SAW the transport fail
+        # ambiguously and persisted that fact. For email that is
+        # retryable safely under the alert's idempotency key
+        # (Resend dedupes an accepted first attempt), so the
+        # record falls through to the send step below instead of
+        # being reconciled as delivered.
+        _unknown_retry = bool(_pending.get("send_intent")) and \
+            _pending.get("last_outcome") == "unknown"
         if _pending.get("escalation_intent") and \
                 not _pending.get("escalated"):
             _pending["escalated"] = True
@@ -3211,7 +3587,7 @@ def _run_monitor_locked(mon):
                       "escalation intent on record from an "
                       "interrupted run; treated as delivered, "
                       "not re-sent")
-        if _pending.get("send_intent"):
+        if _pending.get("send_intent") and not _unknown_retry:
             log_event(order_id, "MONITOR_ALERT_SENT",
                       "retained alert treated as delivered: "
                       "delivery intent on record from an "
@@ -3236,8 +3612,12 @@ def _run_monitor_locked(mon):
     if _pending:
         # Durable delivery intent BEFORE the send (round 16):
         # what a crash can leave behind is the intent, never a
-        # silent second delivery.
+        # silent second delivery. The intent now also carries
+        # the alert's idempotency key (round 18), persisted with
+        # it, so any retry of this alert re-presents the key.
         _pending["send_intent"] = utcnow()
+        if not _pending.get("idem"):
+            _pending["idem"] = _monitor_alert_idem(mon, _pending)
         with _db_lock:
             conn = db_connect()
             conn.execute(
@@ -3245,16 +3625,22 @@ def _run_monitor_locked(mon):
                 (json.dumps(_pending), mon["id"]))
             conn.commit()
             conn.close()
-        _pbody, _phtml = _monitor_alert_parts(
-            mon, host, order_id, _pending["new"], _pending["gone"],
-            _pending["grade"], _pending["score"])
-        _pok, _pdet = send_resend(
-            mon["email"], f"Monitoring: changes detected on {host}",
-            _pbody, html=_phtml)
-        if not _pok:
+        _pres = _send_monitor_alert(mon, host, order_id, _pending)
+        _pstatus = _send_status(_pres)
+        _pdet = _pres[1]
+        if _pstatus != "delivered":
             _attempts = int(_pending.get("attempts", 1)) + 1
             _pending["attempts"] = _attempts
-            _pending.pop("send_intent", None)
+            if _pstatus == "unknown":
+                # Round 18: the outcome is recorded AS unknown —
+                # the intent stays on record together with it,
+                # and the next run retries under the same
+                # idempotency key instead of reconciling the
+                # alert as delivered.
+                _pending["last_outcome"] = "unknown"
+            else:
+                _pending.pop("send_intent", None)
+                _pending.pop("last_outcome", None)
             # The outcome is known: persist it FIRST, so a crash
             # from here on cannot be misread by the
             # reconciliation above as an interrupted delivery.
@@ -3267,7 +3653,8 @@ def _run_monitor_locked(mon):
                 conn.commit()
                 conn.close()
             log_event(order_id, "MONITOR_ALERT_FAILED",
-                      f"retained alert attempt {_attempts}: {_pdet}")
+                      f"retained alert attempt {_attempts} "
+                      f"({_pstatus}): {_pdet}")
             if _attempts >= 3 and not _pending.get("escalated"):
                 # Durable escalation intent, persisted with the
                 # attempt bookkeeping, BEFORE the send (round
@@ -3283,17 +3670,27 @@ def _run_monitor_locked(mon):
                          time.time() + 3600, mon["id"]))
                     conn.commit()
                     conn.close()
-                _tok, _ = send_telegram(
+                _eres = send_telegram(
                     f"ShipAudit Lab: monitoring alert for "
                     f"{mon['url']} UNDELIVERED after 3 attempts "
                     f"({_pdet}); digest held, weekly retries "
                     f"continue. Check the mail pipeline.")
-                if _tok:
+                _estatus = _send_status(_eres)
+                if _estatus == "delivered":
                     _pending["escalated"] = True
                     log_event(order_id, "MONITOR_ALERT_ESCALATED",
                               "retained alert undelivered after 3 "
                               "attempts; hourly retries stop, weekly "
                               "retries continue")
+                elif _estatus == "unknown":
+                    # Telegram is at-most-once (round 18): an
+                    # ambiguous outcome counts as delivered and
+                    # is never re-escalated.
+                    _pending["escalated"] = True
+                    log_event(order_id, "MONITOR_ALERT_ESCALATED",
+                              "escalation transport outcome "
+                              "unknown; treated as delivered, not "
+                              "re-sent")
                 del _pending["escalation_intent"]
             with _db_lock:
                 conn = db_connect()
@@ -3392,13 +3789,6 @@ def _run_monitor_locked(mon):
             conn.commit()
             conn.close()
 
-    def _attempt(d_new, d_gone, d_grade, d_score):
-        body, body_html = _monitor_alert_parts(
-            mon, host, order_id, d_new, d_gone, d_grade, d_score)
-        return send_resend(
-            mon["email"], f"Monitoring: changes detected on {host}",
-            body, html=body_html)
-
     now = time.time()
     # This scan's own diff, against what the client was last told.
     # (A retained alert, if any, was already delivered at the top of
@@ -3427,27 +3817,39 @@ def _run_monitor_locked(mon):
     # a crash after delivery leaves the evidence the retained
     # path at the top of the next run reconciles, instead of a
     # second delivery. The outcome is persisted the moment the
-    # send returns, before any other post-send work.
+    # send returns, before any other post-send work. Round 18:
+    # the record also carries the alert's idempotency key, and
+    # an UNKNOWN outcome keeps the intent with the outcome
+    # recorded — the retained path then retries under the same
+    # key rather than reconciling the alert as delivered.
     retained = {"new": new, "gone": gone, "grade": grade,
                 "score": score, "digest_after": digest,
                 "attempts": 1, "since": utcnow(),
                 "send_intent": utcnow()}
+    retained["idem"] = _monitor_alert_idem(mon, retained)
     _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
-    ok, detail = _attempt(new, gone, grade, score)
-    if ok:
+    res = _send_monitor_alert(mon, host, order_id, retained)
+    status = _send_status(res)
+    detail = res[1]
+    if status == "delivered":
         _save_mon(json.dumps(digest), now + MONITOR_INTERVAL, None)
+    elif status == "unknown":
+        retained["last_outcome"] = "unknown"
+        _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
     else:
         del retained["send_intent"]
         _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
     log_event(order_id,
-              "MONITOR_ALERT_SENT" if ok else "MONITOR_ALERT_FAILED",
-              detail)
+              "MONITOR_ALERT_SENT" if status == "delivered"
+              else "MONITOR_ALERT_FAILED",
+              detail if status != "unknown"
+              else f"transport outcome unknown: {detail}")
     send_telegram(
         f"ShipAudit Lab: monitoring changes on {mon['url']} - "
         f"{len(new)} new, {len(gone)} resolved; grade {grade} "
         f"({score}). Client alert: "
-        f"{'SENT' if ok else 'FAILED - ' + detail}")
-    if not ok:
+        f"{'SENT' if status == 'delivered' else 'FAILED - ' + detail}")
+    if status != "delivered":
         log_event(order_id, "MONITOR_ALERT_RETRY",
                   "attempt 1; alert retained, digest held")
 
