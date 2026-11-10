@@ -1521,10 +1521,23 @@ check("N2 crash before marker: no repeated notification",
       and count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
                 (o16b,)) == 1)
 
-# N3: the zero-delivery arm (F2) — a failed HQ send must NOT
-#     record completion: the transition raises, the order stays
-#     PAID and recoverable, and recovery delivers exactly one
-#     ping once the channel heals.
+# N3: the failed-send arm — REWRITTEN in round 18b under the
+#     parent's contract-change ruling (cause: Codex delta-17
+#     item (g)); the original round-16 (F2) text lives in git
+#     history at 5c00365 and in the JOURNAL. The old check
+#     pinned the coupling delta-17 refuted as a defect: a
+#     stubbed-False HQ send made the transition RAISE and left
+#     SIDE_EFFECTS_OK unwritten, so a dead notification
+#     channel wedged the order in PAID. Its invariant core
+#     survives unchanged and is what is asserted here: exactly
+#     one HQ ping once the channel heals, and the order is
+#     never lost. Under the round-18 semantics (a plain
+#     (False, ...) stub models a DEFINITE rejection — see
+#     _send_status) the failure becomes a durable pending
+#     record on the notify lock, the transition completes
+#     (no raise, marker recorded), and the pending-
+#     notification sweep — not the healed channel alone —
+#     delivers the queued ping exactly once.
 o16c = mk_order("n3@test.dev", "Deep Scan", 29)
 c = db()
 row16c = dict(c.execute("SELECT * FROM orders WHERE id=?",
@@ -1532,21 +1545,43 @@ row16c = dict(c.execute("SELECT * FROM orders WHERE id=?",
 c.close()
 N_TG_MODE["ok"] = False
 raised16c = False
+won16c = False
 try:
-    S.transition_order_status(row16c, "PAID")
+    won16c = S.transition_order_status(row16c, "PAID")
 except RuntimeError:
     raised16c = True
-N_TG_MODE["ok"] = True
+lock16c = S._lock_row(f"notify:{o16c}")
 pre16c = (count("fulfilment_requests", "order_id=?", (o16c,)),
           count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
                 (o16c,)),
-          len(tg16_pings(o16c)))
-S.ensure_paid_side_effects(row16c)
-check("N3 failed send: no completion, recovery delivers once",
-      raised16c and order_status(o16c) == "PAID"
-      and pre16c == (1, 0, 0)
+          len(tg16_pings(o16c)),
+          count("events",
+                "order_id=? AND event='DEEPSCAN_NOTIFY_FAILED'",
+                (o16c,)))
+N_TG_MODE["ok"] = True
+# The channel has healed, but nothing re-fires on its own:
+# the queued ping stays undelivered until the sweep's
+# pending-notification driver runs.
+healed16c = len(tg16_pings(o16c))
+S.sweep_paid_side_effects()
+row16c["status"] = "PAID"
+adv16c = S.transition_order_status(row16c, "IN_PROGRESS")
+check("N3 failed send: no wedge, sweep delivers once",
+      not raised16c and won16c is True
+      and pre16c == (1, 1, 0, 1)
+      and lock16c is not None
+      and lock16c[0] == "deepscan-notify-pending"
+      and healed16c == 0
+      and adv16c is True
+      and order_status(o16c) == "IN_PROGRESS"
       and len(tg16_pings(o16c)) == 1
+      and len([t for t in N_TG["attempts"]
+               if f"Deep Scan order #{o16c} is PAID"
+               in t]) == 2
       and count("events", "order_id=? AND event='DEEPSCAN_QUEUED'",
+                (o16c,)) == 1
+      and count("events",
+                "order_id=? AND event='DEEPSCAN_NOTIFIED'",
                 (o16c,)) == 1
       and count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
                 (o16c,)) == 1)
