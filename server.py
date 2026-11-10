@@ -2966,7 +2966,28 @@ MONITOR_TICK = int(os.environ.get("VF_MONITOR_TICK", "600"))
 _monitor_scan_lock = threading.Lock()
 
 
+def _monitor_activated_logged(order_id):
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM events WHERE order_id=? AND "
+            "event='MONITOR_ACTIVATED'",
+            (order_id,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
 def activate_monitor(order):
+    """Insert the monitor row (INSERT OR IGNORE: unique in every
+    interleaving) and fire its MONITOR_ACTIVATED courtesy log
+    exactly once (round 17, the out-of-mandate observation round
+    16 recorded). The log rides the same single-fire discipline
+    as the Deep Scan hook (round 16): the durable
+    MONITOR_ACTIVATED record is verified by reading it back; a
+    fire whose record did not persist leaves the held lock as
+    the durable 'sent, unconfirmed' record (purpose
+    monitor-activated-unconfirmed), and re-entry honours it and
+    reconciles the log."""
     with _db_lock:
         conn = db_connect()
         conn.execute(
@@ -2976,8 +2997,37 @@ def activate_monitor(order):
              utcnow(), time.time()))
         conn.commit()
         conn.close()
-    log_event(order["id"], "MONITOR_ACTIVATED",
+    oid = order["id"]
+    if _monitor_activated_logged(oid):
+        return
+    key = f"monitor-activate:{oid}"
+    if _lock_purpose(key) == "monitor-activated-unconfirmed":
+        log_event(oid, "MONITOR_ACTIVATED",
+                  "reconciled from the durable sent-unconfirmed "
+                  "record; the original log line was written")
+        return
+    token = _claim_event_lock(key, "monitor-activate")
+    if not token:
+        if _monitor_activated_logged(oid) or \
+                _lock_purpose(key) == \
+                "monitor-activated-unconfirmed":
+            return
+        raise RuntimeError(
+            "monitor activation log in flight in another process")
+    if not _lock_still_mine(key, token):
+        if _monitor_activated_logged(oid):
+            return
+        raise RuntimeError(
+            "monitor activation log lock lost before firing")
+    log_event(oid, "MONITOR_ACTIVATED",
               "weekly rescan scheduled; baseline due on next tick")
+    if not _monitor_activated_logged(oid):
+        if _set_lock_purpose(key, token,
+                             "monitor-activated-unconfirmed"):
+            return
+        _release_event_lock(key, token)
+        raise RuntimeError(
+            "MONITOR_ACTIVATED record did not persist")
 
 
 def _monitor_reschedule(monitor_id, when):

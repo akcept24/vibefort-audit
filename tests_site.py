@@ -1744,6 +1744,39 @@ S.send_telegram = _prev_tg16
 S.send_resend = _prev_resend16
 S._scan_with_timeout = _prev_scan16
 
+# ---- Round 17 catalog (added 2026-11-10, micro-wave: the
+#      MONITOR_ACTIVATED courtesy-log duplicate flagged as an
+#      out-of-mandate observation by round 16) ----
+# activate_monitor's row was always unique (INSERT OR IGNORE),
+# but its MONITOR_ACTIVATED log line fired again on every
+# recovery re-entry. The capture below counts log_event calls
+# for the event — the stub shape the N-block established.
+ACT17 = []
+
+
+def cap17(order_id, event, detail=""):
+    ACT17.append((order_id, event))
+    return real_log16(order_id, event, detail)
+
+
+o17 = mk_order("n9@test.dev", "Monitoring", 79)
+c = db()
+row17 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                       (o17,)).fetchone())
+c.close()
+S.log_event = cap17
+S.activate_monitor(row17)
+# Simulated recovery re-entry: the completion marker never
+# landed, the consult re-fires the PAID side effects.
+S.ensure_paid_side_effects(row17)
+S.log_event = real_log16
+check("N9 activation: MONITOR_ACTIVATED exactly once on re-entry",
+      len([1 for (oid17, ev17) in ACT17
+           if oid17 == o17 and ev17 == "MONITOR_ACTIVATED"]) == 1
+      and count("monitors", "order_id=?", (o17,)) == 1
+      and count("events", "order_id=? AND event='MONITOR_ACTIVATED'",
+                (o17,)) == 1)
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
