@@ -4010,6 +4010,280 @@ check("N61 (3): monitor — definite failure leaves no "
       and pend61b is not None
       and not pend61b.get("post_window_used"))
 
+# ============================================================
+# Round 23 (Codex delta-21): ATOMICITY — every aliveness
+# check and the act it guards collapse into one _db_lock
+# critical section (or, for the claim, a check inside the
+# claim's own acquisition). Delta-21 refuted round 22 on
+# three arms, all one class: (1) _send_gate releases the
+# lock before the HTTP call, so a send can still START
+# after deletion completes — and several monitor Telegrams
+# (retained-delivered, baseline, fresh-change, SSRF and
+# scan-crash arms) have no gate at all; (2) _log_event_alive
+# and _record_effects_ok check and insert in separate
+# steps, and direct log_event calls (receipt settle arms,
+# monitor error/baseline/rescan/change) are unguarded —
+# log_event itself inserts with no alive predicate;
+# (3) _claim_event_lock inserts an order-keyed lock after
+# a stale entry check, where a crash leaves it for the GC.
+# Round 23: _db_lock becomes an RLock (the pins' own seam
+# wraps execute deletions from inside wrapped sends on the
+# same thread — N58's shape); log_event itself is the
+# guarded atomic writer (order_id present => check+INSERT
+# in one acquisition; _log_event_alive delegates to it);
+# every order/monitor notification send runs gate+provider
+# call inside one acquisition (_gated_send); order/monitor
+# -keyed claims and takeovers consult aliveness inside
+# their own acquisition and refuse a dead owner with None.
+
+# N62 (1): the gate-to-send gap for the receipt, threaded —
+#      the send is parked INSIDE its provider call (past
+#      every gate); the admin deletion, attempted from
+#      another thread, must NOT complete while the send is
+#      parked (the gate and the call are one critical
+#      section now, and the delete transaction needs the
+#      same lock), and after it completes no second send
+#      may start for the tombstoned order.
+o62 = mk_order("n62@test.dev", "Deep Scan", 29, status="PAID")
+row62 = row_of18(o62)
+_real_send62 = SR.send_resend
+_send62_calls = []
+_parked62 = threading.Event()
+_release62 = threading.Event()
+
+
+def _parking_send62(to, subject, text, html=None):
+    _send62_calls.append(to)
+    _parked62.set()
+    _release62.wait(30)
+    return SR._SendOutcome(True, "mail-n62", "delivered")
+
+
+SR.send_resend = _parking_send62
+_box62 = {}
+
+
+def _drive62():
+    _box62["r"] = SR._ensure_paid_receipt(row62, 2900)
+
+
+th62 = threading.Thread(target=_drive62)
+th62.start()
+_parked62.wait(30)
+_del62 = {}
+
+
+def _delete62():
+    _del62["code"] = admin_delete22(o62)
+
+
+dth62 = threading.Thread(target=_delete62)
+dth62.start()
+time.sleep(1.0)
+_blocked62 = dth62.is_alive() \
+    and count("orders", "id=?", (o62,)) == 1 \
+    and not tombstone_of22(o62)
+_release62.set()
+th62.join(30)
+dth62.join(30)
+SR.send_resend = _real_send62
+r62b = SR._ensure_paid_receipt(row62, 2900)
+check("N62 (1): receipt — deletion attempted while the "
+      "send is parked inside its provider call cannot "
+      "complete until the send returns; afterwards no "
+      "second send starts for the tombstoned order",
+      _blocked62
+      and _del62.get("code") == 200
+      and tombstone_of22(o62)
+      and count("orders", "id=?", (o62,)) == 0
+      and _send62_calls == ["n62@test.dev"]
+      and r62b is False)
+
+# N63 (1): a previously UNGATED monitor Telegram arm — the
+#      baseline message. The order is deleted mid-scan
+#      (inside the wrapped scanner, through the real admin
+#      endpoint); when the run resumes, no baseline
+#      Telegram may start and no MONITOR_BASELINE event
+#      may be written for the dead order.
+o63 = mk_order("n63@test.dev", "Monitoring", 79, status="PAID")
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
+          (o63, "https://n63.example.com", "n63@test.dev",
+           "N63", SR.utcnow(), time.time()))
+c.commit()
+c.close()
+m63 = mon_row16(o63)
+_real_scan63 = SR._scan_with_timeout
+
+
+def _deleting_scan63(url, timeout=None):
+    admin_delete22(o63)
+    return ([{"severity": "low", "title": "Missing header X"}],
+            {"host": "n63.example.com", "errors": []})
+
+
+SR._scan_with_timeout = _deleting_scan63
+PROV22.tg_mode = "ok"
+SR._run_monitor(dict(m63))
+SR._scan_with_timeout = _real_scan63
+check("N63 (1): baseline — order deleted mid-scan: no "
+      "baseline Telegram starts and no event is written "
+      "for the dead order",
+      [t for t in PROV22.tg_requests
+       if "n63.example.com" in t] == []
+      and count("events", "order_id=?", (o63,)) == 0)
+
+# N64 (2): the event check-to-insert gap, threaded — the
+#      writer is parked at the guarded writer's threshold
+#      (inside the wrapped log_event, before the real
+#      insert) while the deletion completes from another
+#      thread; released afterwards, the writer must not
+#      land an event row for the dead order.
+o64 = mk_order("n64@test.dev", "Deep Scan", 29, status="PAID")
+_real_le64 = SR.log_event
+_parked64 = threading.Event()
+_release64 = threading.Event()
+
+
+def _parking_le64(order_id, event, detail=""):
+    if event == "N64_EVENT" and order_id == o64:
+        _parked64.set()
+        _release64.wait(30)
+    return _real_le64(order_id, event, detail)
+
+
+SR.log_event = _parking_le64
+
+
+def _write64():
+    SR._log_event_alive(o64, "N64_EVENT", "round-23 pin")
+
+
+wth64 = threading.Thread(target=_write64)
+wth64.start()
+_parked64.wait(30)
+_del64 = {}
+
+
+def _delete64():
+    _del64["code"] = admin_delete22(o64)
+
+
+dth64 = threading.Thread(target=_delete64)
+dth64.start()
+dth64.join(30)
+_release64.set()
+wth64.join(30)
+SR.log_event = _real_le64
+check("N64 (2): event writer — deletion completes while "
+      "the writer is parked between its caller's check "
+      "and the insert: no event row for the dead order",
+      _del64.get("code") == 200
+      and count("events", "order_id=? AND event='N64_EVENT'",
+                (o64,)) == 0
+      and count("events", "order_id=?", (o64,)) == 0)
+
+# N65 (2): delta-20's _record_effects_ok specimen again,
+#      with the deletion inside the check-to-insert gap
+#      itself (the wrapped log_event deletes through the
+#      real endpoint before delegating): no orphan
+#      SIDE_EFFECTS_OK may be recreated, and the call must
+#      not raise for the dead order.
+o65 = mk_order("n65@test.dev", "Deep Scan", 29, status="PAID")
+_real_le65 = SR.log_event
+_box65 = {"done": False}
+
+
+def _deleting_le65(order_id, event, detail=""):
+    if event == "SIDE_EFFECTS_OK" and order_id == o65 \
+            and not _box65["done"]:
+        _box65["done"] = True
+        admin_delete22(o65)
+    return _real_le65(order_id, event, detail)
+
+
+SR.log_event = _deleting_le65
+SR._record_effects_ok(o65, "Deep Scan")
+SR.log_event = _real_le65
+check("N65 (2): _record_effects_ok — deletion inside the "
+      "check-to-insert gap writes no SIDE_EFFECTS_OK "
+      "orphan and recreates no event",
+      _box65["done"]
+      and count("events",
+                "order_id=? AND event='SIDE_EFFECTS_OK'",
+                (o65,)) == 0
+      and count("events", "order_id=?", (o65,)) == 0)
+
+# N66 (3): claim-after-delete for both key families — the
+#      worker's entry check passed, THEN the deletion
+#      completes, THEN the claim is attempted: an
+#      order-keyed notify: claim and a monitor-keyed
+#      monitor: claim must both be refused (None), create
+#      NO lock row, and leave the GC nothing to collect.
+o66 = mk_order("n66@test.dev", "Deep Scan", 29, status="PAID")
+SR._order_alive(o66)  # the stale entry check: passed
+admin_delete22(o66)
+tok66a = SR._claim_event_lock(f"notify:{o66}",
+                              "deepscan-notify-intent")
+o66m = mk_order("n66m@test.dev", "Monitoring", 79,
+                status="PAID")
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
+          (o66m, "https://n66.example.com", "n66m@test.dev",
+           "N66", SR.utcnow(), time.time()))
+c.commit()
+c.close()
+m66 = mon_row16(o66m)
+SR._monitor_alive(m66["id"])  # the stale entry check: passed
+admin_delete22(o66m)
+tok66b = SR._claim_event_lock(f"monitor:{m66['id']}",
+                              "monitor")
+SR._gc_notification_orphans()
+check("N66 (3): claim after deletion — notify: and "
+      "monitor: claims are refused (None), no lock row "
+      "is created, the GC finds nothing to collect",
+      tok66a is None and tok66b is None
+      and lock_row18(f"notify:{o66}") is None
+      and lock_row18(f"monitor:{m66['id']}") is None)
+if tok66a:
+    SR._release_event_lock(f"notify:{o66}", tok66a)
+if tok66b:
+    SR._release_event_lock(f"monitor:{m66['id']}", tok66b)
+
+# N67 (1): the scan-CRASH arm (the other ungated error
+#      Telegram) — the order is deleted inside the wrapped
+#      scanner, which then raises: no MONITOR_ERROR event
+#      and no crash Telegram may be produced for the dead
+#      order when the arm runs.
+o67 = mk_order("n67@test.dev", "Monitoring", 79, status="PAID")
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
+          (o67, "https://n67.example.com", "n67@test.dev",
+           "N67", SR.utcnow(), time.time()))
+c.commit()
+c.close()
+m67 = mon_row16(o67)
+_real_scan67 = SR._scan_with_timeout
+
+
+def _crashing_scan67(url, timeout=None):
+    admin_delete22(o67)
+    raise RuntimeError("n67 scan boom")
+
+
+SR._scan_with_timeout = _crashing_scan67
+SR._run_monitor(dict(m67))
+SR._scan_with_timeout = _real_scan67
+check("N67 (1): scan-crash arm — order deleted mid-scan: "
+      "no MONITOR_ERROR event and no crash Telegram for "
+      "the dead order",
+      [t for t in PROV22.tg_requests
+       if "n67.example.com" in t] == []
+      and count("events", "order_id=?", (o67,)) == 0)
+
 _ureq18.urlopen = _real_urlopen18
 
 failed = [n for n, ok in PASS if not ok]
