@@ -1506,8 +1506,16 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     conn.close()
                 if orow is not None:
-                    ensure_paid_side_effects(dict(orow))
-                    _ensure_paid_receipt(dict(orow), amount)
+                    order_d = dict(orow)
+                    if order_d["status"] == "NEW":
+                        # Crash between linking and the transition:
+                        # the verified payment stands — finish the
+                        # transition, don't just paper over it with
+                        # side effects on a NEW order.
+                        transition_order_status(order_d, "PAID")
+                    ensure_paid_side_effects(order_d)
+                    if not _ensure_paid_receipt(order_d, amount):
+                        raise RuntimeError("receipt resend failed")
             self._send_json(200, {"ok": True, "duplicate": True})
             return
         # One payment can arrive as two events (completed +
@@ -1583,8 +1591,12 @@ class Handler(BaseHTTPRequestHandler):
                       f"event={eid} amount={amount} tier={tier} "
                       f"race={'won' if won else 'lost-recovered'}")
             # The payer hears from us immediately — a payment with
-            # no acknowledgement reads as money into a void.
-            _send_paid_receipt(order, amount)
+            # no acknowledgement reads as money into a void. A failed
+            # receipt raises: Stripe retries, and the recovery
+            # consult resends it (the order itself is already PAID
+            # and fulfilled — only the courtesy is outstanding).
+            if not _send_paid_receipt(order, amount):
+                raise RuntimeError("receipt send failed")
             send_telegram(
                 f"ShipAudit Lab: Stripe payment matched — order "
                 f"#{order['id']} ({tier}, ${amount / 100:,.2f}) "
@@ -2031,8 +2043,20 @@ def sweep_paid_side_effects():
         evs = conn.execute(
             "SELECT event_id, order_id, amount FROM stripe_events "
             "WHERE order_id IS NOT NULL").fetchall()
+        linked_new = conn.execute(
+            "SELECT o.* FROM stripe_events se JOIN orders o "
+            "ON o.id = se.order_id WHERE o.status='NEW'").fetchall()
     finally:
         conn.close()
+    for row in linked_new:
+        # A verified payment linked to an order that never got its
+        # transition (crash in the link window): the money stands,
+        # finish the transition at boot.
+        try:
+            transition_order_status(dict(row), "PAID")
+        except Exception as e:
+            log(f"boot sweep: transition for linked order "
+                f"{row['id']} failed: {e!r}")
     for row in rows:
         try:
             ensure_paid_side_effects(dict(row))
@@ -2112,6 +2136,8 @@ def _send_paid_receipt(order, amount_cents):
 
 
 def _ensure_paid_receipt(order, amount_cents):
+    """True when the receipt is on record as sent (already, or by
+    the resend this call performs)."""
     conn = db_connect()
     try:
         sent = conn.execute(
@@ -2119,8 +2145,9 @@ def _ensure_paid_receipt(order, amount_cents):
             "event='PAID_EMAIL_SENT'", (order["id"],)).fetchone()
     finally:
         conn.close()
-    if sent is None:
-        _send_paid_receipt(order, amount_cents)
+    if sent is not None:
+        return True
+    return _send_paid_receipt(order, amount_cents)
 
 
 def _stripe_signature_ok(raw, header, secret):
@@ -2349,7 +2376,9 @@ def _run_monitor(mon):
                     "UPDATE monitors SET pending_alert=?, "
                     "next_run_at=? WHERE id=?",
                     (json.dumps(_pending),
-                     time.time() + (3600 if _attempts < 3
+                     time.time() + (3600
+                                    if _attempts < 3
+                                    or not _pending.get("escalated")
                                     else MONITOR_INTERVAL),
                      mon["id"]))
                 conn.commit()
