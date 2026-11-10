@@ -6748,6 +6748,288 @@ _lsock443.close()
 _SRV32.shutdown()
 _SRV32.server_close()
 
+# ROUND 33 — Codex delta-31: NO-SHIP on b793cd9, ONE
+# finding, a genuine census catch. Certified
+# (untouched): the restructured operative claim, the
+# no-guarantee sentence for build events, classes
+# (1)/(3)/(4) as far as they go, pins N84/N85 as
+# honest basis evidence, the catalog chain to 158
+# and the no-code-change round itself. The census
+# mapped EVERY context-constructor site in
+# server.py; exactly ONE was unassigned:
+# server.py:1544, inside the scanner's
+# _pinned_request — immediately after its own
+# explicit wrap, the module constructs
+# http.client.HTTPSConnection WITHOUT a context,
+# and the constructor creates ANOTHER fresh context
+# per construction by its own semantics (stdlib's
+# constructor when unarmed; under the armed swap,
+# the module's deadline class and its factory, on
+# the scanner's account as initiator). Class (2)
+# described only probe WRAPS; class (4) names
+# FOREIGN direct constructions; a module-owned
+# direct construction outside the send machinery
+# belonged to neither, so the taxonomy did not
+# close. THIS ROUND CHANGES NO PRODUCTION CODE:
+# the JOURNAL widens class (2) by OWNERSHIP — THE
+# MODULE'S OWN NON-SEND CONSTRUCTIONS: every
+# TLS-context creation performed by this module's
+# code outside the gated-send operations,
+# comprising (2a) the scanner seam's explicit probe
+# wraps (_tls_info and _pinned_request's wrap
+# sites, a fresh default context per probed
+# connection) and (2b) the scanner seam's DIRECT
+# connection constructions without a supplied
+# context (_pinned_request's HTTPSConnection
+# construction) — with the precedence rule stated
+# explicitly: opener/handler constructions are
+# class (1) whoever initiates them (the warm-up is
+# the module's own build and stays class (1));
+# class (2) is the module's remaining non-send
+# creations. N86 below is that widening's factual
+# basis for class (2b). N86 is GREEN on b793cd9 by
+# design — a basis pin for a documentary widening,
+# not a defect specimen: behaviour does not change
+# this round; the round-32 defect was in the
+# taxonomy's enumeration, not in the tree's
+# behaviour.
+
+import http.server as _hs33
+import re as _re33
+import ssl as _ssl33
+import subprocess as _sp33
+import tempfile as _tf33
+
+_certdir33 = _tf33.mkdtemp(prefix="vf-tls33-")
+_ca33 = os.path.join(_certdir33, "ca.pem")
+_cakey33 = os.path.join(_certdir33, "ca.key")
+_sp33.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+           "-keyout", _cakey33, "-out", _ca33, "-days", "2",
+           "-nodes", "-subj", "/CN=vf-ca33",
+           "-addext", "basicConstraints=critical,CA:TRUE",
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+          check=True, capture_output=True, timeout=60)
+_cert33 = os.path.join(_certdir33, "cert.pem")
+_key33 = os.path.join(_certdir33, "key.pem")
+_csr33 = os.path.join(_certdir33, "srv.csr")
+_ext33 = os.path.join(_certdir33, "srv.ext")
+_sp33.run(["openssl", "req", "-newkey", "rsa:2048",
+           "-keyout", _key33, "-out", _csr33, "-nodes",
+           "-subj", "/CN=127.0.0.1"],
+          check=True, capture_output=True, timeout=60)
+with open(_ext33, "w") as _fext33:
+    _fext33.write("subjectAltName=IP:127.0.0.1\n")
+_sp33.run(["openssl", "x509", "-req", "-in", _csr33,
+           "-CA", _ca33, "-CAkey", _cakey33,
+           "-CAcreateserial", "-out", _cert33, "-days", "2",
+           "-extfile", _ext33],
+          check=True, capture_output=True, timeout=60)
+_srvctx33 = _ssl33.SSLContext(_ssl33.PROTOCOL_TLS_SERVER)
+_srvctx33.load_cert_chain(_cert33, _key33)
+
+
+class _TlsHandler33(_hs33.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        _ids33 = {"/tls-ok86": b"mail-n86-ok"}
+        if self.path in _ids33:
+            body = b'{"id": "' + _ids33[self.path] + b'"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_SRV33 = _hs33.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _TlsHandler33)
+_SRV33.socket = _srvctx33.wrap_socket(_SRV33.socket,
+                                      server_side=True)
+_PORT33 = _SRV33.server_address[1]
+_th33srv = threading.Thread(
+    target=_SRV33.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th33srv.start()
+
+# N86 (1): taxonomy class (2b) — a FRESH SUBPROCESS
+# specimen in N78's pattern. The driver imports the
+# server module (the warm-up installs the global
+# opener) and wraps the two creator seams in
+# SEPARATE counters: ssl.create_default_context
+# (the explicit-wrap seam) and
+# http.client._create_https_context (the
+# constructor seam — the function a context=None
+# HTTPSConnection construction invokes for its own
+# fresh context). The driver then drives the
+# GENUINE scanner fetch path — SRV._fetch, the
+# free-scan fetcher, which resolves, guard-checks
+# and pins by SRV._pinned_request exactly as its
+# production callers do — against the local
+# CA-signed TLS server, with the SSRF guard opened
+# to loopback: the probe must PERFORM its fetch (a
+# real response status comes back over the wrapped
+# socket) with the WRAP seam >= 1 (its own explicit
+# ssl.create_default_context) AND the CONSTRUCTOR
+# seam >= 1 — the server.py:1544 construction's own
+# creation, a SECOND context distinct from the
+# wrap's, on the scanner's account as initiator.
+# The driver then zeroes both counters and runs ONE
+# gated send on the built opener: delivered with
+# BOTH counters at ZERO — the module's non-send
+# constructions create on their own account, never
+# as send operations. (The child's environment
+# carries SSL_CERT_FILE=<the local CA>, N78's
+# arrangement, so the default contexts trust the
+# local server and everything runs on production
+# mechanics.)
+_DRIVER86 = '''import http.client
+import os
+import ssl
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+port = int(sys.argv[2])
+dbpath = sys.argv[3]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+import server as SRV
+
+print("WARMED86 opener=%s" % (
+    "set" if urllib.request._opener is not None
+    else "unset"), flush=True)
+
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("https_proxy", None)
+os.environ["VF_ALLOW_PRIVATE_TARGETS"] = "1"
+
+_wrap = [0]
+_ctor = [0]
+_real_wrap = ssl.create_default_context
+_real_ctor = http.client._create_https_context
+
+
+def _counting_wrap(*a, **kw):
+    _wrap[0] += 1
+    return _real_wrap(*a, **kw)
+
+
+def _counting_ctor(http_version):
+    _ctor[0] += 1
+    return _real_ctor(http_version)
+
+
+ssl.create_default_context = _counting_wrap
+http.client._create_https_context = _counting_ctor
+
+# Taxonomy class (2): the module's OWN non-send
+# constructions — the genuine _fetch driving the
+# genuine _pinned_request against the local TLS
+# server on the URL's own port: the explicit wrap
+# (class (2a)) and the context=None HTTPSConnection
+# construction at server.py:1544 (class (2b)) each
+# create, on separate seams.
+_out = SRV._fetch("https://127.0.0.1:%d/probe86" % port)
+print("PROBE86 status=%s wrap=%d ctor=%d" % (
+    _out["status"], _wrap[0], _ctor[0]), flush=True)
+_wrap[0] = 0
+_ctor[0] = 0
+
+SRV.RESEND_API_KEY = "catalog-test-key"
+SRV._GATED_SEND_DEADLINE = 10.0
+SRV._RESEND_API_URL = "https://127.0.0.1:%d/tls-ok86" % port
+_conn = SRV.db_connect()
+_cur = _conn.execute(
+    "INSERT INTO orders(created_at,name,email,url,tier,"
+    "notes,amount,status) VALUES(?,?,?,?,?,?,?,?)",
+    (SRV.utcnow(), "Cat T", "n86@test.dev",
+     "https://example.com", "Deep Scan", "", 29, "PAID"))
+_oid = _cur.lastrowid
+_conn.commit()
+_conn.close()
+_res = SRV._gated_send(_oid, SRV.send_resend,
+                       "n86@test.dev",
+                       "Payment received — Deep Scan", "body")
+print("SEND86 status=%s id=%s wrap=%d ctor=%d" % (
+    SRV._send_status(_res), _res[1],
+    _wrap[0], _ctor[0]), flush=True)
+'''
+
+_drvdir33 = _tf33.mkdtemp(prefix="vf-n86-")
+_drvfile86 = os.path.join(_drvdir33, "driver86.py")
+with open(_drvfile86, "w") as _fdrv86:
+    _fdrv86.write(_DRIVER86)
+_env86 = dict(os.environ)
+_env86["SSL_CERT_FILE"] = _ca33
+_run86 = _sp33.run(
+    [sys.executable, _drvfile86,
+     os.path.dirname(os.path.abspath(__file__)),
+     str(_PORT33), os.path.join(_drvdir33, "n86.db")],
+    env=_env86, capture_output=True, text=True, timeout=180)
+_out86 = _run86.stdout or ""
+print("N86 driver rc=%d stdout:\n%s"
+      % (_run86.returncode, _out86))
+if _run86.stderr:
+    print("N86 driver stderr (tail):\n"
+          + _run86.stderr[-2000:])
+_mwarm86 = _re33.search(r"WARMED86 opener=(set|unset)",
+                        _out86)
+_mprb86 = _re33.search(
+    r"PROBE86 status=(\S+) wrap=(\d+) ctor=(\d+)",
+    _out86)
+_msnd86 = _re33.search(
+    r"SEND86 status=(\S+) id=(\S+) wrap=(\d+) ctor=(\d+)",
+    _out86)
+check("N86 (1): fresh subprocess — the module's own "
+      "NON-SEND constructions create on the scanner's "
+      "account while a gated send creates nothing: "
+      "the genuine _fetch/_pinned_request against the "
+      "local CA-signed TLS server performs its fetch "
+      "(a real response status returns) with the "
+      "explicit-wrap seam >=1 AND the constructor "
+      "seam >=1 — the server.py:1544 context=None "
+      "HTTPSConnection construction's OWN fresh "
+      "context, a second creation distinct from the "
+      "wrap's (taxonomy class (2) as widened by "
+      "ownership in round 33: (2a) probe wraps, (2b) "
+      "the seam's direct constructions without a "
+      "supplied context) — and one gated send on the "
+      "built opener is delivered with BOTH seams at "
+      "ZERO (basis pin, green by design on the "
+      "pre-round tree: the round-32 defect was in "
+      "the taxonomy's enumeration, not in behaviour)",
+      _run86.returncode == 0
+      and _mwarm86 is not None
+      and _mwarm86.group(1) == "set"
+      and _mprb86 is not None
+      and _mprb86.group(1) != "None"
+      and int(_mprb86.group(2)) >= 1
+      and int(_mprb86.group(3)) >= 1
+      and _msnd86 is not None
+      and _msnd86.group(1) == "delivered"
+      and _msnd86.group(2) == "mail-n86-ok"
+      and int(_msnd86.group(3)) == 0
+      and int(_msnd86.group(4)) == 0)
+_SRV33.shutdown()
+_SRV33.server_close()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
