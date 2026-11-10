@@ -424,6 +424,40 @@ _MAIL_IDEM = contextvars.ContextVar("vf_mail_idem", default=None)
 # (which have no socket to shim) and routes HTTPError
 # bodies — addinfourl has no read1 and its read() ignores
 # a size argument — to the wrapped response's read1.
+#
+# Round 26 (Codex delta-24): delta-24 certified the
+# read/write phases for exchanges that REACH the shim,
+# but refuted the construction and the connect phase.
+# (1) Under the class swap, Python 3.12's
+# HTTPSConnection.__init__ resolves its explicit super()
+# against the REPLACED global and construction raised
+# TypeError — every armed HTTPS send (both providers
+# are HTTPS) would have failed without sending; the
+# catalog missed it because its specimens were HTTP.
+# The deadline classes now initialise through CAPTURED
+# original class objects (never a call-time global
+# lookup) and take their TLS context from the module
+# factory _HTTPS_CONTEXT_FACTORY, so they construct
+# and operate identically under the swap or not, for
+# armed and unarmed callers alike. (2) Connection
+# establishment ran BEFORE the shim existed: DNS,
+# per-address connects (each with the full timeout),
+# proxy CONNECT and the TLS handshake were not
+# aggregate-bounded. Armed connect now resolves once
+# and iterates addresses itself, re-capping every
+# attempt at the remaining budget; the tunnel runs
+# over the shim; the handshake runs as one operation
+# on a socket timed out at the remaining budget. The
+# one sub-operation that remains uncappable by
+# construction is the single getaddrinfo call itself,
+# named as the bound's only exception in the JOURNAL
+# statement. (3) Descriptor cleanup is deterministic:
+# the shim emulates the real socket's makefile
+# refcount (close() marks; the real close lands with
+# the last reader, or immediately when no reader
+# exists), connect-phase failures force-close in
+# _deadline_connect, and the wrappers close HTTPError
+# responses explicitly on armed exchanges.
 _GATED_SEND_DEADLINE = 30.0
 _SEND_DEADLINE_AT = contextvars.ContextVar(
     "vf_send_deadline_at", default=None)
@@ -493,31 +527,64 @@ class _DeadlineSocket:
     def __init__(self, sock):
         self._sock = sock
         self._close_marked = False
+        self._io_refs = 0
+        self._real_closed = False
 
     def __getattr__(self, name):
-        if name in ("_sock", "_close_marked"):
+        if name in ("_sock", "_close_marked", "_io_refs",
+                    "_real_closed"):
             raise AttributeError(name)
         return getattr(self._sock, name)
 
+    def _really_close(self):
+        if self._real_closed:
+            return
+        self._real_closed = True
+        try:
+            self._sock.close()
+        except Exception:
+            pass
+
+    def _force_close(self):
+        """Close the real socket NOW, whatever the reader
+        refcount says. Used by the connect-phase failure
+        paths (round 26), where the exchange is being
+        abandoned before any response reader can exist —
+        deterministic cleanup there cannot wait for a
+        reader that will never come."""
+        self._close_marked = True
+        self._really_close()
+
+    def _reader_open(self):
+        self._io_refs += 1
+
+    def _reader_closed(self):
+        if self._io_refs > 0:
+            self._io_refs -= 1
+        if self._close_marked and self._io_refs == 0:
+            self._really_close()
+
     def close(self):
-        # Deliberately does NOT close the real socket.
-        # urllib's do_open calls sock.close() on the
-        # connection's socket immediately after
+        # Deliberately does NOT necessarily close the
+        # real socket. urllib's do_open calls sock.close()
+        # on the connection's socket immediately after
         # getresponse() and then keeps reading the body
         # through the response: with a real socket that is
         # safe because close() only marks it — the OS
         # descriptor lives until the last makefile object
-        # is done (the socket's io refcount). The shim's
-        # own makefile creates no such refcount on the real
-        # socket, so a delegating close() here would kill
-        # the descriptor mid-response. The real close is
-        # deferred to _DeadlineRawIO.close() — the reader
-        # of record going away — and otherwise to the real
-        # socket's own deallocation once the shim is
-        # dropped; this call only records the mark, which
-        # is the whole observable contract (reads through
-        # the response are unaffected by it).
+        # is done (the socket's io refcount). The shim
+        # emulates exactly that contract with its own
+        # refcount (round 26): close() records the mark,
+        # and the real close lands when the last makefile
+        # reader goes away (_reader_closed). When NO
+        # reader exists — a connect-phase failure, a
+        # connection closed before any response — the mark
+        # closes the real socket immediately, so cleanup
+        # on those paths is deterministic and never waits
+        # for object destruction (delta-24 (c)).
         self._close_marked = True
+        if self._io_refs == 0:
+            self._really_close()
 
     def _cap(self):
         """Re-cap the real socket's timeout to the budget
@@ -590,8 +657,16 @@ class _DeadlineSocket:
         # this buffered layer, whose every raw read is a
         # deadline-capped recv_into on the shim — the
         # funnel through which status line, headers and
-        # chunk parsing are all bounded.
+        # chunk parsing are all bounded. The reader is
+        # refcounted on the shim (round 26): its close
+        # drops the refcount, and the real socket closes
+        # once the connection's close() mark has ALSO
+        # landed — the real socket's own lifecycle, so a
+        # temporary reader (the proxy tunnel's response)
+        # closing mid-exchange cannot kill the descriptor
+        # the exchange still needs.
         raw = _DeadlineRawIO(self)
+        self._reader_open()
         if buffering is not None and buffering == 0:
             return raw
         bufsize = io.DEFAULT_BUFFER_SIZE \
@@ -609,20 +684,25 @@ class _DeadlineRawIO(io.RawIOBase):
 
     def __init__(self, dsock):
         self._dsock = dsock
+        self._reader_close_done = False
 
     def readable(self):
         return True
 
     def close(self):
-        # The reader of record is going away: this is
-        # where the real socket is actually closed (see
-        # _DeadlineSocket.close for why the connection's
-        # own close() call cannot do it).
+        # This reader is going away: drop its refcount on
+        # the shim. The real socket closes here ONLY if
+        # the connection's close() mark has already landed
+        # (see _DeadlineSocket.close) — a temporary reader
+        # (the proxy tunnel's response) must not close the
+        # descriptor mid-exchange.
+        if getattr(self, "_reader_close_done", True):
+            return
+        self._reader_close_done = True
         try:
-            self._dsock._sock.close()
-        except Exception:
-            pass
-        super().close()
+            self._dsock._reader_closed()
+        finally:
+            super().close()
 
     def readinto(self, b):
         return self._dsock.recv_into(b)
@@ -631,16 +711,212 @@ class _DeadlineRawIO(io.RawIOBase):
         return self._dsock.recv_into(b)
 
 
-class _DeadlineHTTPConnection(http.client.HTTPConnection):
-    def connect(self):
-        super().connect()
-        self.sock = _DeadlineSocket(self.sock)
+# Captured originals (round 26, Codex delta-24 finding
+# 1): the deadline connection classes below are swapped
+# INTO http.client's globals for an armed urlopen call,
+# and Python 3.12's HTTPSConnection.__init__ resolves
+# its explicit super(HTTPSConnection, self) against the
+# REPLACED global — constructing one under the swap
+# raised TypeError, so every armed HTTPS send failed
+# without sending. The classes here therefore NEVER
+# initialise through the originals' __init__ by name:
+# they call the CAPTURED original class objects
+# directly, so no call-time global lookup can influence
+# their construction, under the swap or not, for armed
+# and unarmed callers alike.
+_ORIG_HTTP_CONNECTION = http.client.HTTPConnection
+_ORIG_HTTPS_CONNECTION = http.client.HTTPSConnection
+
+# The stdlib connections' own default-timeout sentinel,
+# captured the same way (this module's `import socket`
+# sits far below, so the default in the signatures
+# below cannot name it directly at class-creation
+# time).
+_SEND_TIMEOUT_DEFAULT = http.client.socket \
+    ._GLOBAL_DEFAULT_TIMEOUT
+
+# The module's HTTPS-context seam: a deadline HTTPS
+# connection takes its TLS context from this factory —
+# in production the stdlib's own default-context
+# creator, which is also what the global opener's
+# HTTPS handler builds its context with, so the swap
+# changes nothing about TLS trust on the real path.
+# The catalog patches this reference to trust a local
+# test certificate.
+_HTTPS_CONTEXT_FACTORY = http.client._create_https_context
 
 
-class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+def _armed_remaining_or_raise():
+    """Remaining gated-send budget; raises
+    _SendDeadlineExceeded once it is spent."""
+    remaining = _send_deadline_remaining()
+    if remaining is not None and remaining <= 0:
+        raise _SendDeadlineExceeded(
+            "gated send deadline exceeded")
+    return remaining
+
+
+def _deadline_tcp_connect(conn):
+    """Armed TCP establishment, attempt by attempt
+    (round 26): the name is resolved ONCE — a single
+    blocking getaddrinfo call, the one sub-operation
+    that cannot be capped by construction and that the
+    JOURNAL statement names as the bound's only
+    exception — and the addresses are then iterated
+    HERE: before every attempt the remaining budget is
+    recomputed and that attempt's socket timeout is
+    capped at min(20, remaining), so an attempt starting
+    inside the budget ends by the deadline at the
+    latest, and a spent budget refuses the next attempt
+    before it starts."""
+    sys.audit("http.client.connect", conn, conn.host,
+              conn.port)
+    infos = socket.getaddrinfo(conn.host, conn.port, 0,
+                               socket.SOCK_STREAM)
+    last_exc = None
+    for family, socktype, proto, _canon, sockaddr in infos:
+        remaining = _armed_remaining_or_raise()
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.settimeout(min(20.0, remaining))
+            if conn.source_address is not None:
+                sock.bind(conn.source_address)
+            sock.connect(sockaddr)
+        except BaseException as exc:
+            try:
+                sock.close()
+            except Exception:
+                pass
+            if isinstance(exc, TimeoutError) and \
+                    _send_deadline_remaining() is not None \
+                    and _send_deadline_remaining() <= 0:
+                raise _SendDeadlineExceeded(
+                    "gated send deadline exceeded while "
+                    "connecting") from None
+            last_exc = exc
+            continue
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP,
+                            socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        return sock
+    if last_exc is not None:
+        raise last_exc
+    raise OSError(
+        f"getaddrinfo returned no addresses for "
+        f"{conn.host}:{conn.port}")
+
+
+def _deadline_connect(conn, tls):
+    """connect() for the deadline connection classes.
+
+    Unarmed (no deadline in THIS context — e.g. an
+    unarmed send constructed inside another exchange's
+    swap window): the CAPTURED original connect runs
+    verbatim (legacy semantics), and the resulting
+    socket is wrapped in a shim that, with no deadline
+    armed in its caller's context, delegates everything
+    untouched.
+
+    Armed: connection establishment is brought under
+    the deadline attempt by attempt — TCP connects via
+    _deadline_tcp_connect; the proxy CONNECT tunnel,
+    when one is configured, runs over the shim (every
+    operation re-capped); the TLS handshake then runs
+    as ONE operation on the raw socket whose timeout is
+    the remaining budget at its start. After the
+    handshake the round-25 shim governs the HTTP
+    phases. On ANY failure after the raw socket exists,
+    it is closed deterministically here (force close),
+    never left to object destruction (delta-24 (c))."""
+    if _send_deadline_remaining() is None:
+        if tls:
+            _ORIG_HTTPS_CONNECTION.connect(conn)
+        else:
+            _ORIG_HTTP_CONNECTION.connect(conn)
+        if conn.sock is not None:
+            conn.sock = _DeadlineSocket(conn.sock)
+        return
+    _armed_remaining_or_raise()
+    raw = None
+    try:
+        raw = _deadline_tcp_connect(conn)
+        conn.sock = raw
+        if conn._tunnel_host:
+            conn.sock = _DeadlineSocket(raw)
+            _armed_remaining_or_raise()
+            conn._tunnel()
+            # The tunnel's response reader has closed by
+            # now (its close only dropped a makefile
+            # refcount — the descriptor lives); detach the
+            # shim so the TLS handshake below runs on the
+            # raw socket itself.
+            conn.sock = raw
+        if tls:
+            remaining = _armed_remaining_or_raise()
+            raw.settimeout(min(20.0, remaining))
+            server_hostname = conn._tunnel_host or conn.host
+            try:
+                tls_sock = conn._context.wrap_socket(
+                    raw, server_hostname=server_hostname)
+            except BaseException as exc:
+                if _deadline_blown(exc):
+                    raise _SendDeadlineExceeded(
+                        "gated send deadline exceeded "
+                        "during the TLS handshake") from None
+                raise
+            conn.sock = _DeadlineSocket(tls_sock)
+        elif not isinstance(conn.sock, _DeadlineSocket):
+            conn.sock = _DeadlineSocket(raw)
+    except BaseException:
+        sock = conn.sock
+        conn.sock = None
+        if sock is not None:
+            try:
+                force = getattr(sock, "_force_close", None)
+                if callable(force):
+                    force()
+                else:
+                    sock.close()
+            except Exception:
+                pass
+        raise
+
+
+class _DeadlineHTTPConnection(_ORIG_HTTP_CONNECTION):
+    def __init__(self, host, port=None, *,
+                 timeout=_SEND_TIMEOUT_DEFAULT,
+                 source_address=None, blocksize=8192):
+        _ORIG_HTTP_CONNECTION.__init__(
+            self, host, port, timeout=timeout,
+            source_address=source_address,
+            blocksize=blocksize)
+
     def connect(self):
-        super().connect()
-        self.sock = _DeadlineSocket(self.sock)
+        _deadline_connect(self, tls=False)
+
+
+class _DeadlineHTTPSConnection(_ORIG_HTTPS_CONNECTION):
+    def __init__(self, host, port=None, *,
+                 timeout=_SEND_TIMEOUT_DEFAULT,
+                 source_address=None, context=None,
+                 blocksize=8192):
+        _ORIG_HTTP_CONNECTION.__init__(
+            self, host, port, timeout=timeout,
+            source_address=source_address,
+            blocksize=blocksize)
+        # The TLS context comes from the module factory
+        # (see _HTTPS_CONTEXT_FACTORY above), never from
+        # the original __init__ — whose explicit-super
+        # lookup is exactly what broke under the swap.
+        factory = globals().get(
+            "_HTTPS_CONTEXT_FACTORY",
+            http.client._create_https_context)
+        self._context = factory(self._http_vsn)
+
+    def connect(self):
+        _deadline_connect(self, tls=True)
 
 
 # Serializes the http.client class swap in _send_urlopen.
@@ -674,7 +950,14 @@ def _send_urlopen(req):
     concurrent unarmed fetch constructed inside the
     window gets a shim whose context has no deadline
     armed and which therefore delegates everything
-    untouched."""
+    untouched. Round 26 (Codex delta-24): the swapped
+    classes initialise through captured original class
+    objects, so constructing one inside the window —
+    HTTPS included, armed or unarmed — cannot hit the
+    replaced-global super() failure; and an armed
+    exchange's connection establishment is itself
+    budget-capped attempt by attempt (see
+    _deadline_connect)."""
     remaining = _send_deadline_remaining()
     if remaining is None:
         return urllib.request.urlopen(req, timeout=20)
@@ -709,7 +992,7 @@ def _send_socket(stream):
         if callable(getattr(obj, "settimeout", None)):
             return obj
         nxt = None
-        for attr in ("fp", "raw", "_sock"):
+        for attr in ("fp", "raw", "_dsock", "_sock"):
             nxt = getattr(obj, attr, None)
             if nxt is not None:
                 break
@@ -792,6 +1075,23 @@ def _read_body_no_read1(stream):
     return stream.read()
 
 
+def _close_error_response(err):
+    """Deterministic cleanup for an HTTPError response
+    on an ARMED exchange (round 26): the wrappers read
+    the error body and then close the response
+    explicitly, so the underlying socket's close is
+    driven by this call — through the connection's
+    close mark and the reader refcount — and never by
+    object-destruction timing. Unarmed sends keep the
+    historical behaviour exactly (no added close)."""
+    if _SEND_DEADLINE_AT.get() is None:
+        return
+    try:
+        err.close()
+    except Exception:
+        pass
+
+
 def send_resend(to, subject, text, html=None):
     """Returns an _SendOutcome (ok, detail, .status). Never
     raises. When html is given the mail goes out multipart: the
@@ -852,6 +1152,7 @@ def send_resend(to, subject, text, html=None):
             # Every other body-read failure keeps the
             # long-standing empty-detail behaviour.
             if _deadline_blown(ex):
+                _close_error_response(e)
                 return _SendOutcome(
                     False,
                     "gated send deadline exceeded while "
@@ -859,6 +1160,7 @@ def send_resend(to, subject, text, html=None):
                     "unknown")
             detail = ""
         status = "failed" if 400 <= e.code < 500 else "unknown"
+        _close_error_response(e)
         return _SendOutcome(False, f"HTTP {e.code}: {detail}", status)
     except Exception as e:
         return _SendOutcome(False, f"{type(e).__name__}: {e}",
@@ -920,12 +1222,14 @@ def send_telegram(text):
             # error-body read classifies "unknown", never
             # the definite failure the status suggests.
             if _deadline_blown(ex):
+                _close_error_response(e)
                 return _SendOutcome(
                     False,
                     "gated send deadline exceeded while "
                     "reading the provider error response",
                     "unknown")
             detail = f"HTTP {e.code}"
+        _close_error_response(e)
         if e.code >= 500:
             return _SendOutcome(False, detail, "unknown")
         if ok_flag is False or 400 <= e.code < 500:
@@ -4145,7 +4449,14 @@ def _gated_send(order_id, send_fn, *args, **kwargs):
     (_DeadlineSocket, beside _MAIL_IDEM), so the cut
     lands in EVERY phase — headers and chunk framing
     included — and a cut inside an HTTPError body read
-    also classifies "unknown", never definite. Returns
+    also classifies "unknown", never definite. Round
+    26 (Codex delta-24): connection ESTABLISHMENT is
+    inside the same bound — the deadline classes
+    construct safely under the swap (HTTPS included)
+    and armed connect is capped attempt by attempt
+    (address connects, proxy tunnel, TLS handshake);
+    the single getaddrinfo call is the statement's one
+    named exception. Returns
     None when the gate aborts; otherwise the send
     function's own result."""
     with _db_lock:

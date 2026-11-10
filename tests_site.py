@@ -4782,6 +4782,289 @@ for _attr25, _saved25 in (
 _SRV25.shutdown()
 _SRV25.server_close()
 
+# ============================================================
+# Round 26 (Codex delta-24): HTTPS CONSTRUCTION + CONNECT
+# PHASE — delta-24 refuted round 25 on two points the
+# HTTP-only specimens could not see: (1) PRODUCTION-
+# BREAKING: under the http.client class swap, Python
+# 3.12's HTTPSConnection.__init__ resolves its explicit
+# super() against the REPLACED global, so constructing
+# an HTTPS connection raised TypeError — every armed
+# send to the real (HTTPS) providers would have
+# returned unknown WITHOUT SENDING, and an unarmed send
+# concurrent with the swap could hit the same failure;
+# (2) the connect phase (DNS, per-address connects,
+# proxy CONNECT, TLS handshake) ran BEFORE the shim
+# wrapped the socket and was not aggregate-bounded, so
+# the stated 30 s bound (which includes connect) did
+# not hold. These pins cover the PRODUCTION SCHEME: a
+# local TLS server (self-signed; the genuine wrapper is
+# made to trust it through the server module's HTTPS
+# context factory seam), a TLS-handshake stall, and an
+# unarmed HTTPS send executed while an armed exchange's
+# swap window is open.
+
+import http.client as _hc26
+import socket as _sock26
+import ssl as _ssl26
+import subprocess as _sp26
+import tempfile as _tf26
+
+_certdir26 = _tf26.mkdtemp(prefix="vf-tls26-")
+_cert26 = os.path.join(_certdir26, "cert.pem")
+_key26 = os.path.join(_certdir26, "key.pem")
+_sp26.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+           "-keyout", _key26, "-out", _cert26, "-days", "2",
+           "-nodes", "-subj", "/CN=127.0.0.1",
+           "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
+          check=True, capture_output=True, timeout=60)
+_srvctx26 = _ssl26.SSLContext(_ssl26.PROTOCOL_TLS_SERVER)
+_srvctx26.load_cert_chain(_cert26, _key26)
+
+_HITS26 = {}
+_ARRIVED26 = {p: threading.Event() for p in ("/tls-ok", "/tls-hdr")}
+
+
+class _TlsHandler26(_hs25.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        mode = self.path
+        _HITS26[mode] = _HITS26.get(mode, 0) + 1
+        ev = _ARRIVED26.get(mode)
+        if ev is not None:
+            ev.set()
+        try:
+            if mode == "/tls-ok":
+                body = b'{"id": "mail-n72-ok"}'
+                self.connection.sendall(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: %d\r\n\r\n" % len(body)
+                    + body)
+            elif mode == "/tls-hdr":
+                # Status line prompt; the header block one
+                # byte at a time (~6.5 s) over TLS — only an
+                # aggregate bound on the real production
+                # scheme can cut this.
+                self.connection.sendall(b"HTTP/1.1 200 OK\r\n")
+                drip = (b"Content-Type: application/json\r\n"
+                        b"X-Dribble: n72-headers-pad\r\n")
+                for i in range(len(drip)):
+                    self.connection.sendall(drip[i:i + 1])
+                    time.sleep(0.12)
+                body = b'{"id": "mail-n72-late"}'
+                self.connection.sendall(
+                    b"Content-Length: %d\r\n\r\n" % len(body)
+                    + body)
+        except Exception:
+            pass
+
+
+_SRV26 = _hs25.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _TlsHandler26)
+_SRV26.socket = _srvctx26.wrap_socket(_SRV26.socket,
+                                      server_side=True)
+_PORT26 = _SRV26.server_address[1]
+_th26srv = threading.Thread(
+    target=_SRV26.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th26srv.start()
+_BASE26 = f"https://127.0.0.1:{_PORT26}"
+
+
+class _Stall26:
+    """A raw TCP listener that accepts one connection,
+    reads the TLS ClientHello and then stalls the
+    handshake for ~6 s: the exchange can only die on
+    time if the HANDSHAKE ITSELF is budget-capped."""
+
+    def __init__(self):
+        self.ls = _sock26.socket()
+        self.ls.setsockopt(_sock26.SOL_SOCKET,
+                           _sock26.SO_REUSEADDR, 1)
+        self.ls.bind(("127.0.0.1", 0))
+        self.ls.listen(1)
+        self.port = self.ls.getsockname()[1]
+        self.accepted = threading.Event()
+
+    def run(self):
+        try:
+            conn, _ = self.ls.accept()
+        except OSError:
+            return
+        self.accepted.set()
+        try:
+            conn.settimeout(5)
+            try:
+                conn.recv(4096)
+            except OSError:
+                pass
+            time.sleep(6)
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    def close(self):
+        try:
+            self.ls.close()
+        except OSError:
+            pass
+
+
+_STALL26 = _Stall26()
+_th26stall = threading.Thread(target=_STALL26.run, daemon=True)
+_th26stall.start()
+
+_orig_http26 = _hc26.HTTPConnection
+_orig_https26 = _hc26.HTTPSConnection
+_saved_open26 = _ureq18.urlopen
+_saved_url26 = SR._RESEND_API_URL
+_saved_factory26 = getattr(SR, "_HTTPS_CONTEXT_FACTORY", None)
+_saved_dl26 = SR._GATED_SEND_DEADLINE
+_ureq18.urlopen = _real_urlopen18
+SR._HTTPS_CONTEXT_FACTORY = (
+    lambda version: _ssl26._create_unverified_context())
+SR._GATED_SEND_DEADLINE = 2.0
+
+# N72 (2): plain armed HTTPS SUCCESS — the genuine
+#      wrapper constructs an HTTPS connection (no
+#      TypeError), completes a normal TLS exchange and
+#      classifies the provider id as delivered. Proves
+#      HTTPS sends WORK, not only that they die on time.
+SR._RESEND_API_URL = _BASE26 + "/tls-ok"
+_hits72ok = _HITS26.get("/tls-ok", 0)
+o72ok = mk_order("n72ok@test.dev", "Deep Scan", 29, status="PAID")
+_t072ok = time.time()
+res72ok = SR._gated_send(o72ok, SR.send_resend, "n72ok@test.dev",
+                         "Payment received — Deep Scan", "body")
+_el72ok = time.time() - _t072ok
+check("N72 (2): armed HTTPS success over a real TLS "
+      "socket — construction works, the exchange "
+      "completes and the provider id classifies delivered",
+      res72ok is not None
+      and SR._send_status(res72ok) == "delivered"
+      and res72ok[1] == "mail-n72-ok"
+      and _HITS26.get("/tls-ok", 0) == _hits72ok + 1
+      and _el72ok < 1.5)
+
+# N72 (1): HTTPS HEADER dribble — the TLS exchange is
+#      under way and the server dribbles response
+#      headers byte-by-byte: the gated send is cut at
+#      the patched deadline and classifies unknown.
+SR._RESEND_API_URL = _BASE26 + "/tls-hdr"
+_hits72 = _HITS26.get("/tls-hdr", 0)
+o72 = mk_order("n72@test.dev", "Deep Scan", 29, status="PAID")
+_t072 = time.time()
+res72 = SR._gated_send(o72, SR.send_resend, "n72@test.dev",
+                       "Payment received — Deep Scan", "body")
+_el72 = time.time() - _t072
+check("N72 (1): HTTPS header dribble over a real TLS "
+      "socket — construction works and the gated send "
+      "is cut at the deadline, classified unknown",
+      res72 is not None
+      and SR._send_status(res72) == "unknown"
+      and _HITS26.get("/tls-hdr", 0) == _hits72 + 1
+      and 1.7 <= _el72 < 3.5)
+
+# N73 (1): CONNECT-PHASE specimen — the TCP connection
+#      succeeds but the TLS HANDSHAKE never completes
+#      (the peer stalls after the ClientHello): the
+#      exchange dies inside the deadline envelope
+#      instead of after a per-attempt timeout stack.
+SR._RESEND_API_URL = f"https://127.0.0.1:{_STALL26.port}/stall"
+o73 = mk_order("n73@test.dev", "Deep Scan", 29, status="PAID")
+_t073 = time.time()
+res73 = SR._gated_send(o73, SR.send_resend, "n73@test.dev",
+                       "Payment received — Deep Scan", "body")
+_el73 = time.time() - _t073
+check("N73 (1): TLS handshake stall — the gated HTTPS "
+      "send dies at the deadline inside connection "
+      "establishment, classified unknown",
+      res73 is not None
+      and SR._send_status(res73) == "unknown"
+      and _STALL26.accepted.is_set()
+      and 1.7 <= _el73 < 3.5)
+
+# N74 (1): UNARMED send inside an armed swap window —
+#      an armed HTTPS exchange is parked in its header
+#      dribble (the http.client classes are swapped for
+#      the duration of its urlopen call) while a second,
+#      UNARMED send runs: it must construct and complete
+#      with legacy behaviour (delivered), never the
+#      swap's construction failure. After the armed
+#      exchange ends, the http.client globals are the
+#      original classes again.
+SR._GATED_SEND_DEADLINE = 5.0
+SR._RESEND_API_URL = _BASE26 + "/tls-hdr"
+_ARRIVED26["/tls-hdr"].clear()
+_hits74hdr = _HITS26.get("/tls-hdr", 0)
+_hits74ok = _HITS26.get("/tls-ok", 0)
+o74 = mk_order("n74@test.dev", "Deep Scan", 29, status="PAID")
+_box74 = {}
+
+
+def _armed74():
+    _box74["r"] = SR._gated_send(
+        o74, SR.send_resend, "n74a@test.dev",
+        "Payment received — Deep Scan", "body")
+
+
+th74 = threading.Thread(target=_armed74)
+th74.start()
+_ARRIVED26["/tls-hdr"].wait(10)
+SR._RESEND_API_URL = _BASE26 + "/tls-ok"
+_t074u = time.time()
+res74u = SR.send_resend("n74u@test.dev",
+                        "Payment received — Deep Scan", "body")
+_el74u = time.time() - _t074u
+th74.join(20)
+check("N74 (1): unarmed HTTPS send during an armed "
+      "swap window constructs and completes with legacy "
+      "behaviour (delivered); the armed exchange is cut "
+      "at its deadline and the http.client globals are "
+      "restored afterwards",
+      SR._send_status(res74u) == "delivered"
+      and res74u[1] == "mail-n72-ok"
+      and _el74u < 3
+      and _box74.get("r") is not None
+      and SR._send_status(_box74["r"]) == "unknown"
+      and _HITS26.get("/tls-ok", 0) == _hits74ok + 1
+      and _HITS26.get("/tls-hdr", 0) == _hits74hdr + 1
+      and _hc26.HTTPConnection is _orig_http26
+      and _hc26.HTTPSConnection is _orig_https26)
+
+_ureq18.urlopen = _saved_open26
+SR._RESEND_API_URL = _saved_url26
+SR._GATED_SEND_DEADLINE = _saved_dl26
+if _saved_factory26 is None:
+    try:
+        delattr(SR, "_HTTPS_CONTEXT_FACTORY")
+    except AttributeError:
+        pass
+else:
+    SR._HTTPS_CONTEXT_FACTORY = _saved_factory26
+_SRV26.shutdown()
+_SRV26.server_close()
+_STALL26.close()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
