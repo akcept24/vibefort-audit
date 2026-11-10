@@ -1760,6 +1760,7 @@ class Handler(BaseHTTPRequestHandler):
         order = None
         ambiguous = False
         lost_claim = False
+        lost_claim_order = None
         if tier and email:
             conn = db_connect()
             conn.row_factory = sqlite3.Row
@@ -1853,8 +1854,12 @@ class Handler(BaseHTTPRequestHandler):
                     # is unmatched. Do NOT unlink yet — the link
                     # is the sweep's evidence until the alert
                     # below is on record (delta-10 #2); the tail
-                    # unlinks after a successful alert.
+                    # unlinks after a successful alert,
+                    # conditionally on the judged link (the
+                    # event may have been relinked to a winner
+                    # in the meantime — delta-14 #2).
                     lost_claim = True
+                    lost_claim_order = order["id"]
                     order = None
                 else:
                     ensure_paid_side_effects(order)
@@ -1893,12 +1898,15 @@ class Handler(BaseHTTPRequestHandler):
             f"ambiguous={ambiguous}")
         if lost_claim:
             # The alert is on record; only now may the provisional
-            # link come off (delta-10 #2).
+            # link come off (delta-10 #2) — and only if it is
+            # still the link this delivery judged, under its own
+            # claim (delta-14 #2).
             with _db_lock:
                 conn = db_connect()
                 conn.execute(
                     "UPDATE stripe_events SET order_id=NULL "
-                    "WHERE event_id=?", (eid,))
+                    "WHERE event_id=? AND order_id=? AND claim=?",
+                    (eid, lost_claim_order, claim))
                 conn.commit()
                 conn.close()
         self._send_json(200, {"ok": True, "matched": False})
@@ -2975,7 +2983,21 @@ def _run_monitor(mon):
             "elsewhere; skipped")
         return
     try:
-        _run_monitor_locked(mon)
+        # The caller's row is a snapshot taken BEFORE the mutex:
+        # another run may have completed since (retained alert
+        # saved, digest advanced). Re-read under the mutex and
+        # work only on the fresh row (Codex delta-14 #1).
+        conn = db_connect()
+        conn.row_factory = sqlite3.Row
+        try:
+            fresh = conn.execute(
+                "SELECT * FROM monitors WHERE id=?",
+                (mon["id"],)).fetchone()
+        finally:
+            conn.close()
+        if fresh is None or not fresh["active"]:
+            return
+        _run_monitor_locked(dict(fresh))
     finally:
         _release_event_lock(key, token)
 

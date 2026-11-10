@@ -1265,6 +1265,93 @@ S._scan_with_timeout = real_scan30
 check("W30 released monitor run proceeds",
       calls30["n"] == 1 and row30()["last_digest"] is not None)
 
+# ---- Delta-14 catalog (added 2026-11-09, round 14) ----
+# W31: the fresh loser's deferred unlink is conditional on the
+#      judged link and its claim. If the event is relinked to a
+#      winning order while the alert fires (simulated inside the
+#      alert hook), the tail must not clear the winning link.
+o31 = mk_order("w31@test.dev", "Deep Scan", 29)
+o31b = mk_order("w31b@test.dev", "Deep Scan", 29)
+race31 = {"fired": False}
+
+
+def racing_t31(row, new_status, **kw):
+    if not race31["fired"] and row["id"] == o31:
+        race31["fired"] = True
+        real_t(row, new_status, paid_event_id="evt_w31_win",
+               paid_pi="pi_w31_win")
+    return real_t(row, new_status, **kw)
+
+
+real_fire31 = S._fire_unmatched_alert
+
+
+def racing_fire31(event_id, tg_text, log_detail):
+    if event_id == "evt_w31":
+        c = db()
+        r31b = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                              (o31b,)).fetchone())
+        c.close()
+        real_t(r31b, "PAID", paid_event_id="evt_w31_b",
+               paid_pi="pi_w31_lose")
+        cc = S.db_connect()
+        cc.execute("UPDATE stripe_events SET order_id=? WHERE "
+                   "event_id='evt_w31'", (o31b,))
+        cc.commit()
+        cc.close()
+    return real_fire31(event_id, tg_text, log_detail)
+
+
+S.transition_order_status = racing_t31
+S._fire_unmatched_alert = racing_fire31
+r = stripe_call(evt("evt_w31"), sess(2900, "w31@test.dev",
+                                     pi="pi_w31_lose"))
+S.transition_order_status = real_t
+S._fire_unmatched_alert = real_fire31
+c = db()
+link31 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w31'").fetchone()[0]
+c.close()
+check("W31 fresh loser unlink spares a relinked winner",
+      r[1].get("matched") is False and link31 == o31b)
+
+# W32: a monitor run re-reads its row under the mutex — a stale
+#      caller snapshot (no pending alert) must not run: the DB
+#      row's retained alert is what gets processed.
+o32 = mk_order("w32@test.dev", "Monitoring", 79, status="PAID")
+retained32 = {"new": ["HIGH|W32 finding"], "gone": [],
+              "grade": "D", "score": 40,
+              "digest_after": ["HIGH|W32 finding"],
+              "attempts": 1, "since": S.utcnow()}
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o32, "example.com", "w32@test.dev", "W32", S.utcnow(),
+           time.time(), json.dumps(["LOW|base"]),
+           json.dumps(retained32)))
+c.commit()
+c.close()
+c = db()
+stale32 = dict(c.execute("SELECT * FROM monitors WHERE order_id=?",
+                         (o32,)).fetchone())
+c.close()
+stale32["pending_alert"] = None  # the caller's old snapshot
+prev_resend32 = S.send_resend
+S.send_resend = lambda to, subject, text, html=None: (False, "down")
+S._run_monitor(stale32)
+S.send_resend = prev_resend32
+c = db()
+m32 = dict(c.execute("SELECT * FROM monitors WHERE order_id=?",
+                     (o32,)).fetchone())
+c.close()
+p32 = json.loads(m32["pending_alert"]) if m32["pending_alert"] \
+    else None
+check("W32 run works on the fresh row, not the snapshot",
+      bool(p32) and p32["attempts"] == 2
+      and json.loads(m32["last_digest"]) == ["LOW|base"])
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
