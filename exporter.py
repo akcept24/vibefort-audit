@@ -123,10 +123,17 @@ def _read_clock(fn):
     boundary — only a non-bool int/float that is finite is
     a reading; anything else (str, None, arbitrary objects,
     NaN, infinities) is no reading at all. An accepted
-    reading is converted with float() INSIDE the guard and
-    only that exact plain float is returned (a conversion
-    failure — e.g. a hostile subclass whose __float__
-    raises — is no reading). All arithmetic downstream
+    reading is converted with float() INSIDE the guard,
+    and the CONVERTED value is itself validated — exact
+    float type and finite — before only that plain float
+    is returned: float() dispatches to the reading's own
+    __float__, which may return something entirely
+    different from the original just validated (e.g. inf
+    from a float subclass whose stored double is
+    finite), so validating the original alone would let
+    such a value through unchecked. A conversion failure
+    — e.g. a hostile subclass whose __float__ raises —
+    is likewise no reading. All arithmetic downstream
     (baselines, high-waters, deltas, comparisons) therefore
     only ever operates on exact floats stored from this
     function's outputs: plain-float arithmetic cannot raise
@@ -147,9 +154,28 @@ def _read_clock(fn):
     if not finite:
         return None
     try:
-        return float(value)
+        converted = float(value)
     except Exception:
         return None
+    # Validate the CONVERTED value, not only the original:
+    # float() dispatches to the reading's own __float__,
+    # which may return something entirely different from
+    # the value validated above — e.g. a float subclass
+    # whose stored double is finite (so the original
+    # passed math.isfinite, which reads that double) but
+    # whose __float__ returns inf. Only a converted value
+    # that is itself an exact float AND finite is a
+    # reading; both checks below are pure operations on
+    # an exact float, which no subclass behaviour can
+    # reach.
+    if type(converted) is not float:
+        return None
+    try:
+        if not math.isfinite(converted):
+            return None
+    except Exception:
+        return None
+    return converted
 
 
 def _recovery_wait(stop_event=None):

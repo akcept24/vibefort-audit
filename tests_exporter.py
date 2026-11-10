@@ -1400,6 +1400,98 @@ def main():
           and elapsed_y >= 3.0
           and not th_y.is_alive())
 
+    # ---- (z) CONVERTED-VALUE VALIDATION: the boundary must
+    #           validate the CONVERTED value, not only the
+    #           original object. float() dispatches to the
+    #           reading's own __float__, which may return
+    #           something entirely different from what was
+    #           validated: this float subclass's underlying
+    #           value is finite — so the ORIGINAL passes
+    #           math.isfinite, which reads the stored
+    #           double — but its __float__ returns inf, so
+    #           float(value) is inf. (On the round-7 tree
+    #           _read_clock returned that inf unchecked:
+    #           the unit arm below got inf instead of None,
+    #           and in the wait a plain baseline followed by
+    #           an inf reading made the clock "reach" the
+    #           deadline instantly and govern the recovery
+    #           wait — although BRIDGE.md states infinity
+    #           is no reading.) The converted result must
+    #           itself be an exact float and finite;
+    #           anything else is no reading. Integration
+    #           arm, driven at the wait like (x): the
+    #           monotonic clock's first reading is a plain
+    #           baseline, every later reading is the
+    #           hostile subclass; the wall clock is FROZEN
+    #           (zero progress), so the ONLY way the wait
+    #           can end inside the window is the inf
+    #           governing it. Post-fix the hostile readings
+    #           are no readings at all: monotonic drops
+    #           out, the frozen wall clock never reaches,
+    #           and the wait is still waiting when the
+    #           window closes — cleanup unfreezes the wall
+    #           clock (stateful, like (x)) so the thread
+    #           can exit.
+    class InfFloatZ(float):
+        def __float__(self):
+            return float("inf")
+
+    unit_z = exporter._read_clock(lambda: InfFloatZ(1.5)) is None
+
+    real_monotonic_z = time.monotonic
+    real_time_z = time.time
+    mono_calls_z = {"n": 0}
+    frozen_z = {"on": True}
+    wall0_z = real_time_z()
+
+    def two_faced_monotonic_z():
+        mono_calls_z["n"] += 1
+        if mono_calls_z["n"] == 1:
+            return real_monotonic_z()
+        return InfFloatZ(real_monotonic_z())
+
+    def frozen_time_z():
+        if frozen_z["on"]:
+            return wall0_z
+        return real_time_z() + 500000.0
+
+    wait_end_z = {}
+
+    def wait_thread_z():
+        t0 = real_time_z()
+        exporter._recovery_wait(None)
+        wait_end_z["elapsed"] = real_time_z() - t0
+
+    time.monotonic = two_faced_monotonic_z
+    time.time = frozen_time_z
+    th_z = threading.Thread(target=wait_thread_z, daemon=True)
+    try:
+        th_z.start()
+        th_z.join(timeout=2.5)
+        not_governed_z = ("elapsed" not in wait_end_z
+                          and th_z.is_alive())
+        frozen_z["on"] = False
+        th_z.join(timeout=5)
+        returned_z = "elapsed" in wait_end_z
+    finally:
+        frozen_z["on"] = False
+        th_z.join(timeout=5)
+        time.monotonic = real_monotonic_z
+        time.time = real_time_z
+    check("(z) a float-subclass clock reading whose "
+          "__float__ returns inf is no reading: the "
+          "CONVERTED value is validated (exact float, "
+          "finite), so _read_clock returns None for it "
+          "and it cannot govern the recovery wait (with "
+          "a plain baseline and a frozen second clock, "
+          "the wait is still waiting when the window "
+          "closes and returns only once the second clock "
+          "is unfrozen and reaches)",
+          unit_z
+          and not_governed_z
+          and returned_z
+          and not th_z.is_alive())
+
     failed = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(failed)}/{len(PASS)} exporter checks pass")
     if failed:
