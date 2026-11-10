@@ -675,6 +675,131 @@ check("W15 stale claim stolen, event completes once",
       and count("events", "event='STRIPE_UNMATCHED' AND "
                 "detail LIKE '%evt_w15%'", ()) == 1)
 
+# ---- Delta-8 catalog (added 2026-11-09, round 8) ----
+# W16: the unmatched alert is single-fire across processes. A
+#      foreign event-lock makes the delivery step aside (500, no
+#      alert); once released, exactly one alert fires; a third
+#      delivery is a quiet duplicate.
+tg16 = {"n": 0}
+real_tg = S.send_telegram
+S.send_telegram = lambda text: (tg16.__setitem__("n", tg16["n"] + 1),
+                                (True, "ok"))[1]
+c = S.db_connect()
+c.execute("INSERT INTO event_locks(event_id,purpose,claimed_at) "
+          "VALUES('evt_w16','unmatched-alert',?)", (time.time(),))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w16"), sess(200, "w16@test.dev",
+                                     pi="pi_w16"))
+check("W16 foreign alert lock: step aside silently",
+      r[0] == 500 and tg16["n"] == 0)
+c = S.db_connect()
+c.execute("DELETE FROM event_locks WHERE event_id='evt_w16'")
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w16"), sess(200, "w16@test.dev",
+                                     pi="pi_w16"))
+r3 = stripe_call(evt("evt_w16"), sess(200, "w16@test.dev",
+                                      pi="pi_w16"))
+S.send_telegram = real_tg
+check("W16 alert fires exactly once",
+      r[1].get("matched") is False and r3[1].get("duplicate") is True
+      and tg16["n"] == 1)
+
+# W17: the payment-intent duplicate shortcut requires the order's
+#      recorded winner to BE this payment. A provisional link to
+#      an order won by another payment does not dup-ack — the new
+#      event settles as unmatched.
+o17 = mk_order("w17@test.dev", "Deep Scan", 29)
+c = db()
+row_17 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o17,)).fetchone())
+c.close()
+S.transition_order_status(row_17, "PAID",
+                          paid_event_id="evt_w17_win",
+                          paid_pi="pi_w17_b")
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w17_a1','checkout.session.completed',?,?,?,2900)",
+          (o17, S.utcnow(), "pi_w17_a"))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w17_a2",
+                    "checkout.session.async_payment_succeeded"),
+                sess(2900, "w17@test.dev", pi="pi_w17_a"))
+check("W17 dup shortcut requires a proven win",
+      r[1].get("matched") is False
+      and count("events", "event='STRIPE_DUP_EVENT' AND "
+                "detail LIKE '%evt_w17_a2%'", ()) == 0
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w17_a2%'", ()) == 1)
+
+# W18: the consult checks its transition result. Losing the race
+#      to a different payment re-judges on the real winner and
+#      settles the provisional event as unmatched.
+o18 = mk_order("w18@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w18_lose','checkout.session.completed',?,?,?,2900)",
+          (o18, S.utcnow(), "pi_w18_lose"))
+c.commit()
+c.close()
+race18 = {"fired": False}
+
+
+def racing_t18(row, new_status, **kw):
+    if not race18["fired"] and row["id"] == o18:
+        race18["fired"] = True
+        real_t(row, new_status, paid_event_id="evt_w18_win",
+               paid_pi="pi_w18_win")
+    return real_t(row, new_status, **kw)
+
+
+S.transition_order_status = racing_t18
+r = stripe_call(evt("evt_w18_lose"),
+                sess(2900, "w18@test.dev", pi="pi_w18_lose"))
+S.transition_order_status = real_t
+c = db()
+link18 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w18_lose'").fetchone()[0]
+c.close()
+check("W18 consult re-judges a lost transition",
+      r[1].get("matched") is False and link18 is None
+      and order_status(o18) == "PAID"
+      and count("fulfilment_requests", "order_id=?", (o18,)) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o18,)) == 0
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w18_lose%'", ()) == 1)
+
+# W19: NULL authority — an order with NO recorded winning payment
+#      (admin-paid) never validates a linked payment as matched;
+#      the payment surfaces as unmatched for a manual decision.
+o19 = mk_order("w19@test.dev", "Deep Scan", 29)
+c = db()
+row_19 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o19,)).fetchone())
+c.close()
+S.transition_order_status(row_19, "PAID")
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w19','checkout.session.completed',?,?,?,2900)",
+          (o19, S.utcnow(), "pi_w19"))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w19"), sess(2900, "w19@test.dev",
+                                     pi="pi_w19"))
+check("W19 unrecorded winner never validates a match",
+      r[1].get("matched") is False
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o19,)) == 0
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w19%'", ()) == 1)
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
