@@ -62,6 +62,16 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 # identifies its tier by amount alone.
 AMOUNT_TO_TIER = {price * 100: tier for tier, price in TIER_PRICES.items()
                   if price > 0}
+# The live payment-link ids (read from the dashboard 2026-11-09).
+# When a checkout session carries a payment_link, it must be one of
+# these and its amount must equal that tier's price.
+PLINK_TO_TIER = {
+    "plink_1Ua3hOL0Rfi91QqAUpx9XrMR": "Deep Scan",
+    "plink_1Ua3iSL0Rfi91QqAuV4K6rV0": "Quick Audit",
+    "plink_1Ua3jmL0Rfi91QqAGDN8Obgp": "Full Audit",
+    "plink_1Ua3kgL0Rfi91QqADQWiQvPB": "Deep Audit",
+    "plink_1Ua3lqL0Rfi91QqAZhEsUcOQ": "Monitoring",
+}
 
 
 def log(msg):
@@ -169,6 +179,8 @@ def db_connect():
     if "payment_intent" not in scols:
         conn.execute(
             "ALTER TABLE stripe_events ADD COLUMN payment_intent TEXT")
+    if "amount" not in scols:
+        conn.execute("ALTER TABLE stripe_events ADD COLUMN amount INTEGER")
     return conn
 
 
@@ -1452,9 +1464,10 @@ class Handler(BaseHTTPRequestHandler):
                 if existing is None:
                     conn.execute(
                         "INSERT INTO stripe_events(event_id, type,"
-                        " order_id, received_at, payment_intent)"
-                        " VALUES(?,?,NULL,?,?)",
-                        (eid, etype, utcnow(), pi))
+                        " order_id, received_at, payment_intent, amount)"
+                        " VALUES(?,?,NULL,?,?,?)",
+                        (eid, etype, utcnow(), pi,
+                         session.get("amount_total")))
                     conn.commit()
                     state = "fresh"
                 elif existing[0] is not None:
@@ -1478,6 +1491,23 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
         if state == "done":
+            # Recovery consult: a linked order whose PAID side
+            # effects or receipt never completed (crash in the
+            # window after the status commit) is finished here,
+            # on Stripe's retry, before the duplicate ack.
+            linked_id = existing[0] if existing else None
+            if linked_id:
+                conn = db_connect()
+                conn.row_factory = sqlite3.Row
+                try:
+                    orow = conn.execute(
+                        "SELECT * FROM orders WHERE id=?",
+                        (linked_id,)).fetchone()
+                finally:
+                    conn.close()
+                if orow is not None:
+                    ensure_paid_side_effects(dict(orow))
+                    _ensure_paid_receipt(dict(orow), amount)
             self._send_json(200, {"ok": True, "duplicate": True})
             return
         # One payment can arrive as two events (completed +
@@ -1504,7 +1534,15 @@ class Handler(BaseHTTPRequestHandler):
                           f"event={eid} pi={pi} already matched")
                 self._send_json(200, {"ok": True, "duplicate": True})
                 return
-        tier = AMOUNT_TO_TIER.get(amount) if currency == "usd" else None
+        plink = session.get("payment_link")
+        tier = None
+        if currency == "usd":
+            if plink:
+                ptier = PLINK_TO_TIER.get(plink)
+                if ptier and TIER_PRICES[ptier] * 100 == amount:
+                    tier = ptier
+            else:
+                tier = AMOUNT_TO_TIER.get(amount)
         order = None
         ambiguous = False
         if tier and email:
@@ -1522,7 +1560,10 @@ class Handler(BaseHTTPRequestHandler):
             elif len(rows) > 1:
                 ambiguous = True
         if order is not None:
-            won = transition_order_status(order, "PAID")
+            # Link the event to the order BEFORE the transition: if
+            # the process dies inside the transition's side effects,
+            # the retry's recovery consult finds this link and
+            # finishes the job instead of reporting a duplicate.
             with _db_lock:
                 conn = db_connect()
                 try:
@@ -1532,79 +1573,40 @@ class Handler(BaseHTTPRequestHandler):
                     conn.commit()
                 finally:
                     conn.close()
+            won = transition_order_status(order, "PAID")
+            if not won:
+                # An admin moved the order past PAID by hand without
+                # the PAID side effects; the money is real, so make
+                # the order whole anyway.
+                ensure_paid_side_effects(order)
             log_event(order["id"], "STRIPE_PAID",
                       f"event={eid} amount={amount} tier={tier} "
-                      f"race={'won' if won else 'lost'}")
-            # The payer hears from us immediately — a payment with no
-            # acknowledgement reads as money into a void.
-            amt_label = f"${amount / 100:,.2f}"
-            rcpt_text = (
-                f"Hi {order['name']},\n\n"
-                f"We've received your payment of {amt_label} for a "
-                f"{tier} of {order['url']}.\n\n"
-                "Your audit is now in the queue, and the delivery "
-                "times in the pricing section of our site run from "
-                "today. We confirm the scope of your app within one "
-                "business day; if the work cannot run as briefed, we "
-                "will write to you before starting and refund your "
-                "payment in full.\n\n"
-                "Questions — just reply to this email.\n\n"
-                "— ShipAudit Lab\n"
-                "Security for what you shipped.")
-            rcpt_html = email_template.render_email(
-                eyebrow="Payment received",
-                headline="Payment received.",
-                body_html=(
-                    email_template.para(f"Hi {order['name']},")
-                    + email_template.para(
-                        f"We've received your payment of {amt_label} "
-                        f"for a {tier} of {order['url']}.")
-                    + email_template.details_table([
-                        ("Reference", f"Order #{order['id']}"),
-                        ("Service", tier),
-                        ("Amount paid", amt_label),
-                        ("Target", order["url"]),
-                        ("Status", "Paid — in the queue"),
-                    ])
-                    + email_template.para(
-                        "Your audit is now in the queue, and the "
-                        "delivery times in the pricing section of our "
-                        "site run from today. We confirm the scope of "
-                        "your app within one business day; if the work "
-                        "cannot run as briefed, we will write to you "
-                        "before starting and refund your payment in "
-                        "full.")
-                    + email_template.para(
-                        "Questions — just reply to this email.")),
-                reason="You received this email because a payment "
-                       "was completed for your ShipAudit Lab order.")
-            eok, edet = send_resend(
-                order["email"], f"Payment received — {tier}",
-                rcpt_text, html=rcpt_html)
-            log_event(order["id"],
-                      "PAID_EMAIL_SENT" if eok else "PAID_EMAIL_FAILED",
-                      edet)
+                      f"race={'won' if won else 'lost-recovered'}")
+            # The payer hears from us immediately — a payment with
+            # no acknowledgement reads as money into a void.
+            _send_paid_receipt(order, amount)
             send_telegram(
                 f"ShipAudit Lab: Stripe payment matched — order "
-                f"#{order['id']} ({tier}, {amt_label}) marked PAID "
-                f"automatically.")
+                f"#{order['id']} ({tier}, ${amount / 100:,.2f}) "
+                f"marked PAID automatically.")
             self._send_json(200, {"ok": True, "order_id": order["id"]})
             return
-        log_event(None, "STRIPE_UNMATCHED",
-                  f"event={eid} tier={tier} email={email} "
-                  f"amount={amount} currency={currency} "
-                  f"ambiguous={ambiguous}")
+        # Alert BEFORE the durable log: if the process dies between
+        # the two, the retry must re-alert, not find a terminal log
+        # and ack in silence (Codex delta-3). A failed alert raises —
+        # the caller's rollback clears the dedupe row (order_id is
+        # NULL here) and Stripe retries the whole event.
         tok, _ = send_telegram(
             f"ShipAudit Lab: Stripe payment NOT matched — tier={tier} "
             f"email={email} amount={amount} currency={currency} "
             f"ambiguous={ambiguous} event={eid}. Match it manually "
             f"in the admin register.")
         if not tok:
-            # The durable log exists, but HQ has not actually been
-            # alerted: fail the delivery so Stripe retries and the
-            # alert is attempted again (the dedupe rollback in the
-            # caller clears the event row for the retry).
             raise RuntimeError("unmatched alert telegram failed")
+        log_event(None, "STRIPE_UNMATCHED",
+                  f"event={eid} tier={tier} email={email} "
+                  f"amount={amount} currency={currency} "
+                  f"ambiguous={ambiguous}")
         self._send_json(200, {"ok": True, "matched": False})
 
     def _api_admin_post(self, path):
@@ -1972,11 +1974,153 @@ def transition_order_status(row, new_status):
                   "concurrent transition; side effects skipped")
         return False
     log_event(oid, "STATUS_CHANGED", f"{row['status']} -> {new_status}")
-    if new_status == "PAID" and row["tier"] == "Monitoring":
-        activate_monitor(row)
-    if new_status == "PAID" and row["tier"] == "Deep Scan":
-        on_deep_scan_paid(row)
+    if new_status == "PAID":
+        # The status is committed; the side effects are the second
+        # half of the transition. Their completion is recorded so a
+        # crash between the commit and the appliers is recoverable
+        # (ensure_paid_side_effects / the boot sweep re-fire them —
+        # both appliers are INSERT OR IGNORE, so re-firing is safe).
+        try:
+            if row["tier"] == "Monitoring":
+                activate_monitor(row)
+            if row["tier"] == "Deep Scan":
+                on_deep_scan_paid(row)
+        except Exception:
+            log_event(oid, "SIDE_EFFECT_FAILED",
+                      "PAID side effects raised; the recovery "
+                      "consult will re-fire them")
+            raise
+        log_event(oid, "SIDE_EFFECTS_OK", f"tier={row['tier']}")
     return True
+
+
+def _paid_effects_done(order_id):
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT 1 FROM events WHERE order_id=? AND "
+            "event='SIDE_EFFECTS_OK'", (order_id,)).fetchone() is not None
+    finally:
+        conn.close()
+
+
+def ensure_paid_side_effects(order):
+    """Re-fire a PAID order's side effects when their completion was
+    never recorded. No-op when SIDE_EFFECTS_OK is already logged."""
+    if _paid_effects_done(order["id"]):
+        return
+    if order["tier"] == "Monitoring":
+        activate_monitor(order)
+    if order["tier"] == "Deep Scan":
+        on_deep_scan_paid(order)
+    log_event(order["id"], "SIDE_EFFECTS_OK",
+              f"tier={order['tier']} (recovered)")
+
+
+def sweep_paid_side_effects():
+    """Boot sweep: every PAID Deep Scan / Monitoring order gets its
+    side-effect completion verified (and re-fired if missing), and
+    every matched Stripe event gets its receipt email verified (and
+    resent if it never landed). Idempotent; runs once at startup."""
+    conn = db_connect()
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE status='PAID' AND "
+            "tier IN ('Deep Scan','Monitoring')").fetchall()
+        evs = conn.execute(
+            "SELECT event_id, order_id, amount FROM stripe_events "
+            "WHERE order_id IS NOT NULL").fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            ensure_paid_side_effects(dict(row))
+        except Exception as e:
+            log(f"boot sweep: side effects for order {row['id']} "
+                f"failed: {e!r}")
+    for ev in evs:
+        try:
+            conn = db_connect()
+            conn.row_factory = sqlite3.Row
+            orow = conn.execute("SELECT * FROM orders WHERE id=?",
+                                (ev["order_id"],)).fetchone()
+            conn.close()
+            if orow is not None:
+                _ensure_paid_receipt(dict(orow), ev["amount"])
+        except Exception as e:
+            log(f"boot sweep: receipt for event {ev['event_id']} "
+                f"failed: {e!r}")
+
+
+def _send_paid_receipt(order, amount_cents):
+    """The payment-received email. Logged either way; a failure is
+    recoverable — while no PAID_EMAIL_SENT is on record, the boot
+    sweep and the webhook recovery consult resend it."""
+    tier = order["tier"]
+    if amount_cents:
+        amt_label = f"${amount_cents / 100:,.2f}"
+    else:
+        amt_label = f"${order['amount']:,.2f}"
+    rcpt_text = (
+        f"Hi {order['name']},\n\n"
+        f"We've received your payment of {amt_label} for a "
+        f"{tier} of {order['url']}.\n\n"
+        "Your audit is now in the queue, and the delivery "
+        "times in the pricing section of our site run from "
+        "today. We confirm the scope of your app within one "
+        "business day; if the work cannot run as briefed, we "
+        "will write to you before starting and refund your "
+        "payment in full.\n\n"
+        "Questions — just reply to this email.\n\n"
+        "— ShipAudit Lab\n"
+        "Security for what you shipped.")
+    rcpt_html = email_template.render_email(
+        eyebrow="Payment received",
+        headline="Payment received.",
+        body_html=(
+            email_template.para(f"Hi {order['name']},")
+            + email_template.para(
+                f"We've received your payment of {amt_label} "
+                f"for a {tier} of {order['url']}.")
+            + email_template.details_table([
+                ("Reference", f"Order #{order['id']}"),
+                ("Service", tier),
+                ("Amount paid", amt_label),
+                ("Target", order["url"]),
+                ("Status", "Paid — in the queue"),
+            ])
+            + email_template.para(
+                "Your audit is now in the queue, and the "
+                "delivery times in the pricing section of our "
+                "site run from today. We confirm the scope of "
+                "your app within one business day; if the work "
+                "cannot run as briefed, we will write to you "
+                "before starting and refund your payment in "
+                "full.")
+            + email_template.para(
+                "Questions — just reply to this email.")),
+        reason="You received this email because a payment "
+               "was completed for your ShipAudit Lab order.")
+    eok, edet = send_resend(
+        order["email"], f"Payment received — {tier}",
+        rcpt_text, html=rcpt_html)
+    log_event(order["id"],
+              "PAID_EMAIL_SENT" if eok else "PAID_EMAIL_FAILED",
+              edet)
+    return eok
+
+
+def _ensure_paid_receipt(order, amount_cents):
+    conn = db_connect()
+    try:
+        sent = conn.execute(
+            "SELECT 1 FROM events WHERE order_id=? AND "
+            "event='PAID_EMAIL_SENT'", (order["id"],)).fetchone()
+    finally:
+        conn.close()
+    if sent is None:
+        _send_paid_receipt(order, amount_cents)
 
 
 def _stripe_signature_ok(raw, header, secret):
@@ -2166,6 +2310,69 @@ def _monitor_alert_parts(mon, host, order_id, d_new, d_gone,
 def _run_monitor(mon):
     order_id = mon["order_id"]
     host = urllib.parse.urlparse(mon["url"]).hostname or ""
+    # A retained alert from an earlier failed send is delivered
+    # BEFORE any scanning: it needs nothing from a new scan, and a
+    # target that no longer scans must not starve it (Codex delta-3).
+    _pending = None
+    if mon.get("pending_alert"):
+        try:
+            _pending = json.loads(mon["pending_alert"])
+        except Exception:
+            _pending = None
+    if _pending:
+        _pbody, _phtml = _monitor_alert_parts(
+            mon, host, order_id, _pending["new"], _pending["gone"],
+            _pending["grade"], _pending["score"])
+        _pok, _pdet = send_resend(
+            mon["email"], f"Monitoring: changes detected on {host}",
+            _pbody, html=_phtml)
+        if not _pok:
+            _attempts = int(_pending.get("attempts", 1)) + 1
+            _pending["attempts"] = _attempts
+            log_event(order_id, "MONITOR_ALERT_FAILED",
+                      f"retained alert attempt {_attempts}: {_pdet}")
+            if _attempts >= 3 and not _pending.get("escalated"):
+                _tok, _ = send_telegram(
+                    f"ShipAudit Lab: monitoring alert for "
+                    f"{mon['url']} UNDELIVERED after 3 attempts "
+                    f"({_pdet}); digest held, weekly retries "
+                    f"continue. Check the mail pipeline.")
+                if _tok:
+                    _pending["escalated"] = True
+                    log_event(order_id, "MONITOR_ALERT_ESCALATED",
+                              "retained alert undelivered after 3 "
+                              "attempts; hourly retries stop, weekly "
+                              "retries continue")
+            with _db_lock:
+                conn = db_connect()
+                conn.execute(
+                    "UPDATE monitors SET pending_alert=?, "
+                    "next_run_at=? WHERE id=?",
+                    (json.dumps(_pending),
+                     time.time() + (3600 if _attempts < 3
+                                    else MONITOR_INTERVAL),
+                     mon["id"]))
+                conn.commit()
+                conn.close()
+            log_event(order_id, "MONITOR_ALERT_RETRY",
+                      f"attempt {_attempts}; digest held")
+            return
+        log_event(order_id, "MONITOR_ALERT_SENT",
+                  f"retained alert delivered: {_pdet}")
+        send_telegram(
+            f"ShipAudit Lab: retained monitoring alert for "
+            f"{mon['url']} delivered ({len(_pending['new'])} new, "
+            f"{len(_pending['gone'])} resolved).")
+        with _db_lock:
+            conn = db_connect()
+            conn.execute(
+                "UPDATE monitors SET pending_alert=NULL, "
+                "last_digest=? WHERE id=?",
+                (json.dumps(_pending["digest_after"]), mon["id"]))
+            conn.commit()
+            conn.close()
+        mon["pending_alert"] = None
+        mon["last_digest"] = json.dumps(_pending["digest_after"])
     guard = _guard_public_target(host)
     if guard:
         log_event(order_id, "MONITOR_ERROR", f"target refused: {guard}")
@@ -2239,47 +2446,9 @@ def _run_monitor(mon):
             body, html=body_html)
 
     now = time.time()
-    # 1) A retained alert from an earlier failed send goes first. It
-    #    reports what was true when it was detected, even if the
-    #    findings have since reverted (Codex delta, 2026-11-09) —
-    #    retaining only the digest would have lost it. The digest
-    #    advances only when an alert is actually delivered; retries
-    #    run hourly and escalate to weekly after the 3rd failure
-    #    (GLM delta: an unbounded hourly retry spins forever).
-    if pending:
-        ok_p, det_p = _attempt(pending["new"], pending["gone"],
-                               pending["grade"], pending["score"])
-        if not ok_p:
-            attempts = int(pending.get("attempts", 1)) + 1
-            pending["attempts"] = attempts
-            log_event(order_id, "MONITOR_ALERT_FAILED",
-                      f"retained alert attempt {attempts}: {det_p}")
-            if attempts == 3:
-                log_event(order_id, "MONITOR_ALERT_ESCALATED",
-                          "retained alert undelivered after 3 "
-                          "attempts; hourly retries stop, weekly "
-                          "retries continue")
-                send_telegram(
-                    f"ShipAudit Lab: monitoring alert for "
-                    f"{mon['url']} UNDELIVERED after 3 attempts "
-                    f"({det_p}); digest held, weekly retries "
-                    f"continue. Check the mail pipeline.")
-            _save_mon(mon["last_digest"],
-                      now + (3600 if attempts < 3
-                             else MONITOR_INTERVAL),
-                      json.dumps(pending))
-            log_event(order_id, "MONITOR_ALERT_RETRY",
-                      f"attempt {attempts}; digest held")
-            return
-        log_event(order_id, "MONITOR_ALERT_SENT",
-                  f"retained alert delivered: {det_p}")
-        send_telegram(
-            f"ShipAudit Lab: retained monitoring alert for "
-            f"{mon['url']} delivered ({len(pending['new'])} new, "
-            f"{len(pending['gone'])} resolved).")
-        prev = pending["digest_after"]
-        pending = None
-    # 2) This scan's own diff, against what the client was last told.
+    # This scan's own diff, against what the client was last told.
+    # (A retained alert, if any, was already delivered at the top of
+    # this run and last_digest advanced to its digest_after there.)
     if prev is None:
         _save_mon(json.dumps(digest), now + MONITOR_INTERVAL, None)
         log_event(order_id, "MONITOR_BASELINE",
@@ -2341,6 +2510,10 @@ def main():
     # Warm the DB so a bad path fails loudly at boot, not on first order.
     conn = db_connect()
     conn.close()
+    try:
+        sweep_paid_side_effects()
+    except Exception as e:
+        log(f"boot sweep failed: {e!r}")
     if os.environ.get("VF_MONITORING", "1") != "0":
         threading.Thread(target=_monitor_loop, daemon=True,
                          name="monitor-loop").start()
