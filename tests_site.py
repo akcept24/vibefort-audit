@@ -6297,6 +6297,457 @@ check("N83 (1): fresh subprocess — the warm-up leaves "
 _SRV31.shutdown()
 _SRV31.server_close()
 
+# ROUND 32 — Codex delta-30: NO-SHIP on e64146a, TWO
+# findings, both documentary, both in the claim's
+# enumeration. Certified (untouched): the no-code-change
+# round itself, pin N83 (as a sequential basis pin), the
+# catalog chain, exclusions (i)/(ii), and the deadline /
+# classification / deletion provisions. Finding (1): the
+# round-31 lazy-build residual guaranteed "the first
+# gated call after the reset contains the build, one
+# event per reset" and placed subsequent calls on the
+# lazy-built opener "inside the claim" — a foreign
+# urlopen can build first, concurrent foreign None-checks
+# can build more than once, a failed build retries, and
+# the lazy-built opener is not the module-warmed opener
+# the claim was scoped to. Finding (2): the enumeration
+# omitted concurrent creation routes — the module's OWN
+# scanner seam (_tls_info, a fresh default context per
+# probed connection) and ANY build_opener construction
+# of an uninstalled opener (including a concurrent
+# module reload re-running the warm-up build). THIS
+# ROUND CHANGES NO PRODUCTION CODE: the JOURNAL bound
+# is RESTRUCTURED around the invariant that is true —
+# within a gated send's own operations no TLS context
+# is created; the claim covers exchanges riding an
+# ALREADY-BUILT opener OF THE STANDARD CONSTRUCTION
+# (module-warmed or lazy-built — the identical
+# build_opener() product; the two differ only in WHICH
+# build event created them, and build events are
+# excluded as a class); creation happens ONLY at the
+# named non-send events of a four-class taxonomy:
+# (1) opener/handler BUILD events (by whomever
+# initiated, installed or never installed; NO guarantee
+# about which call contains a lazy build or
+# exactly-once-per-reset), (2) the module's own scanner
+# seam's per-probe wraps, (3) foreign openers' machinery
+# — exclusion (i), unchanged, (4) foreign direct
+# constructions — exclusion (ii), unchanged. N84 and
+# N85 below are that taxonomy's factual basis for
+# classes (2) and (1) respectively. N84/N85 are GREEN
+# on e64146a by design — basis pins for a documentary
+# restructure, not defect specimens: the round-31
+# defects were in the statement's guarantees and
+# enumeration, not in the tree's behaviour.
+
+import http.server as _hs32
+import re as _re32
+import socket as _sock32
+import ssl as _ssl32
+import subprocess as _sp32
+import tempfile as _tf32
+
+_certdir32 = _tf32.mkdtemp(prefix="vf-tls32-")
+_ca32 = os.path.join(_certdir32, "ca.pem")
+_cakey32 = os.path.join(_certdir32, "ca.key")
+_sp32.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+           "-keyout", _cakey32, "-out", _ca32, "-days", "2",
+           "-nodes", "-subj", "/CN=vf-ca32",
+           "-addext", "basicConstraints=critical,CA:TRUE",
+           "-addext", "keyUsage=critical,keyCertSign,cRLSign"],
+          check=True, capture_output=True, timeout=60)
+_cert32 = os.path.join(_certdir32, "cert.pem")
+_key32 = os.path.join(_certdir32, "key.pem")
+_csr32 = os.path.join(_certdir32, "srv.csr")
+_ext32 = os.path.join(_certdir32, "srv.ext")
+_sp32.run(["openssl", "req", "-newkey", "rsa:2048",
+           "-keyout", _key32, "-out", _csr32, "-nodes",
+           "-subj", "/CN=127.0.0.1"],
+          check=True, capture_output=True, timeout=60)
+with open(_ext32, "w") as _fext32:
+    _fext32.write("subjectAltName=IP:127.0.0.1\n")
+_sp32.run(["openssl", "x509", "-req", "-in", _csr32,
+           "-CA", _ca32, "-CAkey", _cakey32,
+           "-CAcreateserial", "-out", _cert32, "-days", "2",
+           "-extfile", _ext32],
+          check=True, capture_output=True, timeout=60)
+_srvctx32 = _ssl32.SSLContext(_ssl32.PROTOCOL_TLS_SERVER)
+_srvctx32.load_cert_chain(_cert32, _key32)
+
+
+class _TlsHandler32(_hs32.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        _ids32 = {"/tls-ok84": b"mail-n84-ok",
+                  "/tls-ok85": b"mail-n85-ok"}
+        if self.path in _ids32:
+            body = b'{"id": "' + _ids32[self.path] + b'"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_SRV32 = _hs32.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _TlsHandler32)
+_SRV32.socket = _srvctx32.wrap_socket(_SRV32.socket,
+                                      server_side=True)
+_PORT32 = _SRV32.server_address[1]
+_th32srv = threading.Thread(
+    target=_SRV32.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th32srv.start()
+
+# A raw TLS listener on 127.0.0.1:443 for the genuine
+# _tls_info (its direct path connects to port 443 by
+# construction): accept, complete the handshake with
+# the same CA-signed cert, drain, close. Quiet by
+# construction — every failure is swallowed per
+# connection so the listener survives bad probes.
+_lsock443 = _sock32.socket(_sock32.AF_INET,
+                           _sock32.SOCK_STREAM)
+_lsock443.setsockopt(_sock32.SOL_SOCKET,
+                     _sock32.SO_REUSEADDR, 1)
+_lsock443.bind(("127.0.0.1", 443))
+_lsock443.listen(8)
+_lsock443.settimeout(0.2)
+_stop443 = [False]
+
+
+def _one443(_c):
+    try:
+        _tls = _srvctx32.wrap_socket(_c, server_side=True)
+        _tls.settimeout(2.0)
+        try:
+            _tls.recv(4096)
+        except Exception:
+            pass
+        _tls.close()
+    except Exception:
+        try:
+            _c.close()
+        except Exception:
+            pass
+
+
+def _serve443():
+    while not _stop443[0]:
+        try:
+            _conn443, _ = _lsock443.accept()
+        except _sock32.timeout:
+            continue
+        except OSError:
+            break
+        threading.Thread(target=_one443, args=(_conn443,),
+                         daemon=True).start()
+
+
+_th443 = threading.Thread(target=_serve443, daemon=True)
+_th443.start()
+
+# N84 (1): taxonomy class (2) — a FRESH SUBPROCESS
+# specimen in N78's pattern. The driver imports the
+# server module (the warm-up installs the global
+# opener), wraps ALL the stdlib context-creator seams
+# in one counter (ssl.create_default_context — the
+# seam _tls_info itself calls — plus ssl's and
+# http.client's private creators, the N83 pair), forces
+# _tls_info's DIRECT branch (it keys on HTTPS_PROXY at
+# call time) with the SSRF guard opened to loopback,
+# and calls the GENUINE SRV._tls_info("127.0.0.1")
+# against the local CA-signed TLS server on port 443:
+# the probe must RETURN a TLS version (proof the real
+# function executed end to end — context creation,
+# handshake, cert parse) with creations >= 1 recorded.
+# The driver then zeroes the counter and runs ONE
+# gated send on the built opener: delivered with ZERO
+# creations — the scanner's creations are real and
+# concurrent-capable, and none of them is a send
+# operation. (The child's environment carries
+# SSL_CERT_FILE=<the local CA>, N78's arrangement, so
+# the default contexts — the probe's and the opener's —
+# trust the local servers and everything runs on
+# production mechanics.)
+_DRIVER84 = '''import http.client
+import os
+import ssl
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+port = int(sys.argv[2])
+dbpath = sys.argv[3]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+import server as SRV
+
+print("WARMED84 opener=%s" % (
+    "set" if urllib.request._opener is not None
+    else "unset"), flush=True)
+
+# Force _tls_info's direct branch (HTTPS_PROXY is read
+# at call time) and let the SSRF guard accept the
+# loopback target (also read at call time).
+os.environ.pop("HTTPS_PROXY", None)
+os.environ.pop("https_proxy", None)
+os.environ["VF_ALLOW_PRIVATE_TARGETS"] = "1"
+
+_created = [0]
+_real_pub = ssl.create_default_context
+_real_priv = ssl._create_default_https_context
+_real_hc = http.client._create_https_context
+
+
+def _counting_pub(*a, **kw):
+    _created[0] += 1
+    return _real_pub(*a, **kw)
+
+
+def _counting_priv(*a, **kw):
+    _created[0] += 1
+    return _real_priv(*a, **kw)
+
+
+def _counting_hc(http_version):
+    _created[0] += 1
+    return _real_hc(http_version)
+
+
+ssl.create_default_context = _counting_pub
+ssl._create_default_https_context = _counting_priv
+http.client._create_https_context = _counting_hc
+
+# Taxonomy class (2): the module's OWN scanner seam —
+# the genuine _tls_info against the local TLS server
+# on 127.0.0.1:443 (its direct path pins port 443).
+_info = SRV._tls_info("127.0.0.1")
+print("PROBE84 version=%s created=%d" % (
+    _info["version"], _created[0]), flush=True)
+_created[0] = 0
+
+SRV.RESEND_API_KEY = "catalog-test-key"
+SRV._GATED_SEND_DEADLINE = 10.0
+SRV._RESEND_API_URL = "https://127.0.0.1:%d/tls-ok84" % port
+_conn = SRV.db_connect()
+_cur = _conn.execute(
+    "INSERT INTO orders(created_at,name,email,url,tier,"
+    "notes,amount,status) VALUES(?,?,?,?,?,?,?,?)",
+    (SRV.utcnow(), "Cat T", "n84@test.dev",
+     "https://example.com", "Deep Scan", "", 29, "PAID"))
+_oid = _cur.lastrowid
+_conn.commit()
+_conn.close()
+_res = SRV._gated_send(_oid, SRV.send_resend,
+                       "n84@test.dev",
+                       "Payment received — Deep Scan", "body")
+print("SEND84 status=%s id=%s created=%d" % (
+    SRV._send_status(_res), _res[1],
+    _created[0]), flush=True)
+'''
+
+_drvdir32 = _tf32.mkdtemp(prefix="vf-n84-")
+_drvfile84 = os.path.join(_drvdir32, "driver84.py")
+with open(_drvfile84, "w") as _fdrv84:
+    _fdrv84.write(_DRIVER84)
+_env84 = dict(os.environ)
+_env84["SSL_CERT_FILE"] = _ca32
+_run84 = _sp32.run(
+    [sys.executable, _drvfile84,
+     os.path.dirname(os.path.abspath(__file__)),
+     str(_PORT32), os.path.join(_drvdir32, "n84.db")],
+    env=_env84, capture_output=True, text=True, timeout=180)
+_out84 = _run84.stdout or ""
+print("N84 driver rc=%d stdout:\n%s"
+      % (_run84.returncode, _out84))
+if _run84.stderr:
+    print("N84 driver stderr (tail):\n"
+          + _run84.stderr[-2000:])
+_mwarm84 = _re32.search(r"WARMED84 opener=(set|unset)",
+                        _out84)
+_mprb84 = _re32.search(
+    r"PROBE84 version=(\S+) created=(\d+)", _out84)
+_msnd84 = _re32.search(
+    r"SEND84 status=(\S+) id=(\S+) created=(\d+)", _out84)
+check("N84 (1): fresh subprocess — the module's own "
+      "scanner seam creates per probe while a gated "
+      "send creates nothing: the genuine _tls_info "
+      "against the local CA-signed TLS server returns "
+      "a TLS version with >=1 counted stdlib context "
+      "creation (taxonomy class (2): the scanner's "
+      "per-probe wraps, by design, not send "
+      "operations), and one gated send on the built "
+      "opener is delivered with ZERO creations (basis "
+      "pin, green by design on the pre-round tree: "
+      "the round-31 defects were in the statement's "
+      "guarantees and enumeration, not in behaviour)",
+      _run84.returncode == 0
+      and _mwarm84 is not None
+      and _mwarm84.group(1) == "set"
+      and _mprb84 is not None
+      and int(_mprb84.group(2)) >= 1
+      and _msnd84 is not None
+      and _msnd84.group(1) == "delivered"
+      and _msnd84.group(2) == "mail-n84-ok"
+      and int(_msnd84.group(3)) == 0)
+
+# N85 (1): taxonomy class (1) — a FRESH SUBPROCESS
+# specimen in N78's pattern. The driver imports the
+# server module (the warm-up installs the global
+# opener), wraps the stdlib context creators in one
+# counter, then calls urllib.request.build_opener()
+# and does NOT install the result: the build event
+# itself must record creations >= 1 (the HTTPS
+# handler's context is created AT CONSTRUCTION —
+# installed or never installed makes no difference),
+# and the process-global opener must still be the
+# warmed one afterwards, NOT the built object. The
+# driver then zeroes the counter and runs ONE gated
+# send on the built (warmed) opener: delivered with
+# ZERO creations — creation belongs to the build
+# event, never to a send operation on an
+# already-built opener.
+_DRIVER85 = '''import http.client
+import os
+import ssl
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+port = int(sys.argv[2])
+dbpath = sys.argv[3]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+import server as SRV
+
+print("WARMED85 opener=%s" % (
+    "set" if urllib.request._opener is not None
+    else "unset"), flush=True)
+
+_created = [0]
+_real_pub = ssl.create_default_context
+_real_priv = ssl._create_default_https_context
+_real_hc = http.client._create_https_context
+
+
+def _counting_pub(*a, **kw):
+    _created[0] += 1
+    return _real_pub(*a, **kw)
+
+
+def _counting_priv(*a, **kw):
+    _created[0] += 1
+    return _real_priv(*a, **kw)
+
+
+def _counting_hc(http_version):
+    _created[0] += 1
+    return _real_hc(http_version)
+
+
+ssl.create_default_context = _counting_pub
+ssl._create_default_https_context = _counting_priv
+http.client._create_https_context = _counting_hc
+
+# Taxonomy class (1): an opener/handler BUILD event —
+# build_opener() called and the result NEVER
+# installed. Creation happens at the build; the
+# global opener remains the warmed one.
+_built = urllib.request.build_opener()
+print("BUILD85 created=%d global=%s" % (
+    _created[0],
+    "warmed" if urllib.request._opener is not _built
+    else "replaced"), flush=True)
+_created[0] = 0
+
+SRV.RESEND_API_KEY = "catalog-test-key"
+SRV._GATED_SEND_DEADLINE = 10.0
+SRV._RESEND_API_URL = "https://127.0.0.1:%d/tls-ok85" % port
+_conn = SRV.db_connect()
+_cur = _conn.execute(
+    "INSERT INTO orders(created_at,name,email,url,tier,"
+    "notes,amount,status) VALUES(?,?,?,?,?,?,?,?)",
+    (SRV.utcnow(), "Cat T", "n85@test.dev",
+     "https://example.com", "Deep Scan", "", 29, "PAID"))
+_oid = _cur.lastrowid
+_conn.commit()
+_conn.close()
+_res = SRV._gated_send(_oid, SRV.send_resend,
+                       "n85@test.dev",
+                       "Payment received — Deep Scan", "body")
+print("SEND85 status=%s id=%s created=%d" % (
+    SRV._send_status(_res), _res[1],
+    _created[0]), flush=True)
+'''
+
+_drvfile85 = os.path.join(_drvdir32, "driver85.py")
+with open(_drvfile85, "w") as _fdrv85:
+    _fdrv85.write(_DRIVER85)
+_env85 = dict(os.environ)
+_env85["SSL_CERT_FILE"] = _ca32
+_run85 = _sp32.run(
+    [sys.executable, _drvfile85,
+     os.path.dirname(os.path.abspath(__file__)),
+     str(_PORT32), os.path.join(_drvdir32, "n85.db")],
+    env=_env85, capture_output=True, text=True, timeout=180)
+_out85 = _run85.stdout or ""
+print("N85 driver rc=%d stdout:\n%s"
+      % (_run85.returncode, _out85))
+if _run85.stderr:
+    print("N85 driver stderr (tail):\n"
+          + _run85.stderr[-2000:])
+_mwarm85 = _re32.search(r"WARMED85 opener=(set|unset)",
+                        _out85)
+_mbld85 = _re32.search(
+    r"BUILD85 created=(\d+) global=(warmed|replaced)",
+    _out85)
+_msnd85 = _re32.search(
+    r"SEND85 status=(\S+) id=(\S+) created=(\d+)", _out85)
+check("N85 (1): fresh subprocess — an opener/handler "
+      "BUILD event creates at construction while a "
+      "gated send creates nothing: build_opener() "
+      "called and never installed records >=1 counted "
+      "stdlib context creation and leaves the global "
+      "opener the warmed one (taxonomy class (1): "
+      "build events, installed or never installed), "
+      "and one gated send on the built opener is "
+      "delivered with ZERO creations (basis pin, "
+      "green by design on the pre-round tree: the "
+      "round-31 defects were in the statement's "
+      "guarantees and enumeration, not in behaviour)",
+      _run85.returncode == 0
+      and _mwarm85 is not None
+      and _mwarm85.group(1) == "set"
+      and _mbld85 is not None
+      and int(_mbld85.group(1)) >= 1
+      and _mbld85.group(2) == "warmed"
+      and _msnd85 is not None
+      and _msnd85.group(1) == "delivered"
+      and _msnd85.group(2) == "mail-n85-ok"
+      and int(_msnd85.group(3)) == 0)
+_stop443[0] = True
+_lsock443.close()
+_SRV32.shutdown()
+_SRV32.server_close()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
