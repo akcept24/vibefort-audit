@@ -2970,7 +2970,7 @@ def _monitor_alert_parts(mon, host, order_id, d_new, d_gone,
     return body, body_html
 
 
-def _run_monitor(mon):
+def _run_monitor(mon, scheduled=False):
     # One run per monitor across processes (Codex delta-13 #2):
     # two interleaved runs read the same baseline, and the later
     # unconditional save can erase the earlier run's retained
@@ -2996,6 +2996,12 @@ def _run_monitor(mon):
         finally:
             conn.close()
         if fresh is None or not fresh["active"]:
+            return
+        if scheduled and fresh["next_run_at"] > time.time() + 5:
+            # Another run already completed and rescheduled
+            # (Codex delta-15): the scheduler's snapshot was
+            # due, the fresh row is not. Direct calls are a
+            # deliberate force-run and skip this revalidation.
             return
         _run_monitor_locked(dict(fresh))
     finally:
@@ -3197,7 +3203,7 @@ def _monitor_loop():
                     (time.time(),)).fetchall()
                 conn.close()
             for mon in due:
-                _run_monitor(dict(mon))
+                _run_monitor(dict(mon), scheduled=True)
         except Exception as e:
             log(f"monitor loop error: {e!r}")
         time.sleep(MONITOR_TICK)

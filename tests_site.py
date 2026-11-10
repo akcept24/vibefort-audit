@@ -1352,6 +1352,49 @@ check("W32 run works on the fresh row, not the snapshot",
       bool(p32) and p32["attempts"] == 2
       and json.loads(m32["last_digest"]) == ["LOW|base"])
 
+# ---- Delta-15 catalog (added 2026-11-09, round 15) ----
+# W33: a scheduler-triggered run revalidates due time on the
+#      fresh row — a monitor rescheduled by a completed run is
+#      not run early by a stale scheduler snapshot. A direct
+#      call remains a deliberate force-run (W33b).
+o33 = mk_order("w33@test.dev", "Monitoring", 79, status="PAID")
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at) VALUES(?,?,?,?,?,?)",
+          (o33, "example.com", "w33@test.dev", "W33", S.utcnow(),
+           time.time() + 3600))
+c.commit()
+c.close()
+
+
+def row33():
+    c = db()
+    m = dict(c.execute("SELECT * FROM monitors WHERE order_id=?",
+                       (o33,)).fetchone())
+    c.close()
+    return m
+
+
+calls33 = {"n": 0}
+real_scan33 = S._scan_with_timeout
+
+
+def counting_scan33(url):
+    calls33["n"] += 1
+    return real_scan33(url)
+
+
+S._scan_with_timeout = counting_scan33
+stale33 = row33()
+stale33["next_run_at"] = time.time() - 10  # snapshot claims due
+S._run_monitor(stale33, scheduled=True)
+check("W33 scheduled run revalidates due time",
+      calls33["n"] == 0 and row33()["last_digest"] is None)
+S._run_monitor(row33())
+S._scan_with_timeout = real_scan33
+check("W33b direct call is a force-run",
+      calls33["n"] == 1 and row33()["last_digest"] is not None)
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
