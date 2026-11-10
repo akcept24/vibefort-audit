@@ -685,8 +685,13 @@ real_tg = S.send_telegram
 S.send_telegram = lambda text: (tg16.__setitem__("n", tg16["n"] + 1),
                                 (True, "ok"))[1]
 c = S.db_connect()
+# MECHANISM NOTE (round 9): lock keys are namespaced since
+# delta-9 ("alert:<event_id>", "receipt:<order_id>"); the W16
+# invariant — a foreign alert lock silences the delivery — is
+# unchanged.
 c.execute("INSERT INTO event_locks(event_id,purpose,claimed_at) "
-          "VALUES('evt_w16','unmatched-alert',?)", (time.time(),))
+          "VALUES('alert:evt_w16','unmatched-alert',?)",
+          (time.time(),))
 c.commit()
 c.close()
 r = stripe_call(evt("evt_w16"), sess(200, "w16@test.dev",
@@ -694,7 +699,8 @@ r = stripe_call(evt("evt_w16"), sess(200, "w16@test.dev",
 check("W16 foreign alert lock: step aside silently",
       r[0] == 500 and tg16["n"] == 0)
 c = S.db_connect()
-c.execute("DELETE FROM event_locks WHERE event_id='evt_w16'")
+c.execute("DELETE FROM event_locks WHERE "
+          "event_id='alert:evt_w16'")
 c.commit()
 c.close()
 r = stripe_call(evt("evt_w16"), sess(200, "w16@test.dev",
@@ -799,6 +805,130 @@ check("W19 unrecorded winner never validates a match",
                 (o19,)) == 0
       and count("events", "event='STRIPE_UNMATCHED' AND "
                 "detail LIKE '%evt_w19%'", ()) == 1)
+
+
+# ---- Delta-9 catalog (added 2026-11-09, round 9) ----
+# W20: a paid session with NO payment_intent never matches, even
+#      with a perfect amount+email candidate waiting.
+o20 = mk_order("w20@test.dev", "Deep Scan", 29)
+sess20 = sess(2900, "w20@test.dev")
+sess20["payment_intent"] = None
+r = stripe_call(evt("evt_w20"), sess20)
+check("W20 pi-less session never matches",
+      r[1].get("matched") is False and order_status(o20) == "NEW"
+      and count("fulfilment_requests", "order_id=?", (o20,)) == 0
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w20%'", ()) == 1)
+
+# W21: the duplicate lookup must find the PROVEN winner even when
+#      a provisional row for the same payment sits on a lost
+#      order. A third event for the winning payment dup-acks.
+o21a = mk_order("w21a@test.dev", "Deep Scan", 29)
+o21b = mk_order("w21b@test.dev", "Deep Scan", 29)
+c = db()
+ra = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                    (o21a,)).fetchone())
+rb = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                    (o21b,)).fetchone())
+c.close()
+S.transition_order_status(ra, "PAID", paid_event_id="evt_w21_a",
+                          paid_pi="pi_w21_other")
+S.transition_order_status(rb, "PAID", paid_event_id="evt_w21_b",
+                          paid_pi="pi_w21_z")
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w21_z1','checkout.session.completed',?,?,?,2900)",
+          (o21a, S.utcnow(), "pi_w21_z"))
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w21_z2','checkout.session.completed',?,?,?,2900)",
+          (o21b, S.utcnow(), "pi_w21_z"))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w21_z3",
+                    "checkout.session.async_payment_succeeded"),
+                sess(2900, "w21b@test.dev", pi="pi_w21_z"))
+check("W21 dup lookup finds the proven winner",
+      r[1].get("duplicate") is True
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w21_z3%'", ()) == 0)
+
+# W22: a consult whose unmatched alert FAILS keeps the link — the
+#      boot sweep remains able to settle the event afterwards.
+o22 = mk_order("w22@test.dev", "Deep Scan", 29)
+c = db()
+row_22 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o22,)).fetchone())
+c.close()
+S.transition_order_status(row_22, "PAID",
+                          paid_event_id="evt_w22_win",
+                          paid_pi="pi_w22_win")
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w22_lose','checkout.session.completed',?,?,?,2900)",
+          (o22, S.utcnow(), "pi_w22_lose"))
+c.commit()
+c.close()
+STATE["telegram_ok"] = False
+r = stripe_call(evt("evt_w22_lose"),
+                sess(2900, "w22@test.dev", pi="pi_w22_lose"))
+STATE["telegram_ok"] = True
+c = db()
+link22 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w22_lose'").fetchone()[0]
+c.close()
+check("W22 failed consult alert keeps the link", r[0] == 500
+      and link22 == o22
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w22_lose%'", ()) == 0)
+S.sweep_paid_side_effects()
+c = db()
+link22 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w22_lose'").fetchone()[0]
+c.close()
+check("W22 sweep settles what the consult could not",
+      link22 is None
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w22_lose%'", ()) == 1)
+
+# A5: the receipt send is single-fire PER ORDER. A foreign
+#     receipt lock makes the consult step aside (500, nothing
+#     sent); once released, the receipt lands exactly once.
+o23 = mk_order("a5@test.dev", "Deep Scan", 29)
+# The receipt channel is stubbed directly here: by this point in
+# the catalog send_resend is the monitoring stub, which cannot
+# fail — A5 needs a genuinely failing first send.
+keep_resend = S.send_resend
+S.send_resend = lambda *a, **k: (False, "down")
+stripe_call(evt("evt_a5"), sess(2900, "a5@test.dev", pi="pi_a5"))
+S.send_resend = lambda *a, **k: (True, "ok")
+c = S.db_connect()
+c.execute("INSERT INTO event_locks(event_id,purpose,claimed_at) "
+          "VALUES(?,'receipt',?)", (f"receipt:{o23}", time.time()))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_a5"), sess(2900, "a5@test.dev",
+                                    pi="pi_a5"))
+check("A5 foreign receipt lock: consult steps aside",
+      r[0] == 500
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o23,)) == 0)
+c = S.db_connect()
+c.execute("DELETE FROM event_locks WHERE event_id=?",
+          (f"receipt:{o23}",))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_a5"), sess(2900, "a5@test.dev",
+                                    pi="pi_a5"))
+check("A5 receipt lands once the lock clears",
+      r[1].get("duplicate") is True
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o23,)) == 1)
+S.send_resend = keep_resend
 
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")

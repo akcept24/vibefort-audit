@@ -166,7 +166,11 @@ def db_connect():
     conn.execute("""CREATE TABLE IF NOT EXISTS event_locks(
         event_id TEXT PRIMARY KEY,
         purpose TEXT NOT NULL,
-        claimed_at REAL NOT NULL)""")
+        claimed_at REAL NOT NULL,
+        owner TEXT)""")
+    lcols = [r[1] for r in conn.execute("PRAGMA table_info(event_locks)")]
+    if "owner" not in lcols:
+        conn.execute("ALTER TABLE event_locks ADD COLUMN owner TEXT")
     conn.execute("""CREATE TABLE IF NOT EXISTS fulfilment_requests(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER UNIQUE NOT NULL,
@@ -1559,6 +1563,21 @@ class Handler(BaseHTTPRequestHandler):
                             state = "incomplete"
             finally:
                 conn.close()
+        if not pi:
+            # A paid session without a payment_intent can prove
+            # nothing about which payment it was: by the standing
+            # contract (delta-8 #5, delta-9 #3) it NEVER matches —
+            # it surfaces as unmatched for a manual decision.
+            _fire_unmatched_alert(
+                eid,
+                f"ShipAudit Lab: Stripe payment NOT matched — "
+                f"the paid session carries no payment_intent "
+                f"(amount={amount}, email={email}, event={eid}); "
+                f"it needs a manual match or refund.",
+                f"event={eid} no-payment-intent amount={amount} "
+                f"email={email}")
+            self._send_json(200, {"ok": True, "matched": False})
+            return
         if state == "done":
             # Recovery consult: a linked order whose PAID side
             # effects or receipt never completed (crash in the
@@ -1614,15 +1633,11 @@ class Handler(BaseHTTPRequestHandler):
                         # winner was never recorded (admin-paid /
                         # legacy). Contract (delta-8 #5): an
                         # unrecorded winner NEVER validates a
-                        # payment as matched. Settle as unmatched.
-                        with _db_lock:
-                            conn = db_connect()
-                            conn.execute(
-                                "UPDATE stripe_events SET "
-                                "order_id=NULL WHERE event_id=?",
-                                (eid,))
-                            conn.commit()
-                            conn.close()
+                        # payment as matched. Settle as unmatched:
+                        # alert FIRST, unlink only once the alert
+                        # is on record — a failed alert must leave
+                        # the link as the sweep's retry evidence
+                        # (Codex delta-9 #5).
                         _fire_unmatched_alert(
                             eid,
                             f"ShipAudit Lab: Stripe payment NOT "
@@ -1634,11 +1649,19 @@ class Handler(BaseHTTPRequestHandler):
                             f"event={eid} lost-claim "
                             f"order={linked_id} pi={pi} "
                             f"amount={amount}")
+                        with _db_lock:
+                            conn = db_connect()
+                            conn.execute(
+                                "UPDATE stripe_events SET "
+                                "order_id=NULL WHERE event_id=?",
+                                (eid,))
+                            conn.commit()
+                            conn.close()
                         self._send_json(200, {"ok": True,
                                               "matched": False})
                         return
                     ensure_paid_side_effects(order_d)
-                    if not _ensure_paid_receipt(order_d, amount, eid):
+                    if not _ensure_paid_receipt(order_d, amount):
                         raise RuntimeError("receipt resend failed")
             self._send_json(200, {"ok": True, "duplicate": True})
             return
@@ -1652,7 +1675,8 @@ class Handler(BaseHTTPRequestHandler):
                     "SELECT se.order_id, o.paid_pi FROM stripe_events "
                     "se JOIN orders o ON o.id = se.order_id WHERE "
                     "se.payment_intent=? AND se.order_id IS NOT NULL "
-                    "AND se.event_id<>?", (pi, eid)).fetchone()
+                    "AND se.event_id<>? AND o.paid_pi="
+                    "se.payment_intent", (pi, eid)).fetchone()
             finally:
                 conn.close()
             # The duplicate shortcut is taken only when the order's
@@ -1767,7 +1791,7 @@ class Handler(BaseHTTPRequestHandler):
                 # and the recovery consult resends it (the order
                 # itself is already PAID and fulfilled — only the
                 # courtesy is outstanding).
-                if not _ensure_paid_receipt(order, amount, eid):
+                if not _ensure_paid_receipt(order, amount):
                     raise RuntimeError("receipt send failed")
                 send_telegram(
                     f"ShipAudit Lab: Stripe payment matched — order "
@@ -2273,7 +2297,31 @@ def sweep_paid_side_effects():
         # A verified payment linked to an order that never got its
         # transition (crash in the link window): the money stands,
         # finish the transition at boot — recording the linking
-        # event as the winning payment in the same update.
+        # event as the winning payment in the same update. A link
+        # with NO payment_intent can never become a recorded
+        # winner (delta-9 #3): settle it as unmatched instead.
+        if not row["ev_pi"]:
+            try:
+                _fire_unmatched_alert(
+                    row["ev_id"],
+                    f"ShipAudit Lab: Stripe payment NOT matched — "
+                    f"event {row['ev_id']} linked to order "
+                    f"#{row['id']} carries no payment_intent; it "
+                    f"needs a manual match or refund.",
+                    f"event={row['ev_id']} lost-claim "
+                    f"order={row['id']} pi=None "
+                    f"amount={row['amount']} (boot sweep)")
+                with _db_lock:
+                    conn = db_connect()
+                    conn.execute(
+                        "UPDATE stripe_events SET order_id=NULL "
+                        "WHERE event_id=?", (row["ev_id"],))
+                    conn.commit()
+                    conn.close()
+            except Exception as e:
+                log(f"boot sweep: settle for pi-less event "
+                    f"{row['ev_id']} deferred: {e!r}")
+            continue
         try:
             transition_order_status(
                 dict(row), "PAID", paid_event_id=row["ev_id"],
@@ -2352,8 +2400,7 @@ def sweep_paid_side_effects():
                     conn.commit()
                     conn.close()
                 continue
-            _ensure_paid_receipt(order_d, ev["amount"],
-                                 ev["event_id"])
+            _ensure_paid_receipt(order_d, ev["amount"])
         except Exception as e:
             log(f"boot sweep: receipt for event {ev['event_id']} "
                 f"failed: {e!r}")
@@ -2417,15 +2464,20 @@ def _send_paid_receipt(order, amount_cents):
     return eok
 
 
-def _claim_event_lock(event_id, purpose):
-    """Single-fire guard for non-idempotent side effects keyed by
-    Stripe event (unmatched alerts, receipt emails) across
-    processes (Codex delta-8 #1/#4): the primary key admits one
-    holder; a lock older than 300 s belongs to a crashed holder
-    and is reclaimed once. A lock taken for a SUCCESSFUL fire is
-    never released — it is the fired record; a failed fire
-    releases it so the retry can fire again."""
+def _claim_event_lock(key, purpose):
+    """Single-fire guard for non-idempotent side effects across
+    processes (Codex delta-8 #1/#4), keyed by a namespaced string
+    ("alert:<event_id>", "receipt:<order_id>" — the namespaces
+    keep the two purposes from blocking each other, delta-9 #6).
+    The primary key admits one holder; a lock older than 300 s
+    belongs to a crashed (or impossibly slow) holder and is
+    reclaimed once. Returns the holder's owner token, or None.
+    A lock taken for a SUCCESSFUL fire is never released — it is
+    the fired record; a failed fire releases it — scoped to the
+    owner's token, so a reclaimed lock is never deleted by its
+    previous owner (delta-9 #2)."""
     now = time.time()
+    token = _secrets.token_hex(8)
     with _db_lock:
         conn = db_connect()
         try:
@@ -2433,32 +2485,33 @@ def _claim_event_lock(event_id, purpose):
                 try:
                     conn.execute(
                         "INSERT INTO event_locks(event_id, purpose,"
-                        " claimed_at) VALUES(?,?,?)",
-                        (event_id, purpose, now))
+                        " claimed_at, owner) VALUES(?,?,?,?)",
+                        (key, purpose, now, token))
                     conn.commit()
-                    return True
+                    return token
                 except sqlite3.IntegrityError:
                     conn.rollback()
                     row = conn.execute(
                         "SELECT claimed_at FROM event_locks "
-                        "WHERE event_id=?", (event_id,)).fetchone()
+                        "WHERE event_id=?", (key,)).fetchone()
                     if row is None or now - row[0] <= 300:
-                        return False
+                        return None
                     conn.execute(
                         "DELETE FROM event_locks WHERE event_id=? "
-                        "AND claimed_at=?", (event_id, row[0]))
+                        "AND claimed_at=?", (key, row[0]))
                     conn.commit()
-            return False
+            return None
         finally:
             conn.close()
 
 
-def _release_event_lock(event_id):
+def _release_event_lock(key, token):
     with _db_lock:
         conn = db_connect()
         try:
-            conn.execute("DELETE FROM event_locks WHERE event_id=?",
-                         (event_id,))
+            conn.execute(
+                "DELETE FROM event_locks WHERE event_id=? "
+                "AND owner=?", (key, token))
             conn.commit()
         finally:
             conn.close()
@@ -2484,48 +2537,59 @@ def _fire_unmatched_alert(event_id, telegram_text, log_detail):
     (delta-8 #4). Returns 'fired' or 'duplicate'."""
     if _unmatched_logged(event_id):
         return "duplicate"
-    if not _claim_event_lock(event_id, "unmatched-alert"):
+    key = f"alert:{event_id}"
+    token = _claim_event_lock(key, "unmatched-alert")
+    if not token:
         if _unmatched_logged(event_id):
             return "duplicate"
         raise RuntimeError(
             "unmatched alert in flight in another process")
     tok, _ = send_telegram(telegram_text)
     if not tok:
-        _release_event_lock(event_id)
+        _release_event_lock(key, token)
         raise RuntimeError("unmatched alert telegram failed")
     log_event(None, "STRIPE_UNMATCHED", log_detail)
+    if not _unmatched_logged(event_id):
+        # The send happened but its durable record did not (log
+        # writes can fail silently): never ack a fire we cannot
+        # prove — release and raise so the retry re-fires
+        # (Codex delta-9 #6).
+        _release_event_lock(key, token)
+        raise RuntimeError("unmatched alert log did not persist")
     return "fired"
 
 
-def _ensure_paid_receipt(order, amount_cents, event_id=None):
-    """True when the receipt is on record as sent (already, or by
-    the resend this call performs). The send itself is single-
-    fire per winning event (event lock): a concurrent consult or
-    sweep for the same payment cannot double-send; if another
-    holder is mid-send, this returns the on-record state and the
-    caller's retry logic re-checks."""
+def _receipt_logged(order_id):
     conn = db_connect()
     try:
-        sent = conn.execute(
+        return conn.execute(
             "SELECT 1 FROM events WHERE order_id=? AND "
-            "event='PAID_EMAIL_SENT'", (order["id"],)).fetchone()
+            "event='PAID_EMAIL_SENT'",
+            (order_id,)).fetchone() is not None
     finally:
         conn.close()
-    if sent is not None:
+
+
+def _ensure_paid_receipt(order, amount_cents):
+    """True when the receipt is on record as sent (already, or by
+    the resend this call performs). The send is single-fire PER
+    ORDER (the completion record is per order — Codex delta-9
+    #1): two events of one payment, in any processes, contend on
+    the same "receipt:<order_id>" lock. A send whose PAID_EMAIL_
+    SENT record does not persist counts as not sent (delta-9
+    #6). If another holder is mid-send, this returns the
+    on-record state and the caller's retry logic re-checks."""
+    if _receipt_logged(order["id"]):
         return True
-    if event_id and not _claim_event_lock(event_id, "receipt"):
-        conn = db_connect()
-        try:
-            sent = conn.execute(
-                "SELECT 1 FROM events WHERE order_id=? AND "
-                "event='PAID_EMAIL_SENT'",
-                (order["id"],)).fetchone()
-        finally:
-            conn.close()
-        return sent is not None
+    key = f"receipt:{order['id']}"
+    token = _claim_event_lock(key, "receipt")
+    if not token:
+        return _receipt_logged(order["id"])
     ok = _send_paid_receipt(order, amount_cents)
-    if not ok and event_id:
-        _release_event_lock(event_id)
+    if ok and not _receipt_logged(order["id"]):
+        ok = False
+    if not ok:
+        _release_event_lock(key, token)
     return ok
 
 
