@@ -4458,6 +4458,330 @@ else:
 
 _ureq18.urlopen = _real_urlopen18
 
+# ============================================================
+# Round 25 (Codex delta-23): THE DEADLINE IS PHASE-COMPLETE
+# — delta-23 certified the round-24 substitution itself
+# (same-thread enforcement, no abandoned worker) but
+# refuted it as not phase-complete: (1) a header dribble
+# inside urlopen outlived the deadline — every socket
+# operation stayed under its own timeout while the
+# aggregate ran past 30 s — yet the JOURNAL's final
+# statement claimed the bound unconditionally; (2) a
+# chunk-framing dribble hid inside http.client's read1()
+# (its internal chunk-size/trailer reads were never
+# clock-checked between read1 calls), and the no-read1
+# fallback read a body in one unchecked call; (3) a
+# deadline cut inside an HTTPError body read was swallowed
+# by both wrappers' error arms and classified by status
+# (definite) instead of unknown. Round 25 moves the
+# enforcement BELOW http.client's parsing, onto the raw
+# socket: every blocking socket operation of a gated send
+# re-caps its timeout to what is left of the deadline and
+# refuses once it is spent, so no phase — connect, request
+# send, response headers, body (chunk framing and trailers
+# included), error body — can outlive the deadline in
+# aggregate; the expiry is a dedicated exception type and
+# both HTTPError arms classify it UNKNOWN.
+# These pins drive the GENUINE wrappers over a REAL
+# localhost socket — a threaded HTTP server that dribbles
+# — not an in-memory model. The wrappers are pointed at
+# the test server two ways at once: the round-25 base-URL
+# constants are patched where they exist, and a
+# redirecting urlopen carries the pre-fix tree (whose
+# wrappers build the provider URL inline) to the same
+# server through the genuine urllib/http.client stack.
+
+import http.server as _hs25
+
+_HITS25 = {}
+_ARRIVED25 = {p: threading.Event()
+              for p in ("/hdr", "/chunk", "/err", "/tgerr")}
+
+
+class _DribHandler25(_hs25.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length")
+                       or 0)
+        except Exception:
+            left = 0
+        while left > 0:
+            piece = self.rfile.read(min(left, 65536))
+            if not piece:
+                break
+            left -= len(piece)
+        mode = self.path
+        if mode.startswith("/bot"):
+            mode = "/tgerr"
+        _HITS25[mode] = _HITS25.get(mode, 0) + 1
+        ev = _ARRIVED25.get(mode)
+        if ev is not None:
+            ev.set()
+        try:
+            getattr(self, "_m_" + mode.strip("/"))()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            pass
+
+    def _raw(self, data):
+        self.connection.sendall(data)
+
+    def _drip(self, data, interval):
+        for i in range(len(data)):
+            self.connection.sendall(data[i:i + 1])
+            time.sleep(interval)
+
+    def _m_hdr(self):
+        # Status line prompt, then the header block one byte
+        # at a time (~6.5 s at 0.12 s/byte): every socket
+        # read makes progress well inside its per-operation
+        # timeout, so only an AGGREGATE bound can cut this.
+        self._raw(b"HTTP/1.1 200 OK\r\n")
+        self._drip(b"Content-Type: application/json\r\n"
+                   b"X-Dribble: n69-headers-pad\r\n", 0.12)
+        body = b'{"id": "mail-n69"}'
+        self._raw(b"Content-Length: %d\r\n\r\n" % len(body)
+                  + body)
+
+    def _m_chunk(self):
+        # Headers prompt; the chunk-SIZE line dribbled one
+        # byte at a time (~4.5 s) — the dribble lives inside
+        # http.client's chunk parsing, within a single
+        # read1() call from the wrapper's point of view.
+        body = b'{"id": "mail-n70"}'
+        assert len(body) == 18
+        self._raw(b"HTTP/1.1 200 OK\r\n"
+                  b"Content-Type: application/json\r\n"
+                  b"Transfer-Encoding: chunked\r\n\r\n")
+        self._drip(b"00000012\r\n", 0.45)
+        self._raw(body + b"\r\n0\r\n\r\n")
+
+    def _err_body(self, status, body):
+        self._raw(status
+                  + b"\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: "
+                  + str(len(body)).encode() + b"\r\n\r\n")
+        for i in range(0, len(body), 64):
+            self.connection.sendall(body[i:i + 64])
+            time.sleep(0.25)
+
+    def _m_err(self):
+        # 422 promptly; the ERROR body dribbles (~9.5 s).
+        self._err_body(
+            b"HTTP/1.1 422 Unprocessable Entity",
+            b'{"message":"n71 dribbled error","pad":"'
+            + b"x" * 2400 + b'"}')
+
+    def _m_tgerr(self):
+        # 400 promptly; the ERROR body dribbles (~9.5 s).
+        self._err_body(
+            b"HTTP/1.1 400 Bad Request",
+            b'{"ok":false,"description":"n71 tg dribble",'
+            b'"pad":"' + b"x" * 2400 + b'"}')
+
+
+_SRV25 = _hs25.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _DribHandler25)
+_PORT25 = _SRV25.server_address[1]
+_th25srv = threading.Thread(
+    target=_SRV25.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th25srv.start()
+_BASE25 = f"http://127.0.0.1:{_PORT25}"
+_MODE25 = {"resend": "/hdr"}
+_real_open25 = _ureq18.urlopen
+
+
+def _redirect25(req, timeout=None):
+    url = req.full_url
+    if "api.resend.com" in url:
+        req.full_url = _BASE25 + _MODE25["resend"]
+    elif "api.telegram.org" in url:
+        req.full_url = _BASE25 + "/tgerr"
+    if timeout is None:
+        return _real_open25(req)
+    return _real_open25(req, timeout=timeout)
+
+
+def _point25(path):
+    _MODE25["resend"] = path
+    SR._RESEND_API_URL = _BASE25 + path
+
+
+def _failed_detail25(oid):
+    c = db()
+    try:
+        r = c.execute(
+            "SELECT detail FROM events WHERE order_id=? AND "
+            "event='PAID_EMAIL_FAILED' ORDER BY id DESC "
+            "LIMIT 1", (oid,)).fetchone()
+        return r["detail"] if r is not None else ""
+    finally:
+        c.close()
+
+
+_saved_open25 = _ureq18.urlopen
+_saved_url25 = getattr(SR, "_RESEND_API_URL", None)
+_saved_tgbase25 = getattr(SR, "_TELEGRAM_API_BASE", None)
+_saved_dl25 = getattr(SR, "_GATED_SEND_DEADLINE", None)
+SR._GATED_SEND_DEADLINE = 2.0
+SR._TELEGRAM_API_BASE = _BASE25
+_ureq18.urlopen = _redirect25
+
+# N69 (1): HEADER dribble, threaded — the receipt send is
+#      parked inside urlopen's header phase (past the
+#      gate, holding _db_lock) while the server dribbles
+#      response headers byte-by-byte; an admin deletion
+#      attempted from another thread completes at the
+#      TOTAL deadline (released by the deadline cut inside
+#      the header phase — not by the ~6.5 s dribble), and
+#      the receipt does not land. Afterwards no durable
+#      state is attributable to the interrupted send.
+_point25("/hdr")
+_ARRIVED25["/hdr"].clear()
+_hits69 = _HITS25.get("/hdr", 0)
+o69 = mk_order("n69@test.dev", "Deep Scan", 29, status="PAID")
+row69 = row_of18(o69)
+_box69 = {}
+
+
+def _drive69():
+    _box69["t0"] = time.time()
+    _box69["r"] = SR._ensure_paid_receipt(row69, 2900)
+
+
+th69 = threading.Thread(target=_drive69)
+th69.start()
+_ARRIVED25["/hdr"].wait(10)
+_del69 = {}
+
+
+def _delete69():
+    _del69["code"] = admin_delete22(o69)
+    _del69["done"] = time.time()
+
+
+dth69 = threading.Thread(target=_delete69)
+dth69.start()
+th69.join(25)
+dth69.join(25)
+_el69 = _del69.get("done", 0) - _box69.get("t0", 0)
+check("N69 (1): header dribble over a real socket — the "
+      "gated receipt send is cut at the TOTAL deadline "
+      "inside the header phase; a waiting deletion "
+      "completes in the same envelope, the receipt does "
+      "not land, and no state remains attributable to "
+      "the interrupted send",
+      _del69.get("code") == 200
+      and 1.5 <= _el69 < 3.5
+      and _box69.get("r") is False
+      and _HITS25.get("/hdr", 0) == _hits69 + 1
+      and tombstone_of22(o69)
+      and email_state19(f"receipt:{o69}") is None
+      and count("events", "order_id=?", (o69,)) == 0)
+
+# N70 (1): CHUNK-FRAMING dribble, direct arm — the
+#      chunk-size line arrives byte-by-byte, inside
+#      http.client's chunk parsing (a single read1() from
+#      the wrapper's side): the gated send still returns
+#      at the TOTAL deadline, classified unknown.
+_point25("/chunk")
+_hits70 = _HITS25.get("/chunk", 0)
+o70 = mk_order("n70@test.dev", "Deep Scan", 29, status="PAID")
+_t070 = time.time()
+res70 = SR._gated_send(o70, SR.send_resend, "n70@test.dev",
+                       "Payment received — Deep Scan", "body")
+_el70 = time.time() - _t070
+check("N70 (1): chunk-framing dribble over a real socket "
+      "— gated send cut at the TOTAL deadline inside "
+      "chunk parsing, classified unknown, returned at "
+      "the deadline and not after the full dribble",
+      res70 is not None
+      and SR._send_status(res70) == "unknown"
+      and _HITS25.get("/chunk", 0) == _hits70 + 1
+      and 1.7 <= _el70 < 3.5)
+
+# N71 (1): ERROR-BODY dribble, Resend arm — a 422 arrives
+#      promptly but its body dribbles: the deadline cut
+#      inside the HTTPError body read classifies UNKNOWN
+#      (a possibly-accepted send with a lost answer),
+#      never the definite failure the status code alone
+#      would suggest, and returns at the deadline.
+_point25("/err")
+_hits71 = _HITS25.get("/err", 0)
+o71 = mk_order("n71@test.dev", "Deep Scan", 29, status="PAID")
+_t071 = time.time()
+res71 = SR._gated_send(o71, SR.send_resend, "n71@test.dev",
+                       "Payment received — Deep Scan", "body")
+_el71 = time.time() - _t071
+check("N71 (1): 4xx error-body dribble (Resend) — the "
+      "deadline cut inside the HTTPError body read "
+      "classifies unknown, not definite, at the deadline",
+      res71 is not None
+      and SR._send_status(res71) == "unknown"
+      and _HITS25.get("/err", 0) == _hits71 + 1
+      and 1.7 <= _el71 < 3.5)
+
+# N71 (2): ERROR-BODY dribble, Telegram arm — same shape:
+#      a 400 whose body dribbles is UNKNOWN at the
+#      deadline, not the definite ok:false/4xx failure.
+_hits71tg = _HITS25.get("/tgerr", 0)
+o71tg = mk_order("n71tg@test.dev", "Monitoring", 79,
+                 status="PAID")
+_t071tg = time.time()
+res71tg = SR._gated_send(o71tg, SR.send_telegram,
+                         "n71 telegram dribble probe")
+_el71tg = time.time() - _t071tg
+check("N71 (2): 4xx error-body dribble (Telegram) — the "
+      "deadline cut inside the HTTPError body read "
+      "classifies unknown, not definite, at the deadline",
+      res71tg is not None
+      and SR._send_status(res71tg) == "unknown"
+      and _HITS25.get("/tgerr", 0) == _hits71tg + 1
+      and 1.7 <= _el71tg < 3.5)
+
+# N71 (3): the receipt recovery treats a deadline-cut
+#      error body as a LOST ANSWER: the first-unknown
+#      stamp is recorded (the idempotency clock starts,
+#      the retry is deduped) and the failure event carries
+#      the unknown classification — not the 422's
+#      definite failure.
+_point25("/err")
+o71r = mk_order("n71r@test.dev", "Deep Scan", 29,
+                status="PAID")
+row71r = row_of18(o71r)
+r71r = SR._ensure_paid_receipt(row71r, 2900)
+st71r = email_state19(f"receipt:{o71r}")
+check("N71 (3): receipt recovery treats a deadline-cut "
+      "error body as a lost answer — first-unknown stamp "
+      "recorded and the failure event classified unknown, "
+      "not the definite 422",
+      r71r is False
+      and st71r is not None and st71r[0] is not None
+      and "transport outcome unknown"
+      in _failed_detail25(o71r))
+
+_ureq18.urlopen = _saved_open25
+for _attr25, _saved25 in (
+        ("_RESEND_API_URL", _saved_url25),
+        ("_TELEGRAM_API_BASE", _saved_tgbase25),
+        ("_GATED_SEND_DEADLINE", _saved_dl25)):
+    if _saved25 is None:
+        try:
+            delattr(SR, _attr25)
+        except AttributeError:
+            pass
+    else:
+        setattr(SR, _attr25, _saved25)
+_SRV25.shutdown()
+_SRV25.server_close()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

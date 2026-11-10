@@ -19,6 +19,8 @@ on every response.
 
 import contextvars
 import datetime
+import http.client
+import io
 import ipaddress
 import json
 import os
@@ -379,11 +381,7 @@ _MAIL_IDEM = contextvars.ContextVar("vf_mail_idem", default=None)
 # _db_lock far past 20 s. _gated_send therefore arms an
 # absolute deadline (this constant, seconds) in the
 # ContextVar below for the duration of the provider call,
-# and the two wrappers enforce it on their transport:
-# _send_urlopen shortens the per-operation timeout to
-# what is left of the deadline (and refuses to start once
-# it is spent), and _read_body_bounded reads the response
-# against the clock, cutting the read at the deadline.
+# and the two wrappers enforce it on their transport.
 # The cut surfaces inside the wrappers as a transport
 # exception, so their own tri-state machinery classifies
 # it — "unknown" (the provider may have accepted the
@@ -394,9 +392,55 @@ _MAIL_IDEM = contextvars.ContextVar("vf_mail_idem", default=None)
 # stub of them — are untouched, and a send outside
 # _gated_send (the unmatched-payment alert) arms no
 # deadline and behaves exactly as before.
+#
+# Round 25 (Codex delta-23): round 24 enforced the
+# deadline at the response-body read and shortened the
+# per-operation timeout — delta-23 showed that is not
+# phase-complete: a HEADER dribble inside urlopen and a
+# CHUNK-FRAMING dribble inside http.client's read1()
+# chunk parsing both outlived the deadline (each socket
+# operation prompt, the aggregate unbounded), and a
+# deadline cut inside an HTTPError body read was
+# swallowed by the wrappers' error arms and classified
+# by status instead of unknown. Enforcement now sits
+# BELOW http.client's parsing, on the raw socket: a
+# gated send's exchange runs through deadline-aware
+# http.client connection classes (swapped in for the
+# urlopen call only — see _send_urlopen) whose connected
+# socket is wrapped in _DeadlineSocket. Every blocking
+# socket operation — connect is separately capped by the
+# shortened urlopen timeout; request send, header read,
+# body read including chunk framing and trailers, error
+# body read — re-caps the socket timeout to what is left
+# of the deadline before it starts and refuses with
+# _SendDeadlineExceeded once the budget is spent, so no
+# single operation can END after the deadline and the
+# exchange as a whole is cut at the deadline (plus the
+# negligible processing between operations). Expiry is
+# the dedicated _SendDeadlineExceeded (a TimeoutError),
+# and both HTTPError arms classify it "unknown" — see
+# _deadline_blown. _read_body_bounded keeps its read1
+# clock-check loop as the layer for scripted transports
+# (which have no socket to shim) and routes HTTPError
+# bodies — addinfourl has no read1 and its read() ignores
+# a size argument — to the wrapped response's read1.
 _GATED_SEND_DEADLINE = 30.0
 _SEND_DEADLINE_AT = contextvars.ContextVar(
     "vf_send_deadline_at", default=None)
+
+# The providers' endpoints, as constants (round 25) so the
+# catalog can point the genuine wrappers at a local test
+# server; the values are the long-standing literals.
+_RESEND_API_URL = "https://api.resend.com/emails"
+_TELEGRAM_API_BASE = "https://api.telegram.org"
+
+
+class _SendDeadlineExceeded(TimeoutError):
+    """The armed gated-send deadline expired mid-exchange.
+    A TimeoutError subclass so every pre-existing timeout
+    handling keeps its shape; the dedicated type lets the
+    wrappers' HTTPError arms tell a deadline cut from an
+    ordinary body-read failure (delta-23 finding 3)."""
 
 
 def _send_deadline_remaining():
@@ -408,22 +452,247 @@ def _send_deadline_remaining():
     return at - time.monotonic()
 
 
+def _deadline_blown(exc):
+    """True when a transport failure IS the gated-send
+    deadline expiring: the dedicated exception, or a plain
+    socket TimeoutError raised by an operation whose
+    timeout the deadline had capped, observed once the
+    budget is spent."""
+    if isinstance(exc, _SendDeadlineExceeded):
+        return True
+    if isinstance(exc, TimeoutError):
+        remaining = _send_deadline_remaining()
+        return remaining is not None and remaining <= 0
+    return False
+
+
+class _DeadlineSocket:
+    """Delegating wrapper around a connected (possibly
+    TLS-wrapped) socket, installed by the deadline-aware
+    connection classes below for the duration of one gated
+    send's exchange. Before every blocking operation the
+    real socket's timeout is re-capped to what is left of
+    the armed deadline — min(20, remaining), preserving
+    the wrappers' long-standing per-operation ceiling —
+    and once the budget is spent the operation refuses
+    with _SendDeadlineExceeded. A socket timeout raised by
+    an operation the deadline had capped, observed with
+    the budget spent, is converted to _SendDeadlineExceeded.
+    Because an operation's timeout is set to the time
+    remaining at ITS start, no operation can end after
+    the deadline: the aggregate exchange is bounded by
+    the deadline in every phase http.client drives over
+    this socket — request send, status line and headers,
+    body (including the reads http.client's chunk parser
+    performs internally), and error bodies. With no
+    deadline armed IN THIS CONTEXT the wrapper delegates
+    everything untouched (it can be constructed around a
+    concurrent unarmed fetch's socket — see _send_urlopen
+    — and must then be behaviourally invisible)."""
+
+    def __init__(self, sock):
+        self._sock = sock
+        self._close_marked = False
+
+    def __getattr__(self, name):
+        if name in ("_sock", "_close_marked"):
+            raise AttributeError(name)
+        return getattr(self._sock, name)
+
+    def close(self):
+        # Deliberately does NOT close the real socket.
+        # urllib's do_open calls sock.close() on the
+        # connection's socket immediately after
+        # getresponse() and then keeps reading the body
+        # through the response: with a real socket that is
+        # safe because close() only marks it — the OS
+        # descriptor lives until the last makefile object
+        # is done (the socket's io refcount). The shim's
+        # own makefile creates no such refcount on the real
+        # socket, so a delegating close() here would kill
+        # the descriptor mid-response. The real close is
+        # deferred to _DeadlineRawIO.close() — the reader
+        # of record going away — and otherwise to the real
+        # socket's own deallocation once the shim is
+        # dropped; this call only records the mark, which
+        # is the whole observable contract (reads through
+        # the response are unaffected by it).
+        self._close_marked = True
+
+    def _cap(self):
+        """Re-cap the real socket's timeout to the budget
+        left; True when a deadline is armed in this
+        context. Raises _SendDeadlineExceeded once the
+        budget is spent."""
+        remaining = _send_deadline_remaining()
+        if remaining is None:
+            return False
+        if remaining <= 0:
+            raise _SendDeadlineExceeded(
+                "gated send deadline exceeded")
+        try:
+            self._sock.settimeout(min(20.0, remaining))
+        except Exception:
+            pass
+        return True
+
+    def _timed(self, fn, *args):
+        armed = self._cap()
+        try:
+            return fn(*args)
+        except TimeoutError:
+            if armed:
+                remaining = _send_deadline_remaining()
+                if remaining is not None and remaining <= 0:
+                    raise _SendDeadlineExceeded(
+                        "gated send deadline exceeded") \
+                        from None
+            raise
+
+    def recv(self, bufsize, flags=0):
+        return self._timed(self._sock.recv, bufsize, flags)
+
+    def recv_into(self, buffer, nbytes=0, flags=0):
+        return self._timed(self._sock.recv_into, buffer,
+                           nbytes, flags)
+
+    def send(self, data, flags=0):
+        return self._timed(self._sock.send, data, flags)
+
+    def sendall(self, data, flags=0):
+        # Manual loop over send() so every partial send is
+        # re-capped like every other operation (the real
+        # sendall would loop internally on one timeout).
+        view = memoryview(data)
+        total = 0
+        while total < len(view):
+            sent = self.send(view[total:], flags)
+            if sent == 0:
+                raise ConnectionError(
+                    "socket connection broken during a "
+                    "gated send")
+            total += sent
+
+    def settimeout(self, timeout):
+        # Plain delegation: the deadline re-caps before
+        # every operation regardless of what any caller
+        # set in between.
+        return self._sock.settimeout(timeout)
+
+    def makefile(self, mode="r", buffering=None, *,
+                 encoding=None, errors=None, newline=None):
+        if _send_deadline_remaining() is None \
+                or "r" not in mode:
+            return self._sock.makefile(
+                mode, buffering, encoding=encoding,
+                errors=errors, newline=newline)
+        # Armed: http.client reads the response through
+        # this buffered layer, whose every raw read is a
+        # deadline-capped recv_into on the shim — the
+        # funnel through which status line, headers and
+        # chunk parsing are all bounded.
+        raw = _DeadlineRawIO(self)
+        if buffering is not None and buffering == 0:
+            return raw
+        bufsize = io.DEFAULT_BUFFER_SIZE \
+            if buffering is None or buffering < 0 \
+            else buffering
+        return io.BufferedReader(raw, bufsize)
+
+
+class _DeadlineRawIO(io.RawIOBase):
+    """The raw layer under _DeadlineSocket.makefile: each
+    readinto is one recv_into on the shim, so a buffered
+    read1 keeps its at-most-one-socket-read meaning —
+    the property _read_body_bounded's clock-checked loop
+    relies on."""
+
+    def __init__(self, dsock):
+        self._dsock = dsock
+
+    def readable(self):
+        return True
+
+    def close(self):
+        # The reader of record is going away: this is
+        # where the real socket is actually closed (see
+        # _DeadlineSocket.close for why the connection's
+        # own close() call cannot do it).
+        try:
+            self._dsock._sock.close()
+        except Exception:
+            pass
+        super().close()
+
+    def readinto(self, b):
+        return self._dsock.recv_into(b)
+
+    def readinto1(self, b):
+        return self._dsock.recv_into(b)
+
+
+class _DeadlineHTTPConnection(http.client.HTTPConnection):
+    def connect(self):
+        super().connect()
+        self.sock = _DeadlineSocket(self.sock)
+
+
+class _DeadlineHTTPSConnection(http.client.HTTPSConnection):
+    def connect(self):
+        super().connect()
+        self.sock = _DeadlineSocket(self.sock)
+
+
+# Serializes the http.client class swap in _send_urlopen.
+# Gated sends already hold _db_lock for the whole call
+# (round 23), so two armed exchanges never overlap; the
+# lock makes the swap's own invariant local rather than
+# derived from that fact.
+_send_swap_lock = threading.Lock()
+
+
 def _send_urlopen(req):
     """urlopen for the provider wrappers: the long-standing
     20 s per-operation timeout, shortened to whatever is
     left of the gated-send deadline when one is armed —
     and a refusal to start once it is spent (the
-    TimeoutError lands in the wrappers' own exception arm
-    and classifies as "unknown")."""
+    _SendDeadlineExceeded lands in the wrappers' own
+    exception arm and classifies as "unknown").
+
+    Unarmed, this is exactly the long-standing plain
+    urlopen call. Armed, the exchange additionally runs
+    through the deadline-aware http.client connection
+    classes for this call only: urllib's handlers resolve
+    http.client.HTTPConnection / HTTPSConnection at call
+    time, so the classes are swapped in around the call
+    and restored in the finally — the global urlopen entry
+    point (and every stub of it) is untouched, and the
+    connection the handlers build wraps its socket in
+    _DeadlineSocket at connect time. The swap window is
+    the urlopen call itself (headers included); the
+    shimmed socket outlives it inside the connection. A
+    concurrent unarmed fetch constructed inside the
+    window gets a shim whose context has no deadline
+    armed and which therefore delegates everything
+    untouched."""
     remaining = _send_deadline_remaining()
     if remaining is None:
         return urllib.request.urlopen(req, timeout=20)
     if remaining <= 0:
-        raise TimeoutError(
+        raise _SendDeadlineExceeded(
             "gated send deadline already spent before the "
             "provider call started")
-    return urllib.request.urlopen(
-        req, timeout=min(20, remaining))
+    with _send_swap_lock:
+        saved = (http.client.HTTPConnection,
+                 http.client.HTTPSConnection)
+        http.client.HTTPConnection = _DeadlineHTTPConnection
+        http.client.HTTPSConnection = _DeadlineHTTPSConnection
+        try:
+            return urllib.request.urlopen(
+                req, timeout=min(20, remaining))
+        finally:
+            http.client.HTTPConnection = saved[0]
+            http.client.HTTPSConnection = saved[1]
 
 
 def _send_socket(stream):
@@ -459,20 +728,21 @@ def _read_body_bounded(stream):
     between socket reads) with the socket's own timeout
     tightened to the time remaining: a body still
     dribbling when the deadline passes is CUT, and the
-    TimeoutError propagates into the calling wrapper's
-    exception arm, which classifies it "unknown". A
-    stream with no read1 (an in-memory or scripted body —
-    never a real socket) is read in one call, as before,
-    after the same spent-deadline refusal."""
+    _SendDeadlineExceeded propagates into the calling
+    wrapper's exception arm, which classifies it
+    "unknown". Round 25: for a REAL response the socket
+    beneath is _DeadlineSocket, whose per-operation caps
+    are the primary enforcement (including the reads
+    http.client's chunk parser performs inside one read1
+    call — delta-23 finding 2); this loop's clock checks
+    remain the layer for scripted transports, which have
+    no socket to shim. A stream with no read1 is handled
+    by _read_body_no_read1."""
     if _SEND_DEADLINE_AT.get() is None:
         return stream.read()
     read1 = getattr(stream, "read1", None)
     if not callable(read1):
-        if _send_deadline_remaining() <= 0:
-            raise TimeoutError(
-                "gated send deadline spent before the "
-                "provider response could be read")
-        return stream.read()
+        return _read_body_no_read1(stream)
     sock = _send_socket(stream)
     chunks = []
     while True:
@@ -481,7 +751,7 @@ def _read_body_bounded(stream):
             chunks.append(stream.read())
             break
         if remaining <= 0:
-            raise TimeoutError(
+            raise _SendDeadlineExceeded(
                 "gated send deadline exceeded while "
                 "reading the provider response")
         if sock is not None:
@@ -494,6 +764,32 @@ def _read_body_bounded(stream):
             break
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _read_body_no_read1(stream):
+    """_read_body_bounded for a stream with no usable read1.
+    An HTTPError (the wrappers' error-body case) has no
+    usable read1 and its read() ignores a size argument —
+    but its .fp IS the real response: read THAT through
+    the read1 path, so an error body is bounded exactly
+    like a success body (that detour is what removes the
+    one unchecked-duration network read delta-23 named:
+    the HTTPError body was the only read1-less body backed
+    by a socket). Any OTHER read1-less stream is an
+    in-memory or scripted body — never a real socket (see
+    _send_socket) — read in the one long-standing call, as
+    rounds 18–24 certified, after the same spent-deadline
+    refusal; there is no socket operation beneath it for
+    the deadline to bound."""
+    inner = getattr(stream, "fp", None)
+    if inner is not None and inner is not stream \
+            and callable(getattr(inner, "read1", None)):
+        return _read_body_bounded(inner)
+    if _send_deadline_remaining() <= 0:
+        raise _SendDeadlineExceeded(
+            "gated send deadline spent before the "
+            "provider response could be read")
+    return stream.read()
 
 
 def send_resend(to, subject, text, html=None):
@@ -518,7 +814,7 @@ def send_resend(to, subject, text, html=None):
     if idem:
         headers["Idempotency-Key"] = idem
     req = urllib.request.Request(
-        "https://api.resend.com/emails", data=payload, method="POST",
+        _RESEND_API_URL, data=payload, method="POST",
         headers=headers)
     try:
         with _send_urlopen(req) as resp:
@@ -547,7 +843,20 @@ def send_resend(to, subject, text, html=None):
         try:
             detail = _read_body_bounded(e).decode(
                 "utf-8", "replace")[:300]
-        except Exception:
+        except Exception as ex:
+            # Round 25 (Codex delta-23 finding 3): a
+            # deadline cut inside the error-body read is a
+            # lost answer, not evidence about acceptance —
+            # it classifies "unknown", never the definite
+            # failure the status code alone would suggest.
+            # Every other body-read failure keeps the
+            # long-standing empty-detail behaviour.
+            if _deadline_blown(ex):
+                return _SendOutcome(
+                    False,
+                    "gated send deadline exceeded while "
+                    "reading the provider error response",
+                    "unknown")
             detail = ""
         status = "failed" if 400 <= e.code < 500 else "unknown"
         return _SendOutcome(False, f"HTTP {e.code}: {detail}", status)
@@ -570,7 +879,7 @@ def send_telegram(text):
     data = urllib.parse.urlencode(
         {"chat_id": TELEGRAM_CHAT_ID, "text": text}).encode()
     req = urllib.request.Request(
-        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+        f"{_TELEGRAM_API_BASE}/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
         data=data, method="POST")
     try:
         with _send_urlopen(req) as resp:
@@ -605,7 +914,17 @@ def send_telegram(text):
             ok_flag = parsed.get("ok")
             detail = str(parsed.get("description", "")) \
                 or f"HTTP {e.code}"
-        except Exception:
+        except Exception as ex:
+            # Round 25 (Codex delta-23 finding 3): as in
+            # send_resend — a deadline cut inside the
+            # error-body read classifies "unknown", never
+            # the definite failure the status suggests.
+            if _deadline_blown(ex):
+                return _SendOutcome(
+                    False,
+                    "gated send deadline exceeded while "
+                    "reading the provider error response",
+                    "unknown")
             detail = f"HTTP {e.code}"
         if e.code >= 500:
             return _SendOutcome(False, detail, "unknown")
@@ -3816,14 +4135,19 @@ def _gated_send(order_id, send_fn, *args, **kwargs):
     bounded BY CONSTRUCTION, not by the wrappers'
     per-operation timeout — _GATED_SEND_DEADLINE (30 s) is
     armed below for the duration of the call and the
-    wrappers enforce it on their transport (see
-    _send_urlopen / _read_body_bounded beside _MAIL_IDEM):
-    a call still in flight when the deadline passes is cut
-    there, its outcome classified "unknown" by the
-    wrappers' own machinery, and this section exits —
-    releasing the lock, and with it the waiting delete, at
-    the deadline at the latest. Returns None when the gate
-    aborts; otherwise the send function's own result."""
+    wrappers enforce it on their transport: a call still
+    in flight when the deadline passes is cut there, its
+    outcome classified "unknown" by the wrappers' own
+    machinery, and this section exits — releasing the
+    lock, and with it the waiting delete, at the deadline
+    at the latest. Round 25 (Codex delta-23): the
+    enforcement sits on the exchange's raw socket
+    (_DeadlineSocket, beside _MAIL_IDEM), so the cut
+    lands in EVERY phase — headers and chunk framing
+    included — and a cut inside an HTTPError body read
+    also classifies "unknown", never definite. Returns
+    None when the gate aborts; otherwise the send
+    function's own result."""
     with _db_lock:
         if _order_dead(order_id):
             return None
