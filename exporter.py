@@ -74,6 +74,44 @@ def log(msg):
     print(f"[exporter] {msg}", file=sys.stderr, flush=True)
 
 
+def _safe_log(msg):
+    """log() that can never raise. Used by run_loop's own
+    machinery (setup and handler), where a failing logger must
+    neither terminate the loop nor prevent it from starting.
+    BaseExceptions (KeyboardInterrupt / SystemExit) still
+    propagate — only ordinary Exceptions are swallowed."""
+    try:
+        log(msg)
+    except Exception:
+        pass
+
+
+def _recovery_wait(stop_event=None):
+    """The loop's rate guarantee for failed iterations: a
+    MONOTONIC-DEADLINE wait. The deadline is RECOVERY_SLEEP_SEC
+    of wall clock from now; small sleep attempts (at most 0.1s
+    each) are made until the deadline passes, and every failed
+    attempt is swallowed — so the wait consumes its full
+    wall-clock delay no matter how the sleep primitive itself
+    behaves (a sleep that raises immediately on every call
+    cannot bypass it). Returns early only if stop_event is
+    set. BaseExceptions from a sleep attempt (KeyboardInterrupt
+    / SystemExit) still propagate."""
+    deadline = time.monotonic() + RECOVERY_SLEEP_SEC
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        try:
+            if stop_event is not None:
+                if stop_event.wait(min(remaining, 0.1)):
+                    return
+            else:
+                time.sleep(min(remaining, 0.1))
+        except Exception:
+            pass
+
+
 def _env(name, default):
     v = os.environ.get(name)
     return v if v not in (None, "") else default
@@ -386,12 +424,30 @@ def run_loop(cfg, stop_event=None):
     """Poll forever (or until stop_event is set). No exception
     terminates the loop: pass failures back off via
     backoff_delay (exponent capped before exponentiation), and
-    an outermost guard catches anything else, logs it, sleeps,
-    and continues. KeyboardInterrupt / SystemExit still exit —
-    they are BaseExceptions, not caught here."""
+    an outermost guard catches anything else, logs it, waits
+    out a recovery deadline, and continues. The setup is part
+    of the protected structure: sanitization runs under a
+    guard (its own logging may fail — a failing logger there
+    falls back to the default interval, it cannot prevent the
+    loop), and EVERY log call in this function's own machinery
+    goes through _safe_log, which can never raise. The
+    handler's recovery wait is _recovery_wait — a
+    monotonic-deadline wait — so ANY exception inside an
+    iteration (the pass, the interval wait, the backoff sleep)
+    lands in the same handler, and every failed iteration is
+    guaranteed its wall-clock recovery delay no matter how
+    the sleep primitive behaves. KeyboardInterrupt /
+    SystemExit still exit — they are BaseExceptions, not
+    caught here."""
     failures = 0
-    poll_sec = sanitize_poll_sec(cfg.get("poll_sec",
-                                         DEFAULT_POLL_SEC))
+    try:
+        poll_sec = sanitize_poll_sec(cfg.get("poll_sec",
+                                             DEFAULT_POLL_SEC))
+    except Exception:
+        # Sanitization failed (e.g. its log call raised because
+        # the logger is broken): fall back to the default
+        # interval — setup can never prevent the loop.
+        poll_sec = DEFAULT_POLL_SEC
     while stop_event is None or not stop_event.is_set():
         try:
             try:
@@ -399,35 +455,28 @@ def run_loop(cfg, stop_event=None):
                                     cfg["inbox_dir"],
                                     cfg["ledger_path"])
                 if stats["exported"] or stats["errors"]:
-                    log(f"pass: {stats}")
+                    _safe_log(f"pass: {stats}")
                 failures = 0
                 wait = poll_sec
             except Exception as e:
                 failures += 1
                 wait = backoff_delay(poll_sec, failures)
-                log(f"pass failed ({e!r}); retrying in {wait:.1f}s")
+                _safe_log(f"pass failed ({e!r}); retrying in "
+                          f"{wait:.1f}s")
             if stop_event is not None:
                 stop_event.wait(wait)
             else:
                 time.sleep(wait)
         except Exception as e:
-            # The handler itself is guarded: its log call may
-            # fail (that may be WHY we are here — a failing log
-            # inside the pass), and its recovery sleep uses a
-            # small constant that cannot overflow. Whatever the
-            # handler's own failures, the loop still sleeps and
-            # continues — it never spins and never dies here.
-            try:
-                log(f"unexpected loop error ({e!r}); continuing")
-            except Exception:
-                pass
-            try:
-                if stop_event is not None:
-                    stop_event.wait(RECOVERY_SLEEP_SEC)
-                else:
-                    time.sleep(RECOVERY_SLEEP_SEC)
-            except Exception:
-                pass
+            # The handler itself cannot die and cannot spin:
+            # its log call goes through _safe_log (which never
+            # raises — a failing log inside the pass may be WHY
+            # we are here), and its recovery wait is the
+            # monotonic-deadline _recovery_wait, the single
+            # rate guarantee for failed iterations.
+            _safe_log(f"unexpected loop error ({e!r}); "
+                      f"continuing")
+            _recovery_wait(stop_event)
 
 
 def main():

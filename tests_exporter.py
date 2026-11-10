@@ -547,6 +547,118 @@ def main():
           "only via KeyboardInterrupt",
           ki_raised and sleep_calls["n"] >= 4)
 
+    # ---- (o) the recovery wait cannot be bypassed: if the
+    #           sleep primitive raises IMMEDIATELY on every
+    #           call, a failed iteration must still consume
+    #           its wall-clock recovery delay (the recovery
+    #           wait is a monotonic-deadline wait that keeps
+    #           attempting small sleeps, swallowing their
+    #           failures, until the deadline passes) — never
+    #           a busy spin. export_once raises on every pass;
+    #           over a ~2.2s window the number of passes must
+    #           stay small. (On the pre-round-4 loop the same
+    #           setup spins through thousands of passes.)
+    dirO = os.path.join(tmp, "caseO")
+    os.makedirs(dirO)
+    cfgO = {"db_path": os.path.join(dirO, "site.db"),
+            "inbox_dir": os.path.join(dirO, "inbox"),
+            "ledger_path": os.path.join(dirO, "ledger.json"),
+            "poll_sec": 5}
+    real_export_once = exporter.export_once
+    real_sleep_o = time.sleep
+    pass_calls = {"n": 0}
+    stop_now_o = threading.Event()
+    loop_end_o = {}
+
+    def failing_pass(db_path, inbox_dir, ledger_path):
+        pass_calls["n"] += 1
+        raise RuntimeError("simulated pass failure")
+
+    def raising_sleep_o(sec):
+        if stop_now_o.is_set():
+            raise KeyboardInterrupt
+        raise RuntimeError("simulated sleep failure")
+
+    def loop_thread_o():
+        try:
+            exporter.run_loop(cfgO)
+            loop_end_o["how"] = "returned"
+        except KeyboardInterrupt:
+            loop_end_o["how"] = "KeyboardInterrupt"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_o["how"] = f"other:{e!r}"
+
+    exporter.export_once = failing_pass
+    time.sleep = raising_sleep_o
+    th_o = threading.Thread(target=loop_thread_o, daemon=True)
+    try:
+        th_o.start()
+        real_sleep_o(2.2)
+        passes_in_window = pass_calls["n"]
+    finally:
+        stop_now_o.set()
+        th_o.join(timeout=5)
+        exporter.export_once = real_export_once
+        time.sleep = real_sleep_o
+    check("(o) a recovery/interval sleep that raises "
+          "immediately on every call cannot spin the loop: "
+          "over a 2.2s window of always-failing passes the "
+          "pass count stays <= 5 (each failed iteration waits "
+          "out its monotonic recovery deadline), and the loop "
+          "still exits via KeyboardInterrupt",
+          passes_in_window <= 5
+          and loop_end_o.get("how") == "KeyboardInterrupt"
+          and not th_o.is_alive())
+
+    # ---- (p) setup is inside the guard: a logger that raises
+    #           on EVERY call, combined with an invalid poll
+    #           config (so startup sanitization itself wants
+    #           to log), cannot prevent run_loop from entering
+    #           its loop — sanitization runs inside the
+    #           protected structure and every log call in
+    #           run_loop's own machinery goes through a
+    #           never-raising wrapper. Exit is via a patched
+    #           sleep raising KeyboardInterrupt after a few
+    #           iterations. (On the pre-round-4 loop,
+    #           run_loop died during setup sanitization.)
+    dirP = os.path.join(tmp, "caseP")
+    os.makedirs(dirP)
+    cfgP = {"db_path": os.path.join(dirP, "site.db"),
+            "inbox_dir": os.path.join(dirP, "missing-inbox"),
+            "ledger_path": os.path.join(dirP, "ledger.json"),
+            "poll_sec": "not-a-number"}
+    real_log_p = exporter.log
+    real_sleep_p = time.sleep
+    sleep_calls_p = {"n": 0}
+
+    def raising_log_p(msg):
+        raise RuntimeError("simulated logging failure")
+
+    def counting_sleep_p(sec):
+        sleep_calls_p["n"] += 1
+        if sleep_calls_p["n"] >= 4:
+            raise KeyboardInterrupt
+
+    exporter.log = raising_log_p
+    time.sleep = counting_sleep_p
+    ki_p = False
+    other_p = False
+    try:
+        exporter.run_loop(cfgP)
+    except KeyboardInterrupt:
+        ki_p = True
+    except Exception:
+        other_p = True
+    finally:
+        exporter.log = real_log_p
+        time.sleep = real_sleep_p
+    check("(p) run_loop enters and completes iterations even "
+          "when the logger raises on every call AND the poll "
+          "config is invalid (startup sanitization logs): no "
+          "exception escapes setup, iterations proceed, and "
+          "the loop exits only via KeyboardInterrupt",
+          ki_p and not other_p and sleep_calls_p["n"] >= 4)
+
     failed = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(failed)}/{len(PASS)} exporter checks pass")
     if failed:

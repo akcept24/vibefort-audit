@@ -39,10 +39,12 @@ same name, same bytes, harmless. A changed payload (hash
 mismatch) re-exports. An inbox-side fsync failure (file or
 directory) *fails that row's export*: no ledger entry is
 written, and the row is retried on a later pass (durability is
-never recorded as established when it was not). A **ledger**
-directory fsync failure is the one case where an entry can
-become visible without being durable, because it happens
-after the atomic replace: that export still counts as FAILED,
+never recorded as established when it was not). A failure of the
+**ledger** post-replace directory durability step (opening,
+fsyncing and closing the directory after the replace) is the
+one case where an entry can become visible without being
+durable, because it happens after the atomic replace: that
+export still counts as FAILED,
 and the entry is held in an in-memory **suspect set** for the
 life of the process. A suspect entry is trusted (skipped) only
 when the skip decision sees the inbox file present with a
@@ -54,18 +56,26 @@ window (ledger entry survives on disk, inbox file does not),
 followed by a process restart, can still lose that one export
 — the restarted exporter sees a normal-looking ledger entry
 and skips the row. The window is bounded to the ledger
-directory-fsync failure itself, and any *observed* fsync
-failure (the exporter still running) is fully covered by the
-suspect mechanism above. Errors are logged and the loop
-continues with capped backoff: the backoff exponent is capped
-before exponentiation, the poll interval is sanitized at
-startup (invalid values fall back to 15s; huge finite values
-are clamped to a 3600s maximum, so no value can make
-`time.sleep` overflow), and an outermost guard catches any
-other exception — with its own log call and recovery sleep
-themselves guarded, so even a failing logger cannot kill or
-spin the loop. No failure count and no bad config value can
-terminate the exporter. The exporter never creates the inbox
+directory durability-step failure itself, and any *observed*
+durability-step failure (the exporter still running) is
+fully covered by the suspect mechanism above. Errors are
+logged and the loop continues with capped backoff: the
+backoff exponent is capped before exponentiation, the poll
+interval is sanitized at startup (invalid values fall back
+to 15s; huge finite values are clamped to a 3600s maximum,
+so no value can make `time.sleep` overflow), and an
+outermost guard catches any other exception from an
+iteration (the pass, the interval wait, the backoff sleep).
+A failed iteration always waits out its recovery deadline:
+the handler's recovery wait is a monotonic-deadline wait
+that keeps attempting small sleeps, swallowing their
+failures, until the deadline passes — so no failure of the
+sleep primitive itself can make the loop spin. Logging
+failures inside run_loop's own machinery cannot kill it
+either: startup sanitization runs inside the guarded
+structure, and every log call in run_loop's machinery goes
+through a never-raising wrapper. No failure count and no
+bad config value can terminate the exporter. The exporter never creates the inbox
 directory (a missing mount must stay a visible, logged retry —
 not a silently created local folder).
 
