@@ -2119,6 +2119,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             self._send_json(400, {"ok": False, "error": "bad id"})
             return
+        fr_left = None
         with _db_lock:
             conn = db_connect()
             try:
@@ -2145,6 +2146,25 @@ class Handler(BaseHTTPRequestHandler):
                         conn.execute(
                             "DELETE FROM stripe_events WHERE "
                             "order_id=?", (oid,))
+                        # Round 20: a fulfilment request still
+                        # in its queued (unconsumed) state goes
+                        # in the same transaction too — the
+                        # engine worker must never be offered
+                        # work for an order that no longer
+                        # exists. A row in any other status was
+                        # already picked up by the worker: it is
+                        # left standing (cancelling it from here
+                        # would fake a cancellation that did not
+                        # happen) and the fact is logged after
+                        # the commit, below.
+                        conn.execute(
+                            "DELETE FROM fulfilment_requests WHERE "
+                            "order_id=? AND status='queued'", (oid,))
+                        frow = conn.execute(
+                            "SELECT status FROM fulfilment_requests "
+                            "WHERE order_id=?", (oid,)).fetchone()
+                        if frow is not None:
+                            fr_left = frow[0]
                 elif kind == "scans":
                     cur = conn.execute("DELETE FROM scans WHERE id=?",
                                        (oid,))
@@ -2161,6 +2181,11 @@ class Handler(BaseHTTPRequestHandler):
                                   "error": f"no such {kind[:-1]}"})
             return
         log(f"admin deleted {kind[:-1]} id={oid}")
+        if fr_left is not None:
+            log(f"admin deleted order id={oid}: fulfilment "
+                f"request already {fr_left} — picked up by the "
+                f"engine worker; left standing, not cancelled "
+                f"from here")
         self._send_json(200, {"ok": True, "deleted": oid})
 
     # -- /api/brief ---------------------------------------------------------------
@@ -2625,7 +2650,13 @@ def sweep_paid_side_effects():
     """Boot sweep: every PAID order gets its side-effect completion
     verified (and re-fired if missing), and
     every matched Stripe event gets its receipt email verified (and
-    resent if it never landed). Idempotent; runs once at startup."""
+    resent if it never landed). Idempotent; runs once at startup
+    and, since round 20, again on every production scheduler
+    tick (_monitor_tick) — receipts are a pending paid
+    side-effect state like the notifications round 19 wired
+    into the tick, and driving them only at boot left an
+    unknown-outcome receipt dormant once the webhook's own
+    retries were exhausted."""
     conn = db_connect()
     conn.row_factory = sqlite3.Row
     try:
@@ -3202,7 +3233,12 @@ def _ensure_paid_receipt(order, amount_cents):
     observes the claim and no-ops (it reports the on-record
     state). The claim only ever transitions a row that already
     exists in the unconfirmed state — it creates no row, so
-    A5's lifecycle is untouched."""
+    A5's lifecycle is untouched.
+
+    Round 20: the sweep whose event loop drives this function
+    now runs on every production scheduler tick as well as at
+    boot (see _monitor_tick), so a pending receipt no longer
+    waits for a webhook retry, a consult, or a restart."""
     if _receipt_logged(order["id"]):
         return True
     key = f"receipt:{order['id']}"
@@ -4214,7 +4250,21 @@ def _monitor_tick():
     (a definite Telegram rejection, healed minutes later)
     could wait for a restart that might never come (Codex
     delta-18 (c1)). The tick is separately callable so the
-    wiring itself is pinnable in the catalog."""
+    wiring itself is pinnable in the catalog.
+
+    Round 20: the tick ALSO runs the paid-side-effects sweep
+    (sweep_paid_side_effects — the same function main() runs
+    at startup, unmodified) in its own isolation leg between
+    the monitor runs and the driver. Round 19 wired only the
+    notification driver in here; pending RECEIPTS were still
+    driven solely by webhook consults and the startup sweep,
+    so a receipt whose outcome went unknown could sit dormant
+    once Stripe's webhook retries were exhausted — its
+    bounded post-window attempt (round 19) never made until
+    someone opened the order or the process restarted. The
+    sweep's own tail already drives pending notifications, so
+    the driver leg below remains as the final resolver; both
+    are idempotent."""
     try:
         with _db_lock:
             conn = db_connect()
@@ -4228,6 +4278,10 @@ def _monitor_tick():
             _run_monitor(dict(mon), scheduled=True)
     except Exception as e:
         log(f"monitor loop error: {e!r}")
+    try:
+        sweep_paid_side_effects()
+    except Exception as e:
+        log(f"paid side-effects sweep error: {e!r}")
     try:
         _drive_pending_notifications()
     except Exception as e:

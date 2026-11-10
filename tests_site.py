@@ -2895,6 +2895,200 @@ check("N32 (d): racing receipt reconciles -> one record, "
 
 _ureq18.urlopen = _real_urlopen18
 
+# ---- Round 20 catalog (added 2026-11-10: the periodic tick
+#      also drives the paid-side-effects sweep; the admin
+#      order-delete cancels a still-queued fulfilment
+#      request) ----
+# Round 19's final semantics said the durable pending states
+# are driven status-independently, and its (c1) wired the
+# pending-NOTIFICATION driver into the production tick — but
+# pending RECEIPTS were still driven only by webhook consults
+# and the startup sweep, so a receipt whose outcome went
+# unknown could sit dormant after Stripe's webhook retries
+# were exhausted, its bounded post-window attempt never made
+# until someone opened the order (the same statement-vs-
+# wiring gap delta-18 (c1) caught for pings). And the round-19
+# (c2) delete cleanup left a deleted order's
+# fulfilment_requests row behind, still offered to the engine
+# worker. The pins below continue the N-block (N33+).
+_ureq18.urlopen = PROV19.urlopen
+
+
+def _paid_linked20(email, pi):
+    """A Deep Scan order taken PAID by a proven Stripe link:
+    the stripe_events row the sweep's receipt loop judges is
+    inserted first, then the production transition fires with
+    the winning event's identity, exactly as the webhook
+    drives it."""
+    oid = mk_order(email, "Deep Scan", 29)
+    c = db()
+    c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+              "received_at,payment_intent,amount) "
+              "VALUES(?,?,?,?,?,?)",
+              (f"evt_{pi}", "checkout.session.completed", oid,
+               SR.utcnow(), pi, 2900))
+    c.commit()
+    c.close()
+    SR.transition_order_status(row_of18(oid), "PAID",
+                               paid_event_id=f"evt_{pi}",
+                               paid_pi=pi)
+    return oid
+
+
+def _park_monitors20():
+    """Idle the tick's monitor half (every monitor parked far
+    in the future), as pin N26 does, so only the sweep/driver
+    legs can act."""
+    c = db()
+    c.execute("UPDATE monitors SET next_run_at=?",
+              (time.time() + 10 ** 9,))
+    c.commit()
+    c.close()
+
+
+# N33 (item 1): a receipt pending on an already-advanced
+#      order — first outcome UNKNOWN, channel then healed —
+#      is delivered by invoking ONLY the production tick: no
+#      webhook, no consult, no startup sweep is called by
+#      the pin. One logical delivery under the same
+#      idempotency key, as in round 19's N22.
+o33 = _paid_linked20("n33@test.dev", "pi_n33")
+PROV19.mail_mode = "accept-lost"
+r33a = SR._ensure_paid_receipt(row_of18(o33), 2900)
+SR.transition_order_status(row_of18(o33), "IN_PROGRESS")
+_park_monitors20()
+PROV19.mail_mode = "ok"
+SR._monitor_tick()
+keys33 = PROV19.mail_keys_to("n33@test.dev")
+check("N33 (r20): tick alone delivers the pending receipt "
+      "on an advanced order, same key, one delivery",
+      r33a is False
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o33,)) == 1
+      and len(keys33) == 2
+      and keys33[0] == keys33[1] == f"receipt:{o33}"
+      and PROV19.mail_delivered_count("n33@test.dev") == 1)
+
+# N34 (item 1): the same pending receipt, recovered by the
+#      tick alone PAST the 23h safe window (the first unknown
+#      outcome was stamped 25h ago): the tick makes the
+#      round-19 bounded attempt — exactly one further same-key
+#      resend — and the receipt settles as sent-unconfirmed
+#      whatever its outcome (here the bounded attempt's answer
+#      is lost too); a second tick attempts nothing.
+o34 = _paid_linked20("n34@test.dev", "pi_n34")
+PROV19.mail_mode = "accept-lost"
+r34a = SR._ensure_paid_receipt(row_of18(o34), 2900)
+shift_unknown19(f"receipt:{o34}", time.time() - 25 * 3600)
+SR.transition_order_status(row_of18(o34), "IN_PROGRESS")
+_park_monitors20()
+SR._monitor_tick()
+st34 = email_state19(f"receipt:{o34}")
+keys34a = PROV19.mail_keys_to("n34@test.dev")
+SR._monitor_tick()
+keys34b = PROV19.mail_keys_to("n34@test.dev")
+PROV19.mail_mode = "ok"
+check("N34 (r20): tick past window: one bounded same-key "
+      "resend, settled, second tick attempts nothing",
+      r34a is False
+      and len(keys34a) == 2
+      and keys34a[0] == keys34a[1] == f"receipt:{o34}"
+      and PROV19.mail_delivered_count("n34@test.dev") == 1
+      and st34 is not None and st34[1] == 1 and st34[2] == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o34,)) == 1
+      and len(keys34b) == 2)
+
+# N35 (item 1): the sweep leg inside the tick is exception-
+#      isolated exactly like the driver leg (round 19's N27
+#      discipline): a raising sweep neither escapes the tick
+#      nor starves the pending-notification driver, which
+#      still resolves a pending ping in the same tick. The
+#      call counter pins the wiring itself — before round 20
+#      the tick never invoked the sweep at all.
+o35 = mk_order("n35@test.dev", "Deep Scan", 29)
+PROV19.tg_mode = "http4xx"
+SR.transition_order_status(row_of18(o35), "PAID")
+SR.transition_order_status(row_of18(o35), "IN_PROGRESS")
+_park_monitors20()
+PROV19.tg_mode = "ok"
+_real_sweep20 = SR.sweep_paid_side_effects
+_calls35 = []
+
+
+def _boom_sweep20():
+    _calls35.append(1)
+    raise RuntimeError("simulated sweep failure (pin N35)")
+
+
+SR.sweep_paid_side_effects = _boom_sweep20
+esc35 = False
+try:
+    SR._monitor_tick()
+except Exception:
+    esc35 = True
+SR.sweep_paid_side_effects = _real_sweep20
+check("N35 (r20): raising sweep isolated in the tick; the "
+      "driver still delivers the pending ping",
+      not esc35 and len(_calls35) == 1
+      and len(PROV19.tg_pings(o35)) == 1)
+
+# N36 (item 2): admin delete of a paid Deep Scan order whose
+#      fulfilment request is still queued removes the request
+#      in the same transaction — the register the engine
+#      worker consumes no longer contains it.
+o36 = mk_order("n36@test.dev", "Deep Scan", 29)
+SR.transition_order_status(row_of18(o36), "PAID")
+q36 = count("fulfilment_requests",
+            "order_id=? AND status='queued'", (o36,))
+SR.ADMIN_TOKEN = "catalog-admin"
+fs20a = FakeSelf19()
+SR.Handler._api_admin_delete(fs20a, f"/api/orders/{o36}")
+check("N36 (r20): admin delete cancels the queued "
+      "fulfilment request",
+      q36 == 1
+      and fs20a.replies[-1][0] == 200
+      and count("orders", "id=?", (o36,)) == 0
+      and count("fulfilment_requests", "order_id=?", (o36,)) == 0)
+
+# N37 (item 2): the same delete when the worker has ALREADY
+#      picked the request up — a non-queued status, written
+#      directly here as the worker's side of the contract
+#      writes it ('processing'): the row is left standing and
+#      the delete path logs that fact; no cancellation is
+#      faked for a fulfilment that may already be running.
+o37 = mk_order("n37@test.dev", "Deep Scan", 29)
+SR.transition_order_status(row_of18(o37), "PAID")
+c = db()
+c.execute("UPDATE fulfilment_requests SET status='processing' "
+          "WHERE order_id=?", (o37,))
+c.commit()
+c.close()
+LOG37 = []
+_real_log37 = SR.log
+
+
+def _cap_log37(msg):
+    LOG37.append(msg)
+    return _real_log37(msg)
+
+
+SR.log = _cap_log37
+fs20b = FakeSelf19()
+SR.Handler._api_admin_delete(fs20b, f"/api/orders/{o37}")
+SR.log = _real_log37
+check("N37 (r20): delete leaves an in-flight fulfilment "
+      "request standing and logs the fact",
+      fs20b.replies[-1][0] == 200
+      and count("orders", "id=?", (o37,)) == 0
+      and count("fulfilment_requests",
+                "order_id=? AND status='processing'",
+                (o37,)) == 1
+      and any("fulfilment" in m and "left standing" in m
+              and f"id={o37}" in m for m in LOG37))
+
+_ureq18.urlopen = _real_urlopen18
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
