@@ -1429,19 +1429,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self._stripe_process(event, session)
         except Exception as e:
-            # Roll the dedupe record back so Stripe's retry reprocesses
-            # the event from scratch, and answer 500 so it does retry.
+            # The dedupe rollback already happened inside the webhook
+            # lock (see _stripe_process); here we only answer 500 so
+            # Stripe retries the event from scratch.
             log(f"stripe webhook processing failed for {eid}: {e!r}")
-            try:
-                with _db_lock:
-                    conn = db_connect()
-                    conn.execute(
-                        "DELETE FROM stripe_events WHERE event_id=? "
-                        "AND order_id IS NULL", (eid,))
-                    conn.commit()
-                    conn.close()
-            except Exception:
-                pass
             self._send_json(500, {"ok": False, "error": "processing"})
 
     def _stripe_process(self, event, session):
@@ -1451,7 +1442,27 @@ class Handler(BaseHTTPRequestHandler):
         # NEW order (Codex delta-5 finding 1). Payment volume is
         # small; correctness beats parallelism here.
         with _webhook_lock:
-            self._stripe_process_locked(event, session)
+            try:
+                self._stripe_process_locked(event, session)
+            except Exception:
+                # Roll the dedupe record back INSIDE the lock: a
+                # concurrent retry of the same event must never be
+                # mid-processing on a row that disappears under it
+                # (Codex delta-6 finding 1). Only unlinked rows are
+                # rolled back — a linked row is the recovery
+                # consult's evidence and stays.
+                try:
+                    with _db_lock:
+                        conn = db_connect()
+                        conn.execute(
+                            "DELETE FROM stripe_events WHERE "
+                            "event_id=? AND order_id IS NULL",
+                            (event.get("id") or "",))
+                        conn.commit()
+                        conn.close()
+                except Exception:
+                    pass
+                raise
 
     def _stripe_process_locked(self, event, session):
         etype = event.get("type") or ""
@@ -1543,11 +1554,14 @@ class Handler(BaseHTTPRequestHandler):
             if prior:
                 with _db_lock:
                     conn = db_connect()
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE stripe_events SET order_id=? "
                         "WHERE event_id=?", (prior[0], eid))
                     conn.commit()
                     conn.close()
+                if cur.rowcount == 0:
+                    raise RuntimeError(
+                        "stripe event row vanished before linking")
                 log_event(prior[0], "STRIPE_DUP_EVENT",
                           f"event={eid} pi={pi} already matched")
                 self._send_json(200, {"ok": True, "duplicate": True})
@@ -1585,34 +1599,67 @@ class Handler(BaseHTTPRequestHandler):
             with _db_lock:
                 conn = db_connect()
                 try:
-                    conn.execute(
+                    cur = conn.execute(
                         "UPDATE stripe_events SET order_id=? "
                         "WHERE event_id=?", (order["id"], eid))
                     conn.commit()
                 finally:
                     conn.close()
+            if cur.rowcount == 0:
+                raise RuntimeError(
+                    "stripe event row vanished before linking")
             won = transition_order_status(order, "PAID")
             if not won:
-                # An admin moved the order past PAID by hand without
-                # the PAID side effects; the money is real, so make
-                # the order whole anyway.
-                ensure_paid_side_effects(order)
-            log_event(order["id"], "STRIPE_PAID",
-                      f"event={eid} amount={amount} tier={tier} "
-                      f"race={'won' if won else 'lost-recovered'}")
-            # The payer hears from us immediately — a payment with
-            # no acknowledgement reads as money into a void. A failed
-            # receipt raises: Stripe retries, and the recovery
-            # consult resends it (the order itself is already PAID
-            # and fulfilled — only the courtesy is outstanding).
-            if not _send_paid_receipt(order, amount):
-                raise RuntimeError("receipt send failed")
-            send_telegram(
-                f"ShipAudit Lab: Stripe payment matched — order "
-                f"#{order['id']} ({tier}, ${amount / 100:,.2f}) "
-                f"marked PAID automatically.")
-            self._send_json(200, {"ok": True, "order_id": order["id"]})
-            return
+                # The transition was claimed by someone else. If a
+                # DIFFERENT payment claimed this order (the claim
+                # window spans processes — the webhook lock is
+                # per-process, Codex delta-6 finding 3), this
+                # payment is not matched at all: unlink and let the
+                # unmatched flow below alert HQ. Same payment (a
+                # duplicate event) or an admin's manual PAID: the
+                # money is real, make the order whole and ack.
+                winner_pi = None
+                conn = db_connect()
+                try:
+                    wrow = conn.execute(
+                        "SELECT payment_intent FROM stripe_events "
+                        "WHERE order_id=? AND event_id<>? AND "
+                        "payment_intent IS NOT NULL",
+                        (order["id"], eid)).fetchone()
+                    if wrow:
+                        winner_pi = wrow[0]
+                finally:
+                    conn.close()
+                if winner_pi and pi and winner_pi != pi:
+                    with _db_lock:
+                        conn = db_connect()
+                        conn.execute(
+                            "UPDATE stripe_events SET order_id=NULL "
+                            "WHERE event_id=?", (eid,))
+                        conn.commit()
+                        conn.close()
+                    order = None
+                else:
+                    ensure_paid_side_effects(order)
+            if order is not None:
+                log_event(order["id"], "STRIPE_PAID",
+                          f"event={eid} amount={amount} tier={tier} "
+                          f"race={'won' if won else 'lost-recovered'}")
+                # The payer hears from us immediately — a payment
+                # with no acknowledgement reads as money into a
+                # void. A failed receipt raises: Stripe retries,
+                # and the recovery consult resends it (the order
+                # itself is already PAID and fulfilled — only the
+                # courtesy is outstanding).
+                if not _send_paid_receipt(order, amount):
+                    raise RuntimeError("receipt send failed")
+                send_telegram(
+                    f"ShipAudit Lab: Stripe payment matched — order "
+                    f"#{order['id']} ({tier}, ${amount / 100:,.2f}) "
+                    f"marked PAID automatically.")
+                self._send_json(200, {"ok": True,
+                                      "order_id": order["id"]})
+                return
         # Alert BEFORE the durable log: if the process dies between
         # the two, the retry must re-alert, not find a terminal log
         # and ack in silence (Codex delta-3). A failed alert raises —
@@ -2039,7 +2086,7 @@ def transition_order_status(row, new_status):
                       "PAID side effects raised; the recovery "
                       "consult will re-fire them")
             raise
-        log_event(oid, "SIDE_EFFECTS_OK", f"tier={row['tier']}")
+        _record_effects_ok(oid, row["tier"])
     return True
 
 
@@ -2053,6 +2100,22 @@ def _paid_effects_done(order_id):
         conn.close()
 
 
+def _record_effects_ok(order_id, tier, note=""):
+    """The SIDE_EFFECTS_OK marker is the recovery contract — the
+    consult, the sweep and the leave-PAID guard all key on it.
+    log_event deliberately swallows write errors (it serves
+    courtesy logs too), so the marker is verified by reading it
+    back; an unpersisted marker raises instead of letting the
+    order advance on a completion that exists only in memory
+    (Codex delta-6 finding 2)."""
+    log_event(order_id, "SIDE_EFFECTS_OK",
+              f"tier={tier}" + (f" {note}" if note else ""))
+    if not _paid_effects_done(order_id):
+        raise RuntimeError(
+            "SIDE_EFFECTS_OK marker did not persist; the paid "
+            "side effects are not treated as complete")
+
+
 def ensure_paid_side_effects(order):
     """Re-fire a PAID order's side effects when their completion was
     never recorded. No-op when SIDE_EFFECTS_OK is already logged."""
@@ -2062,8 +2125,7 @@ def ensure_paid_side_effects(order):
         activate_monitor(order)
     if order["tier"] == "Deep Scan":
         on_deep_scan_paid(order)
-    log_event(order["id"], "SIDE_EFFECTS_OK",
-              f"tier={order['tier']} (recovered)")
+    _record_effects_ok(order["id"], order["tier"], "(recovered)")
 
 
 def sweep_paid_side_effects():

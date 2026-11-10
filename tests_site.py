@@ -228,6 +228,17 @@ check("W10 unmatched alert failure rolls back",
       and count("stripe_events", "event_id='evt_w10'", ()) == 0
       and order_status(o10) == "NEW")
 
+# W10b: after the rollback, the same event redelivers cleanly —
+#       one alert, one terminal log; a third delivery is a quiet
+#       duplicate (the alert never repeats).
+r = stripe_call(evt("evt_w10"), sess(200, "w10@test.dev", pi="pi_w10"))
+r3 = stripe_call(evt("evt_w10"), sess(200, "w10@test.dev", pi="pi_w10"))
+check("W10b redelivery after rollback is clean",
+      r[1].get("matched") is False and r3[1].get("duplicate") is True
+      and count("events",
+                "event='STRIPE_UNMATCHED' AND detail LIKE '%evt_w10%'",
+                ()) == 1)
+
 # ---- Monitoring catalog ----
 F1 = [{"severity": "low", "title": "Missing header A"}]
 F2 = [{"severity": "low", "title": "Missing header A"},
@@ -506,6 +517,86 @@ check("S3b no receipt while effects broken",
       and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
                 (os4,)) == 0
       and count("fulfilment_requests", "order_id=?", (os4,)) == 0)
+
+# ---- Delta-6 catalog (added 2026-11-09, round 6) ----
+# W13: cross-process claim loss — another payment's transition
+#      lands between this delivery's selection and its own
+#      transition. This payment must end UNMATCHED (HQ alerted),
+#      never acked as matched to an order it did not pay for.
+o13 = mk_order("w13@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w13_win','checkout.session.completed',?,?,?,2900)",
+          (o13, S.utcnow(), "pi_w13_win"))
+c.commit()
+c.close()
+real_t = S.transition_order_status
+race = {"fired": False}
+
+
+def racing_t(row, new_status):
+    if not race["fired"] and row["id"] == o13:
+        race["fired"] = True
+        real_t(row, new_status)  # the winner's transition lands
+    return real_t(row, new_status)
+
+
+S.transition_order_status = racing_t
+r = stripe_call(evt("evt_w13_lose"),
+                sess(2900, "w13@test.dev", pi="pi_w13_lose"))
+S.transition_order_status = real_t
+c = db()
+loser_link = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w13_lose'").fetchone()[0]
+c.close()
+check("W13 cross-process loser ends unmatched",
+      r[1].get("matched") is False and order_status(o13) == "PAID"
+      and loser_link is None
+      and count("fulfilment_requests", "order_id=?", (o13,)) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o13,)) == 0
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w13_lose%'", ()) == 1)
+
+# A3: the completion marker is verified, not assumed — if the
+#     SIDE_EFFECTS_OK write cannot persist, leaving PAID is
+#     refused (log_event swallows write errors by design).
+oa4 = mk_order("a4@test.dev", "Deep Scan", 29, status="PAID")
+real_done = S._paid_effects_done
+S._paid_effects_done = lambda oid: False
+c = db()
+row_a4 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (oa4,)).fetchone())
+c.close()
+refused = False
+try:
+    S.transition_order_status(row_a4, "IN_PROGRESS")
+except RuntimeError:
+    refused = True
+S._paid_effects_done = real_done
+check("A3 unpersisted marker blocks leaving PAID", refused
+      and order_status(oa4) == "PAID")
+
+# A3b: the same failure inside a fresh transition raises, but
+#      leaves the recoverable state — PAID, effects applied, the
+#      consult/sweep can finish the marker once writes heal.
+oa5 = mk_order("a5@test.dev", "Deep Scan", 29)
+S._paid_effects_done = lambda oid: False
+c = db()
+row_a5 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (oa5,)).fetchone())
+c.close()
+refused = False
+try:
+    S.transition_order_status(row_a5, "PAID")
+except RuntimeError:
+    refused = True
+S._paid_effects_done = real_done
+check("A3b marker failure leaves recoverable PAID", refused
+      and order_status(oa5) == "PAID"
+      and count("fulfilment_requests", "order_id=?", (oa5,)) == 1)
 
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
