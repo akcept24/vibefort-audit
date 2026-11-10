@@ -1172,6 +1172,99 @@ check("W28b payment recovers once the fence returns",
       order_status(o28b) == "PAID"
       and count("fulfilment_requests", "order_id=?", (o28b,)) == 1)
 
+# ---- Delta-13 catalog (added 2026-11-09, round 13) ----
+# W29: the sweep's settle unlink is conditional on the link it
+#      judged. If the event is relinked to its true winner while
+#      the settle is in flight (simulated inside the alert hook),
+#      the sweep must not clear the new link.
+o29b = mk_order("w29b@test.dev", "Deep Scan", 29)
+o29a = mk_order("w29a@test.dev", "Deep Scan", 29)
+c = db()
+r29b = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                      (o29b,)).fetchone())
+r29a = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                      (o29a,)).fetchone())
+c.close()
+S.transition_order_status(r29b, "PAID",
+                          paid_event_id="evt_w29_win",
+                          paid_pi="pi_w29")
+S.transition_order_status(r29a, "PAID",
+                          paid_event_id="evt_w29_other",
+                          paid_pi="pi_w29_other")
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w29','checkout.session.completed',?,?,?,2900)",
+          (o29a, S.utcnow(), "pi_w29"))
+c.commit()
+c.close()
+real_fire29 = S._fire_unmatched_alert
+
+
+def racing_fire29(event_id, tg_text, log_detail):
+    if event_id == "evt_w29":
+        cc = S.db_connect()
+        cc.execute("UPDATE stripe_events SET order_id=? WHERE "
+                   "event_id='evt_w29'", (o29b,))
+        cc.commit()
+        cc.close()
+    return real_fire29(event_id, tg_text, log_detail)
+
+
+S._fire_unmatched_alert = racing_fire29
+S.sweep_paid_side_effects()
+S._fire_unmatched_alert = real_fire29
+c = db()
+link29 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w29'").fetchone()[0]
+c.close()
+check("W29 settle never clears a relinked winner link",
+      link29 == o29b)
+
+# W30: one monitor run per monitor across processes — a foreign
+#      lock holder makes the run skip entirely (no scan, no
+#      save); once released, the run proceeds.
+o30 = mk_order("w30@test.dev", "Monitoring", 79, status="PAID")
+c = S.db_connect()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at) VALUES(?,?,?,?,?,?)",
+          (o30, "example.com", "w30@test.dev", "W30", S.utcnow(),
+           time.time()))
+c.commit()
+c.close()
+
+
+def row30():
+    c = db()
+    m = dict(c.execute("SELECT * FROM monitors WHERE order_id=?",
+                       (o30,)).fetchone())
+    c.close()
+    return m
+
+
+mid30 = row30()["id"]
+foreign30 = S._claim_event_lock(f"monitor:{mid30}", "monitor")
+calls30 = {"n": 0}
+real_scan30 = S._scan_with_timeout
+
+
+def counting_scan30(url):
+    calls30["n"] += 1
+    return real_scan30(url)
+
+
+S._scan_with_timeout = counting_scan30
+S._run_monitor(row30())
+check("W30 foreign-held monitor run skips",
+      bool(foreign30) and calls30["n"] == 0
+      and row30()["last_digest"] is None)
+S._release_event_lock(f"monitor:{mid30}", foreign30)
+S._run_monitor(row30())
+S._scan_with_timeout = real_scan30
+check("W30 released monitor run proceeds",
+      calls30["n"] == 1 and row30()["last_digest"] is not None)
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

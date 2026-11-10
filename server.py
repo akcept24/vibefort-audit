@@ -1699,8 +1699,9 @@ class Handler(BaseHTTPRequestHandler):
                             conn = db_connect()
                             conn.execute(
                                 "UPDATE stripe_events SET "
-                                "order_id=NULL WHERE event_id=?",
-                                (eid,))
+                                "order_id=NULL WHERE event_id=? "
+                                "AND order_id=?",
+                                (eid, linked_id))
                             conn.commit()
                             conn.close()
                         self._send_json(200, {"ok": True,
@@ -2431,7 +2432,8 @@ def sweep_paid_side_effects():
                     conn = db_connect()
                     conn.execute(
                         "UPDATE stripe_events SET order_id=NULL "
-                        "WHERE event_id=?", (row["ev_id"],))
+                        "WHERE event_id=? AND order_id=?",
+                        (row["ev_id"], row["id"]))
                     conn.commit()
                     conn.close()
             except Exception as e:
@@ -2521,7 +2523,19 @@ def sweep_paid_side_effects():
                 # match. Alert FIRST through the single-fire
                 # helper and unlink only once the alert is on
                 # record; if the alert cannot fire, the link stays
-                # for the next sweep (delta-8 #4).
+                # for the next sweep (delta-8 #4). The link is
+                # re-read before judging and the unlink is
+                # conditional on it: the event may have been
+                # relinked to its true winner since the snapshot
+                # (Codex delta-13 #1).
+                conn = db_connect()
+                cur_link = conn.execute(
+                    "SELECT order_id FROM stripe_events WHERE "
+                    "event_id=?", (ev["event_id"],)).fetchone()
+                conn.close()
+                if cur_link is None or \
+                        cur_link[0] != ev["order_id"]:
+                    continue
                 try:
                     _fire_unmatched_alert(
                         ev["event_id"],
@@ -2544,7 +2558,8 @@ def sweep_paid_side_effects():
                     conn = db_connect()
                     conn.execute(
                         "UPDATE stripe_events SET order_id=NULL "
-                        "WHERE event_id=?", (ev["event_id"],))
+                        "WHERE event_id=? AND order_id=?",
+                        (ev["event_id"], ev["order_id"]))
                     conn.commit()
                     conn.close()
                 continue
@@ -2948,6 +2963,24 @@ def _monitor_alert_parts(mon, host, order_id, d_new, d_gone,
 
 
 def _run_monitor(mon):
+    # One run per monitor across processes (Codex delta-13 #2):
+    # two interleaved runs read the same baseline, and the later
+    # unconditional save can erase the earlier run's retained
+    # alert. The event-lock table is the mutex; a foreign holder
+    # means this monitor is already being worked — skip the cycle.
+    key = f"monitor:{mon['id']}"
+    token = _claim_event_lock(key, "monitor")
+    if not token:
+        log(f"monitor {mon['id']}: run already in progress "
+            "elsewhere; skipped")
+        return
+    try:
+        _run_monitor_locked(mon)
+    finally:
+        _release_event_lock(key, token)
+
+
+def _run_monitor_locked(mon):
     order_id = mon["order_id"]
     host = urllib.parse.urlparse(mon["url"]).hostname or ""
     # A retained alert from an earlier failed send is delivered
