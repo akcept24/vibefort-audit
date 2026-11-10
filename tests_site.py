@@ -3089,6 +3089,560 @@ check("N37 (r20): delete leaves an in-flight fulfilment "
 
 _ureq18.urlopen = _real_urlopen18
 
+# ---- Round 21 catalog (added 2026-11-10: Codex delta-19
+#      NO-SHIP — (1) a Resend "delivered" requires the message
+#      id to be a non-empty STRING; (2a) the post-window spend
+#      is claimed atomically, never decided from a pre-claim
+#      read, so two racing receipt drivers make exactly one
+#      post-window attempt between them; (2b) the first-
+#      attempt stamp is written BEFORE the send (first-stamp-
+#      wins) for receipts and monitor alerts alike, so a crash
+#      at the outcome-recording seam can no longer leave an
+#      attempt unstamped; (3) the production tick isolates
+#      each monitor run, so one monitor's exception cannot
+#      skip the tick's later monitors; (4) deletion is
+#      complete — the admin delete and the driver's GC both
+#      cover email_delivery rows and monitor:<id> locks;
+#      (5) recovery writes are existence-guarded in the same
+#      transaction and the send seams re-check existence, so
+#      a deleted order gains no new work and no recreated
+#      state (a send already inside its HTTP call when the
+#      deletion lands may still complete — that residual is
+#      accepted, delta-19 (c)). The pins below continue the
+#      N-block (N38+) against the same beneath-wrapper
+#      transport.
+
+
+class _Provider21(_Provider19):
+    """Delta-19 specimens: a Resend 2xx whose id is not a
+    string at all (an object) or an empty string; plus a
+    capture hook that snapshots a monitor's retained record
+    DURING its alert send — the round-21 pre-send stamp must
+    already be on it at that moment."""
+
+    def __init__(self):
+        super().__init__()
+        self.captured = []   # (to, pending_alert dict | None)
+
+    def _mail(self, req):
+        if self.mail_mode in ("object-id", "empty-id"):
+            key = None
+            for hk, hv in req.headers.items():
+                if hk.lower() == "idempotency-key":
+                    key = hv
+            to = json.loads(req.data.decode())["to"][0]
+            self.mail_requests.append((key, to))
+            rid = {"unexpected": "object"} \
+                if self.mail_mode == "object-id" else ""
+            return _Resp18(json.dumps({"id": rid}).encode())
+        to = json.loads(req.data.decode())["to"][0]
+        c = db()
+        r = c.execute(
+            "SELECT pending_alert FROM monitors WHERE email=?",
+            (to,)).fetchone()
+        c.close()
+        if r is not None:
+            self.captured.append(
+                (to, json.loads(r[0]) if r[0] else None))
+        return super()._mail(req)
+
+    def captured_for(self, addr):
+        return [p for (t, p) in self.captured if t == addr]
+
+
+PROV21 = _Provider21()
+_ureq18.urlopen = PROV21.urlopen
+
+
+def shift_attempt21(notif_key, when):
+    """Age a receipt's first-attempt stamp (round 21); a
+    no-op on the pre-fix tree, where the column is absent."""
+    c = db()
+    try:
+        c.execute(
+            "UPDATE email_delivery SET first_attempt_at=? "
+            "WHERE notif_key=?", (when, notif_key))
+        c.commit()
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        c.close()
+
+
+# N38 (1): the Resend wrapper's "delivered" requires the id
+#      to be a non-empty string. A truthy non-string id (an
+#      object) proves no more about acceptance than a missing
+#      one did in round 19: it is unknown.
+PROV21.mail_mode = "object-id"
+r38a = SR.send_resend("n38@test.dev", "Subject", "body")
+PROV21.mail_mode = "empty-id"
+r38b = SR.send_resend("n38@test.dev", "Subject", "body")
+PROV21.mail_mode = "ok"
+r38c = SR.send_resend("n38@test.dev", "Subject", "body")
+check("N38 (1): Resend id must be a non-empty string: "
+      "object -> unknown, empty -> unknown, string -> "
+      "delivered",
+      SR._send_status(r38a) == "unknown" and r38a[0] is False
+      and SR._send_status(r38b) == "unknown"
+      and SR._send_status(r38c) == "delivered"
+      and r38c[0] is True)
+
+# N39 (2a): two racing receipt drivers on a receipt past the
+#      window — a webhook consult and a scheduler-tick sweep,
+#      modelled as two calls on two threads. Driver B is
+#      parked at the lock claim AFTER it took its spend
+#      decision from the unspent state (the pre-fix order:
+#      read state, then claim); driver A then runs a complete
+#      pass — claims, spends, sends (answer lost), settles,
+#      releases. B resumes and must observe the spent state
+#      and settle WITHOUT a second post-window attempt.
+o39 = mk_order("n39@test.dev", "Deep Scan", 29, status="PAID")
+row39 = row_of18(o39)
+PROV21.mail_mode = "accept-lost"
+r39a = SR._ensure_paid_receipt(row39, 2900)
+shift_unknown19(f"receipt:{o39}", time.time() - 25 * 3600)
+_real_claim39 = SR._claim_event_lock
+_parked39 = _th19.Event()
+_go39 = _th19.Event()
+_claims39 = []
+
+
+def _trap_claim39(key, purpose):
+    if key == f"receipt:{o39}" and not _claims39:
+        _claims39.append(key)
+        _parked39.set()
+        _go39.wait(15)
+    return _real_claim39(key, purpose)
+
+
+SR._claim_event_lock = _trap_claim39
+_res39 = {}
+
+
+def _drive39():
+    _res39["B"] = SR._ensure_paid_receipt(row39, 2900)
+
+
+_tB39 = _th19.Thread(target=_drive39)
+_tB39.start()
+_parked39.wait(5)
+_res39["A"] = SR._ensure_paid_receipt(row39, 2900)
+_go39.set()
+_tB39.join()
+SR._claim_event_lock = _real_claim39
+PROV21.mail_mode = "ok"
+keys39 = PROV21.mail_keys_to("n39@test.dev")
+st39 = email_state19(f"receipt:{o39}")
+check("N39 (2a): racing drivers past the window -> exactly "
+      "one post-window attempt, terminal settled state",
+      r39a is False
+      and _res39.get("A") is True and _res39.get("B") is True
+      and len(keys39) == 2
+      and keys39[0] == keys39[1] == f"receipt:{o39}"
+      and PROV21.mail_delivered_count("n39@test.dev") == 1
+      and st39 is not None and st39[1] == 1 and st39[2] == 1
+      and count("events",
+                "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o39,)) == 1)
+
+# N40 (2b): the crash at the outcome-recording seam — the
+#      provider accepted the receipt send, its answer was
+#      lost, and the process died BEFORE the unknown outcome
+#      could be stamped (the stamping call itself raises a
+#      BaseException, as a death would). The attempt itself
+#      was stamped BEFORE the send (round 21), so recovery
+#      25h later recognizes the expired window and takes the
+#      bounded post-window path — one claimed attempt, then
+#      settled — never an unrecognized fresh resend.
+o40 = mk_order("n40@test.dev", "Deep Scan", 29, status="PAID")
+row40 = row_of18(o40)
+_real_note40 = SR._email_note_unknown
+
+
+def _crash_note40(notif_key):
+    raise Crash18("process died at outcome recording "
+                  "(pin N40)")
+
+
+SR._email_note_unknown = _crash_note40
+PROV21.mail_mode = "accept-lost"
+crashed40 = False
+try:
+    SR._ensure_paid_receipt(row40, 2900)
+except Crash18:
+    crashed40 = True
+SR._email_note_unknown = _real_note40
+shift_attempt21(f"receipt:{o40}", time.time() - 25 * 3600)
+r40b = SR._ensure_paid_receipt(row40, 2900)
+r40c = SR._ensure_paid_receipt(row40, 2900)
+PROV21.mail_mode = "ok"
+keys40 = PROV21.mail_keys_to("n40@test.dev")
+st40 = email_state19(f"receipt:{o40}")
+check("N40 (2b): crash after an accepted unknown send -> "
+      "+25h recovery takes the bounded claimed path, "
+      "settles, attempts nothing further",
+      crashed40 and r40b is True and r40c is True
+      and len(keys40) == 2
+      and keys40[0] == keys40[1] == f"receipt:{o40}"
+      and PROV21.mail_delivered_count("n40@test.dev") == 1
+      and st40 is not None and st40[1] == 1 and st40[2] == 1)
+
+# N41 (2b): a monitor alert's window stamp precedes its
+#      send: while the FRESH alert's send is on the wire,
+#      the retained record the provider-side snapshot reads
+#      ALREADY carries first_unknown_at (round 19 stamped it
+#      only after the outcome returned).
+o41 = mk_order("n41@test.dev", "Monitoring", 79, status="PAID")
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at,last_digest) "
+          "VALUES(?,?,?,?,?,?,?)",
+          (o41, "example.com", "n41@test.dev", "N41",
+           SR.utcnow(), time.time(), json.dumps(["LOW|base"])))
+c.commit()
+c.close()
+SR._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"},
+     {"severity": "medium", "title": "N41 hole"}],
+    {"host": "example.com", "errors": []})
+PROV21.mail_mode = "accept-lost"
+SR._run_monitor(mon_row16(o41))
+PROV21.mail_mode = "ok"
+cap41 = PROV21.captured_for("n41@test.dev")
+cap41 = cap41[-1] if cap41 else None
+check("N41 (2b): fresh alert: first_unknown_at is on the "
+      "retained record before the send",
+      cap41 is not None
+      and cap41.get("first_unknown_at") is not None
+      and abs(cap41["first_unknown_at"] - time.time()) < 120)
+
+# N42 (2b): the same pre-send stamp on the RETAINED path —
+#      the intent write that precedes a retained alert's
+#      resend carries the stamp too, not just the outcome
+#      write that follows it.
+o42 = mk_order("n42@test.dev", "Monitoring", 79, status="PAID")
+pend42 = {"new": ["MEDIUM|N42 hole"], "gone": [], "grade": "B",
+          "score": 88,
+          "digest_after": ["LOW|base", "MEDIUM|N42 hole"],
+          "attempts": 1, "since": SR.utcnow()}
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o42, "example.com", "n42@test.dev", "N42",
+           SR.utcnow(), time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend42)))
+c.commit()
+c.close()
+SR._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"},
+     {"severity": "medium", "title": "N42 hole"}],
+    {"host": "example.com", "errors": []})
+PROV21.mail_mode = "accept-lost"
+SR._run_monitor(mon_row16(o42))
+PROV21.mail_mode = "ok"
+cap42 = PROV21.captured_for("n42@test.dev")
+cap42 = cap42[-1] if cap42 else None
+check("N42 (2b): retained alert: first_unknown_at is "
+      "stamped with the intent, before the send",
+      cap42 is not None
+      and cap42.get("first_unknown_at") is not None
+      and abs(cap42["first_unknown_at"] - time.time()) < 120)
+
+# N43 (3): the production tick isolates each monitor run:
+#      the first due monitor's run raises, and the tick's
+#      later monitor still runs in the same pass (its
+#      last_run_at advances).
+_park_monitors20()
+o43a = mk_order("n43a@test.dev", "Monitoring", 79, status="PAID")
+o43b = mk_order("n43b@test.dev", "Monitoring", 79, status="PAID")
+c = db()
+for _o43, _e43, _due43 in (
+        (o43a, "n43a@test.dev", time.time() - 10),
+        (o43b, "n43b@test.dev", time.time() - 5)):
+    c.execute("INSERT INTO monitors(order_id,url,email,name,"
+              "created_at,next_run_at,last_digest) "
+              "VALUES(?,?,?,?,?,?,?)",
+              (_o43, "example.com", _e43, "N43", SR.utcnow(),
+               _due43, json.dumps(["LOW|base"])))
+c.commit()
+c.close()
+mid43a = mon_row16(o43a)["id"]
+_real_run43 = SR._run_monitor
+
+
+def _poison_run43(mon, scheduled=False):
+    if mon["id"] == mid43a:
+        raise RuntimeError("simulated monitor failure "
+                           "(pin N43)")
+    return _real_run43(mon, scheduled=scheduled)
+
+
+SR._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"}],
+    {"host": "example.com", "errors": []})
+SR._run_monitor = _poison_run43
+SR._monitor_tick()
+SR._run_monitor = _real_run43
+m43b = mon_row16(o43b)
+check("N43 (3): one monitor's exception does not skip the "
+      "tick's later monitors",
+      bool(m43b["last_run_at"]) and m43b["last_run_at"] > 0)
+
+# N44 (4): the admin order-delete removes, in the same
+#      transaction, the order's email_delivery row and the
+#      monitor:<monitor_id> locks of its monitors — the two
+#      families round 19/20 left behind.
+o44 = mk_order("n44@test.dev", "Monitoring", 79, status="PAID")
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
+          (o44, "example.com", "n44@test.dev", "N44",
+           SR.utcnow(), time.time() + 10 ** 9))
+c.commit()
+c.close()
+mid44 = mon_row16(o44)["id"]
+c = db()
+c.execute("INSERT INTO email_delivery(notif_key,"
+          "first_unknown_at) VALUES(?,?)",
+          (f"receipt:{o44}", time.time()))
+c.execute("INSERT INTO event_locks(event_id,purpose,"
+          "claimed_at,owner) VALUES(?,?,?,?)",
+          (f"monitor:{mid44}", "monitor", time.time(), "pin44"))
+c.commit()
+c.close()
+SR.ADMIN_TOKEN = "catalog-admin"
+fs21a = FakeSelf19()
+SR.Handler._api_admin_delete(fs21a, f"/api/orders/{o44}")
+check("N44 (4): admin delete also removes the order's "
+      "email_delivery row and its monitors' locks",
+      fs21a.replies[-1][0] == 200
+      and count("orders", "id=?", (o44,)) == 0
+      and count("monitors", "order_id=?", (o44,)) == 0
+      and count("email_delivery", "notif_key=?",
+                (f"receipt:{o44}",)) == 0
+      and count("event_locks", "event_id=?",
+                (f"monitor:{mid44}",)) == 0)
+
+# N45 (4): the driver's garbage collection extends beyond
+#      notify: locks — a monitor: lock whose monitor row is
+#      gone and an email_delivery row whose order is gone
+#      are collected; rows belonging to live monitors and
+#      orders are spared.
+ghost45 = 987651
+live45 = mk_order("n45@test.dev", "Deep Scan", 29, status="PAID")
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
+          (live45, "example.com", "n45@test.dev", "N45",
+           SR.utcnow(), time.time() + 10 ** 9))
+c.commit()
+c.close()
+mid45live = mon_row16(live45)["id"]
+c = db()
+c.execute("INSERT INTO event_locks(event_id,purpose,"
+          "claimed_at,owner) VALUES(?,?,?,?)",
+          (f"monitor:{ghost45}", "monitor", time.time(),
+           "pin45"))
+c.execute("INSERT INTO event_locks(event_id,purpose,"
+          "claimed_at,owner) VALUES(?,?,?,?)",
+          (f"monitor:{mid45live}", "monitor", time.time(),
+           "pin45"))
+c.execute("INSERT INTO email_delivery(notif_key,"
+          "first_unknown_at) VALUES(?,?)",
+          (f"receipt:{ghost45}", time.time()))
+c.execute("INSERT INTO email_delivery(notif_key,"
+          "first_unknown_at) VALUES(?,?)",
+          (f"receipt:{live45}", time.time()))
+c.commit()
+c.close()
+SR._drive_pending_notifications()
+check("N45 (4): driver GC collects orphan monitor locks "
+      "and orphan email rows, spares live ones",
+      lock_row18(f"monitor:{ghost45}") is None
+      and email_state19(f"receipt:{ghost45}") is None
+      and email_state19(f"receipt:{live45}") is not None
+      and lock_row18(f"monitor:{mid45live}") is not None)
+
+# N46 (5a): the named deletion specimen — a paid snapshot is
+#      obtained, the order is deleted, THEN the Deep Scan
+#      hook resumes: it must write nothing (no fulfilment
+#      row), claim nothing (no notify lock) and send nothing
+#      (no ping attempted).
+o46 = mk_order("n46@test.dev", "Deep Scan", 29, status="PAID")
+row46 = row_of18(o46)
+fs21b = FakeSelf19()
+SR.Handler._api_admin_delete(fs21b, f"/api/orders/{o46}")
+SR.on_deep_scan_paid(row46)
+check("N46 (5a): hook resumed after deletion writes "
+      "nothing: no fulfilment row, no notify lock, no ping",
+      fs21b.replies[-1][0] == 200
+      and count("fulfilment_requests", "order_id=?",
+                (o46,)) == 0
+      and lock_row18(f"notify:{o46}") is None
+      and PROV21.tg_attempts(o46) == [])
+
+# N47 (5a): monitor activation resumed after deletion
+#      recreates nothing — no monitor row, no activation
+#      lock, no MONITOR_ACTIVATED record.
+o47 = mk_order("n47@test.dev", "Monitoring", 79, status="PAID")
+row47 = row_of18(o47)
+fs21c = FakeSelf19()
+SR.Handler._api_admin_delete(fs21c, f"/api/orders/{o47}")
+SR.activate_monitor(row47)
+check("N47 (5a): activation resumed after deletion "
+      "recreates no monitor row, lock or log",
+      count("monitors", "order_id=?", (o47,)) == 0
+      and lock_row18(f"monitor-activate:{o47}") is None
+      and count("events",
+                "order_id=? AND event='MONITOR_ACTIVATED'",
+                (o47,)) == 0)
+
+# N48 (5a): receipt recovery driven for a deleted order
+#      writes no durable state (no email_delivery row, no
+#      receipt lock) and sends nothing.
+o48 = mk_order("n48@test.dev", "Deep Scan", 29, status="PAID")
+row48 = row_of18(o48)
+fs21d = FakeSelf19()
+SR.Handler._api_admin_delete(fs21d, f"/api/orders/{o48}")
+PROV21.mail_mode = "ok"
+r48 = SR._ensure_paid_receipt(row48, 2900)
+check("N48 (5a): receipt recovery on a deleted order "
+      "writes no state and sends nothing",
+      r48 is False
+      and PROV21.mail_keys_to("n48@test.dev") == []
+      and email_state19(f"receipt:{o48}") is None
+      and lock_row18(f"receipt:{o48}") is None)
+
+# N49 (5b): a monitor run holding its snapshot when its
+#      order (and monitor row) is deleted mid-run — the
+#      deletion lands inside the retained alert's send
+#      preparation — re-reads the monitor row at the send
+#      seam and drops the work: no alert send is attempted
+#      and no state is recreated.
+o49 = mk_order("n49@test.dev", "Monitoring", 79, status="PAID")
+pend49 = {"new": ["MEDIUM|N49 hole"], "gone": [],
+          "grade": "B", "score": 88,
+          "digest_after": ["LOW|base", "MEDIUM|N49 hole"],
+          "attempts": 1, "since": SR.utcnow()}
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o49, "example.com", "n49@test.dev", "N49",
+           SR.utcnow(), time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend49)))
+c.commit()
+c.close()
+_real_idem49 = SR._monitor_alert_idem
+
+
+def _deleting_idem49(mon, pending):
+    fs = FakeSelf19()
+    SR.Handler._api_admin_delete(fs, f"/api/orders/{o49}")
+    return _real_idem49(mon, pending)
+
+
+SR._monitor_alert_idem = _deleting_idem49
+SR._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"}],
+    {"host": "example.com", "errors": []})
+PROV21.mail_mode = "ok"
+SR._run_monitor(mon_row16(o49))
+SR._monitor_alert_idem = _real_idem49
+check("N49 (5b): monitor deleted mid-run (retained alert): "
+      "no alert send attempted, no state recreated",
+      PROV21.mail_keys_to("n49@test.dev") == []
+      and count("monitors", "order_id=?", (o49,)) == 0)
+
+# N50 (5b): the same seam on the fresh path — the deletion
+#      lands while the run is inside its scan; the fresh
+#      alert's send is aborted at the seam.
+o50 = mk_order("n50@test.dev", "Monitoring", 79, status="PAID")
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at,last_digest) "
+          "VALUES(?,?,?,?,?,?,?)",
+          (o50, "example.com", "n50@test.dev", "N50",
+           SR.utcnow(), time.time(), json.dumps(["LOW|base"])))
+c.commit()
+c.close()
+_real_scan50 = SR._scan_with_timeout
+
+
+def _deleting_scan50(url):
+    fs = FakeSelf19()
+    SR.Handler._api_admin_delete(fs, f"/api/orders/{o50}")
+    return ([{"severity": "low", "title": "base"},
+             {"severity": "medium", "title": "N50 hole"}],
+            {"host": "example.com", "errors": []})
+
+
+SR._scan_with_timeout = _deleting_scan50
+PROV21.mail_mode = "ok"
+SR._run_monitor(mon_row16(o50))
+SR._scan_with_timeout = _real_scan50
+check("N50 (5b): monitor deleted mid-scan (fresh alert): "
+      "no alert send attempted, no state recreated",
+      PROV21.mail_keys_to("n50@test.dev") == []
+      and count("monitors", "order_id=?", (o50,)) == 0)
+
+# N51 (5b): the receipt send seam — the deletion lands in
+#      the gap between the pre-send stamp and the send
+#      itself (the stamp helper is wrapped to delete after
+#      stamping, through the real admin endpoint): no send
+#      is attempted and nothing is left behind — the delete
+#      transaction itself removed the stamp and the lock.
+o51 = mk_order("n51@test.dev", "Deep Scan", 29, status="PAID")
+row51 = row_of18(o51)
+_note51 = getattr(SR, "_email_note_attempt", None)
+if _note51 is not None:
+    def _deleting_note51(notif_key):
+        _note51(notif_key)
+        fs = FakeSelf19()
+        SR.Handler._api_admin_delete(fs, f"/api/orders/{o51}")
+
+    SR._email_note_attempt = _deleting_note51
+PROV21.mail_mode = "ok"
+r51 = SR._ensure_paid_receipt(row51, 2900)
+if _note51 is not None:
+    SR._email_note_attempt = _note51
+check("N51 (5b): order deleted between the receipt stamp "
+      "and the send: no send, no state left behind",
+      r51 is False
+      and PROV21.mail_keys_to("n51@test.dev") == []
+      and email_state19(f"receipt:{o51}") is None
+      and lock_row18(f"receipt:{o51}") is None)
+
+# N52 (5b): the notify send seam — the deletion lands after
+#      the DEEPSCAN_QUEUED record and before the ping (the
+#      log write is wrapped to delete through the real
+#      admin endpoint once the record lands): no ping is
+#      attempted and no notify lock is left standing.
+o52 = mk_order("n52@test.dev", "Deep Scan", 29, status="PAID")
+row52 = row_of18(o52)
+_real_le52 = SR.log_event
+
+
+def _deleting_le52(order_id, event, detail=""):
+    out = _real_le52(order_id, event, detail)
+    if event == "DEEPSCAN_QUEUED" and order_id == o52:
+        fs = FakeSelf19()
+        SR.Handler._api_admin_delete(fs, f"/api/orders/{o52}")
+    return out
+
+
+SR.log_event = _deleting_le52
+PROV21.tg_mode = "ok"
+SR._fire_deep_scan_notification(row52)
+SR.log_event = _real_le52
+check("N52 (5b): order deleted between the QUEUED record "
+      "and the ping: no ping attempted, no lock left",
+      PROV21.tg_attempts(o52) == []
+      and lock_row18(f"notify:{o52}") is None)
+
+_ureq18.urlopen = _real_urlopen18
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
