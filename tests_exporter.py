@@ -366,6 +366,187 @@ def main():
           "zero) sanitized to the 15s default; a valid value "
           "passes through", ok_k2)
 
+    # ---- (l) config guard, second name: (h) covers ledger ==
+    #           DB; a DB sitting at the ledger's TEMP path must
+    #           also be refused — save_ledger opens that name
+    #           with "w" before the replace and would truncate
+    #           the DB. The temp name is built here by hand
+    #           (.<ledger basename>.tmp-<pid>, in the ledger's
+    #           own directory — the documented naming) so the
+    #           specimen exercises the behaviour on any tree,
+    #           not a helper's existence.
+    dirL = os.path.join(tmp, "caseL")
+    os.makedirs(dirL)
+    inboxL = os.path.join(dirL, "inbox")
+    os.makedirs(inboxL)
+    ledgerL = os.path.join(dirL, "ledger.json")
+    dbL = os.path.join(
+        dirL, f".{os.path.basename(ledgerL)}.tmp-{os.getpid()}")
+    make_db(dbL, [(161, payload_for(161), "queued")])
+    with real_open(dbL, "rb") as fh:
+        dbL_bytes = fh.read()
+    refusedL = False
+    err_buf = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = err_buf
+    try:
+        try:
+            exporter.export_once(dbL, inboxL, ledgerL)
+        except ValueError:
+            refusedL = True
+    finally:
+        sys.stderr = old_stderr
+    dbL_intact = os.path.isfile(dbL)
+    if dbL_intact:
+        with real_open(dbL, "rb") as fh:
+            dbL_intact = fh.read() == dbL_bytes
+    check("(l) DB path == ledger TEMP path: refusal logged, "
+          "DB bytes unchanged, nothing exported, no ledger "
+          "written",
+          refusedL and dbL_intact
+          and os.listdir(inboxL) == []
+          and not os.path.exists(ledgerL)
+          and "MISCONFIGURATION" in err_buf.getvalue())
+
+    # ---- (m) ledger DIRECTORY fsync failure AFTER the
+    #           replace: the new entry is VISIBLE in the ledger
+    #           file, but its durability was never established.
+    #           The export counts as FAILED and the entry is
+    #           suspect: a later pass re-exports when the inbox
+    #           file is missing (arm A) and confirms/skips when
+    #           the file is present with a matching hash
+    #           (arm B). os.fsync is patched to fail ONLY for
+    #           the ledger directory's fd (matched by inode);
+    #           the inbox directory and the ledger file fsync
+    #           normally.
+    def ledger_dir_fsync_case(case_dir, order_id):
+        os.makedirs(case_dir)
+        dbM = os.path.join(case_dir, "site.db")
+        inboxM = os.path.join(case_dir, "inbox")
+        os.makedirs(inboxM)
+        ledgerM = os.path.join(case_dir, "ledger.json")
+        pM = payload_for(order_id)
+        make_db(dbM, [(order_id, pM, "queued")])
+        ledger_dir_ino = os.stat(case_dir).st_ino
+        real_f = os.fsync
+
+        def picky_fsync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode) \
+                    and st.st_ino == ledger_dir_ino:
+                raise OSError(
+                    "simulated ledger-dir fsync failure")
+            return real_f(fd)
+
+        os.fsync = picky_fsync
+        statsM = None
+        try:
+            statsM = exporter.export_once(dbM, inboxM, ledgerM)
+        except Exception:
+            statsM = None
+        finally:
+            os.fsync = real_f
+        return statsM, dbM, inboxM, ledgerM, pM
+
+    dirMA = os.path.join(tmp, "caseMA")
+    statsMA1, dbMA, inboxMA, ledgerMA, p171 = \
+        ledger_dir_fsync_case(dirMA, 171)
+    ledMA1 = exporter.load_ledger(ledgerMA)
+    f171 = os.path.join(inboxMA, "fulfilment-171.json")
+    check("(m1) ledger dir-fsync failure after replace: the "
+          "export counts as failed (stats returned, not "
+          "raised) although the entry is visible in the "
+          "ledger",
+          statsMA1 is not None and statsMA1["exported"] == 0
+          and statsMA1["errors"] == 1
+          and ledMA1.get("171", {}).get("sha256")
+          == hashlib.sha256(p171.encode("utf-8")).hexdigest()
+          and os.path.isfile(f171))
+    os.remove(f171)  # the unconfirmed file is lost
+    statsMA2 = exporter.export_once(dbMA, inboxMA, ledgerMA)
+    bodyMA = None
+    if os.path.isfile(f171):
+        with real_open(f171, "rb") as fh:
+            bodyMA = fh.read()
+    check("(m2) suspect entry + missing inbox file: the row "
+          "is RE-EXPORTED despite the visible ledger entry",
+          statsMA2["exported"] == 1
+          and bodyMA == p171.encode("utf-8"))
+
+    dirMB = os.path.join(tmp, "caseMB")
+    statsMB1, dbMB, inboxMB, ledgerMB, p172 = \
+        ledger_dir_fsync_case(dirMB, 172)
+    f172 = os.path.join(inboxMB, "fulfilment-172.json")
+    beforeMB = (sha256_file(f172), os.stat(f172).st_mtime_ns)
+    time.sleep(0.02)
+    statsMB2 = exporter.export_once(dbMB, inboxMB, ledgerMB)
+    afterMB = (sha256_file(f172), os.stat(f172).st_mtime_ns)
+    check("(m3) suspect entry + present, hash-matching inbox "
+          "file: confirmed and skipped (file untouched)",
+          statsMB1 is not None and statsMB1["errors"] == 1
+          and statsMB2["skipped"] == 1
+          and statsMB2["exported"] == 0 and beforeMB == afterMB)
+    os.remove(f172)
+    statsMB3 = exporter.export_once(dbMB, inboxMB, ledgerMB)
+    check("(m4) once confirmed, the entry has left the "
+          "suspect set: a later deletion is the accepted "
+          "residual (still skipped, no re-export)",
+          statsMB3["skipped"] == 1 and not os.path.exists(f172))
+
+    # ---- (n) sleep overflow + handler fragility: huge finite
+    #           poll values are clamped before they can reach
+    #           time.sleep (which would raise OverflowError),
+    #           and the loop survives a log function that
+    #           raises on every call — the outer guard's own
+    #           log and recovery sleep are themselves guarded.
+    ok_n1 = False
+    try:
+        ok_n1 = (exporter.sanitize_poll_sec(1e6) == 3600
+                 and exporter.sanitize_poll_sec(1e308) == 3600
+                 and exporter.sanitize_poll_sec(3600) == 3600
+                 and exporter.sanitize_poll_sec(2.5) == 2.5)
+    except Exception:
+        ok_n1 = False
+    check("(n1) sanitize_poll_sec clamps huge finite values "
+          "(1e6, 1e308) to the 3600s maximum without raising; "
+          "ordinary values pass through", ok_n1)
+
+    dirN = os.path.join(tmp, "caseN")
+    os.makedirs(dirN)
+    cfgN = {"db_path": os.path.join(dirN, "site.db"),
+            "inbox_dir": os.path.join(dirN, "missing-inbox"),
+            "ledger_path": os.path.join(dirN, "ledger.json"),
+            "poll_sec": 5}
+    real_log = exporter.log
+    real_sleep = time.sleep
+    sleep_calls = {"n": 0}
+
+    def raising_log(msg):
+        raise RuntimeError("simulated logging failure")
+
+    def counting_sleep(sec):
+        sleep_calls["n"] += 1
+        if sleep_calls["n"] >= 4:
+            raise KeyboardInterrupt
+
+    exporter.log = raising_log
+    time.sleep = counting_sleep
+    ki_raised = False
+    try:
+        exporter.run_loop(cfgN)
+    except KeyboardInterrupt:
+        ki_raised = True
+    except Exception:
+        ki_raised = False
+    finally:
+        exporter.log = real_log
+        time.sleep = real_sleep
+    check("(n2) run_loop survives a log that raises on every "
+          "call: iterations continue (the counting recovery "
+          "sleep is reached repeatedly) and the loop exits "
+          "only via KeyboardInterrupt",
+          ki_raised and sleep_calls["n"] >= 4)
+
     failed = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(failed)}/{len(PASS)} exporter checks pass")
     if failed:
