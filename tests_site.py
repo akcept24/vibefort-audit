@@ -1012,6 +1012,103 @@ check("W24 sweep settles the preserved link",
       and count("events", "event='STRIPE_UNMATCHED' AND "
                 "detail LIKE '%evt_w24%'", ()) == 1)
 
+# ---- Delta-11 catalog (added 2026-11-09, round 11) ----
+# W25: the consult's fenced loser — the payment already won
+#      another order, so the provisional event is relinked to the
+#      WINNING order and acked as its duplicate. The NEW order it
+#      was provisionally linked to gets no effects, no receipt.
+o25a = mk_order("w25a@test.dev", "Deep Scan", 29)
+c = db()
+row_25a = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                         (o25a,)).fetchone())
+c.close()
+S.transition_order_status(row_25a, "PAID",
+                          paid_event_id="evt_w25_win",
+                          paid_pi="pi_w25")
+o25b = mk_order("w25b@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w25_x','checkout.session.completed',?,?,?,2900)",
+          (o25b, S.utcnow(), "pi_w25"))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w25_x"), sess(2900, "w25b@test.dev",
+                                       pi="pi_w25"))
+c = db()
+link25 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w25_x'").fetchone()[0]
+c.close()
+check("W25 consult fenced loser relinks to the winner",
+      r[1].get("duplicate") is True and link25 == o25a
+      and order_status(o25b) == "NEW"
+      and count("fulfilment_requests", "order_id=?", (o25b,)) == 0
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o25b,)) == 0
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w25_x%'", ()) == 0)
+
+# W26: the boot sweep settles the same fenced loser the same way.
+o26a = mk_order("w26a@test.dev", "Deep Scan", 29)
+c = db()
+row_26a = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                         (o26a,)).fetchone())
+c.close()
+S.transition_order_status(row_26a, "PAID",
+                          paid_event_id="evt_w26_win",
+                          paid_pi="pi_w26")
+o26b = mk_order("w26b@test.dev", "Deep Scan", 29)
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w26_x','checkout.session.completed',?,?,?,2900)",
+          (o26b, S.utcnow(), "pi_w26"))
+c.commit()
+c.close()
+S.sweep_paid_side_effects()
+c = db()
+link26 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w26_x'").fetchone()[0]
+c.close()
+check("W26 sweep fenced loser relinks to the winner",
+      link26 == o26a and order_status(o26b) == "NEW"
+      and count("fulfilment_requests", "order_id=?", (o26b,)) == 0)
+
+# W27: without the unique index (legacy duplicate paid_pi data
+#      blocks its creation) an identity transition fails CLOSED
+#      instead of running on the racy pre-check alone.
+c = S.db_connect()
+c.execute("DROP INDEX idx_orders_paid_pi")
+c.execute("UPDATE orders SET paid_pi='pi_w27_dup' WHERE id=?",
+          (o25a,))
+c.execute("UPDATE orders SET paid_pi='pi_w27_dup' WHERE id=?",
+          (o26a,))
+c.commit()
+c.close()
+o27 = mk_order("w27@test.dev", "Deep Scan", 29)
+c = db()
+row_27 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o27,)).fetchone())
+c.close()
+refused = False
+try:
+    S.transition_order_status(row_27, "PAID",
+                              paid_event_id="evt_w27",
+                              paid_pi="pi_w27_new")
+except RuntimeError:
+    refused = True
+check("W27 unfenced transition fails closed", refused
+      and order_status(o27) == "NEW")
+# Restore a fenced register for any later runs of this file.
+c = S.db_connect()
+c.execute("UPDATE orders SET paid_pi='pi_w25' WHERE id=?", (o25a,))
+c.execute("UPDATE orders SET paid_pi='pi_w26' WHERE id=?", (o26a,))
+c.commit()
+c.close()
+S.db_connect().close()  # recreates the index now that data is clean
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

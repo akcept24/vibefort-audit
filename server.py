@@ -1637,6 +1637,43 @@ class Handler(BaseHTTPRequestHandler):
                                 winner_pi = order_d.get("paid_pi")
                                 proven = bool(winner_pi and pi
                                               and winner_pi == pi)
+                    if order_d["status"] == "NEW" and not proven:
+                        # The transition was FENCED (the status
+                        # never moved): this payment already won a
+                        # different order (Codex delta-11 #1). This
+                        # event belongs to THAT order — relink it
+                        # there and ack as its duplicate; never
+                        # fire this NEW order's side effects or
+                        # receipt.
+                        won_order = None
+                        conn = db_connect()
+                        try:
+                            grow = conn.execute(
+                                "SELECT id FROM orders WHERE "
+                                "paid_pi=?", (pi,)).fetchone()
+                            if grow:
+                                won_order = grow[0]
+                        finally:
+                            conn.close()
+                        if won_order is not None and \
+                                won_order != linked_id:
+                            with _db_lock:
+                                conn = db_connect()
+                                conn.execute(
+                                    "UPDATE stripe_events SET "
+                                    "order_id=? WHERE event_id=?",
+                                    (won_order, eid))
+                                conn.commit()
+                                conn.close()
+                            log_event(won_order, "STRIPE_DUP_EVENT",
+                                      f"event={eid} pi={pi} already "
+                                      "matched to this order")
+                            self._send_json(200, {"ok": True,
+                                                  "duplicate": True})
+                            return
+                        raise RuntimeError(
+                            "transition fenced but no winning "
+                            "order found for this payment")
                     if order_d["status"] != "NEW" and not proven:
                         # Provisional loser — or an order whose
                         # winner was never recorded (admin-paid /
@@ -2247,6 +2284,21 @@ def transition_order_status(row, new_status, paid_event_id=None,
     with _db_lock:
         conn = db_connect()
         try:
+            if new_status == "PAID" and paid_pi is not None and \
+                    conn.execute(
+                        "SELECT 1 FROM sqlite_master WHERE "
+                        "type='index' AND "
+                        "name='idx_orders_paid_pi'").fetchone() \
+                    is None:
+                # The fence could not be installed (legacy
+                # duplicate paid_pi data): fail CLOSED — no
+                # identity transition without the atomic fence
+                # (Codex delta-11 #3). Reads and other flows are
+                # unaffected; the webhook answers 500 and Stripe
+                # retries while ops clean the register.
+                raise RuntimeError(
+                    "paid_pi unique index unavailable; refusing "
+                    "an unfenced payment transition")
             won = None
             if new_status == "PAID" and paid_pi is not None:
                 # The same payment must never win a second order
@@ -2387,9 +2439,37 @@ def sweep_paid_side_effects():
                     f"{row['ev_id']} deferred: {e!r}")
             continue
         try:
-            transition_order_status(
+            moved = transition_order_status(
                 dict(row), "PAID", paid_event_id=row["ev_id"],
                 paid_pi=row["ev_pi"])
+            if not moved:
+                # Fenced: this payment already won another order
+                # (Codex delta-11 #2). The event belongs to the
+                # winning order — relink it there as a duplicate.
+                conn = db_connect()
+                try:
+                    grow = conn.execute(
+                        "SELECT id FROM orders WHERE paid_pi=?",
+                        (row["ev_pi"],)).fetchone()
+                finally:
+                    conn.close()
+                if grow and grow[0] != row["id"]:
+                    with _db_lock:
+                        conn = db_connect()
+                        conn.execute(
+                            "UPDATE stripe_events SET order_id=? "
+                            "WHERE event_id=?",
+                            (grow[0], row["ev_id"]))
+                        conn.commit()
+                        conn.close()
+                    log_event(grow[0], "STRIPE_DUP_EVENT",
+                              f"event={row['ev_id']} "
+                              f"pi={row['ev_pi']} already matched "
+                              "to this order")
+                else:
+                    log(f"boot sweep: transition for linked order "
+                        f"{row['id']} lost without a recorded "
+                        f"winner; left for the next pass")
         except Exception as e:
             log(f"boot sweep: transition for linked order "
                 f"{row['id']} failed: {e!r}")
@@ -2414,11 +2494,6 @@ def sweep_paid_side_effects():
                 f"failed: {e!r}")
     for ev in evs:
         try:
-            # Never tell a payer the audit is queued while the
-            # queueing itself failed (Codex delta-5 finding 3):
-            # the receipt goes only once the effects are on record.
-            if not _paid_effects_done(ev["order_id"]):
-                continue
             conn = db_connect()
             conn.row_factory = sqlite3.Row
             orow = conn.execute("SELECT * FROM orders WHERE id=?",
@@ -2463,6 +2538,11 @@ def sweep_paid_side_effects():
                         "WHERE event_id=?", (ev["event_id"],))
                     conn.commit()
                     conn.close()
+                continue
+            # Never tell a payer the audit is queued while the
+            # queueing itself failed (Codex delta-5 finding 3):
+            # the receipt goes only once the effects are on record.
+            if not _paid_effects_done(ev["order_id"]):
                 continue
             _ensure_paid_receipt(order_d, ev["amount"])
         except Exception as e:
