@@ -162,6 +162,13 @@ def db_connect():
         type TEXT NOT NULL,
         order_id INTEGER,
         received_at TEXT NOT NULL)""")
+    mcols = [r[1] for r in conn.execute("PRAGMA table_info(monitors)")]
+    if "pending_alert" not in mcols:
+        conn.execute("ALTER TABLE monitors ADD COLUMN pending_alert TEXT")
+    scols = [r[1] for r in conn.execute("PRAGMA table_info(stripe_events)")]
+    if "payment_intent" not in scols:
+        conn.execute(
+            "ALTER TABLE stripe_events ADD COLUMN payment_intent TEXT")
     return conn
 
 
@@ -1406,24 +1413,98 @@ class Handler(BaseHTTPRequestHandler):
         if session.get("payment_status") != "paid":
             self._send_json(200, {"ok": True, "ignored": "not paid"})
             return
+        try:
+            self._stripe_process(event, session)
+        except Exception as e:
+            # Roll the dedupe record back so Stripe's retry reprocesses
+            # the event from scratch, and answer 500 so it does retry.
+            log(f"stripe webhook processing failed for {eid}: {e!r}")
+            try:
+                with _db_lock:
+                    conn = db_connect()
+                    conn.execute(
+                        "DELETE FROM stripe_events WHERE event_id=? "
+                        "AND order_id IS NULL", (eid,))
+                    conn.commit()
+                    conn.close()
+            except Exception:
+                pass
+            self._send_json(500, {"ok": False, "error": "processing"})
+
+    def _stripe_process(self, event, session):
+        etype = event.get("type") or ""
+        eid = event.get("id") or ""
+        amount = session.get("amount_total")
+        currency = _s(session.get("currency") or "").lower()
+        pi = session.get("payment_intent")
+        email = _s((session.get("customer_details") or {}).get("email")
+                   or session.get("customer_email") or "").lower()
+        # Dedupe with completion awareness: an event row whose
+        # processing never reached a terminal log (crash between the
+        # dedupe commit and the transition — Codex/GLM finding
+        # 2026-11-09) is processed now, not acked as a duplicate.
         with _db_lock:
             conn = db_connect()
             try:
-                cur = conn.execute(
-                    "INSERT OR IGNORE INTO stripe_events(event_id, type,"
-                    " order_id, received_at) VALUES(?,?,NULL,?)",
-                    (eid, etype, utcnow()))
-                conn.commit()
-                fresh = cur.rowcount > 0
+                existing = conn.execute(
+                    "SELECT order_id FROM stripe_events WHERE event_id=?",
+                    (eid,)).fetchone()
+                if existing is None:
+                    conn.execute(
+                        "INSERT INTO stripe_events(event_id, type,"
+                        " order_id, received_at, payment_intent)"
+                        " VALUES(?,?,NULL,?,?)",
+                        (eid, etype, utcnow(), pi))
+                    conn.commit()
+                    state = "fresh"
+                elif existing[0] is not None:
+                    state = "done"
+                else:
+                    done_log = conn.execute(
+                        "SELECT 1 FROM events WHERE event IN "
+                        "('STRIPE_PAID','STRIPE_UNMATCHED') AND "
+                        "detail LIKE ?",
+                        (f"%event={eid}%",)).fetchone()
+                    state = "done" if done_log else "incomplete"
+                    if state == "incomplete" and pi:
+                        # Refresh the stored payment_intent: the row
+                        # may predate it (crash before the first
+                        # processing got this far), and the duplicate
+                        # check below keys on it.
+                        conn.execute(
+                            "UPDATE stripe_events SET payment_intent=? "
+                            "WHERE event_id=?", (pi, eid))
+                        conn.commit()
             finally:
                 conn.close()
-        if not fresh:
+        if state == "done":
             self._send_json(200, {"ok": True, "duplicate": True})
             return
-        amount = session.get("amount_total")
-        tier = AMOUNT_TO_TIER.get(amount)
-        email = _s((session.get("customer_details") or {}).get("email")
-                   or session.get("customer_email") or "").lower()
+        # One payment can arrive as two events (completed +
+        # async_payment_succeeded, different ids, same payment_intent):
+        # the second is a quiet duplicate, not an unmatched alert.
+        if pi:
+            conn = db_connect()
+            try:
+                prior = conn.execute(
+                    "SELECT order_id FROM stripe_events WHERE "
+                    "payment_intent=? AND order_id IS NOT NULL AND "
+                    "event_id<>?", (pi, eid)).fetchone()
+            finally:
+                conn.close()
+            if prior:
+                with _db_lock:
+                    conn = db_connect()
+                    conn.execute(
+                        "UPDATE stripe_events SET order_id=? "
+                        "WHERE event_id=?", (prior[0], eid))
+                    conn.commit()
+                    conn.close()
+                log_event(prior[0], "STRIPE_DUP_EVENT",
+                          f"event={eid} pi={pi} already matched")
+                self._send_json(200, {"ok": True, "duplicate": True})
+                return
+        tier = AMOUNT_TO_TIER.get(amount) if currency == "usd" else None
         order = None
         ambiguous = False
         if tier and email:
@@ -1441,6 +1522,7 @@ class Handler(BaseHTTPRequestHandler):
             elif len(rows) > 1:
                 ambiguous = True
         if order is not None:
+            won = transition_order_status(order, "PAID")
             with _db_lock:
                 conn = db_connect()
                 try:
@@ -1450,22 +1532,79 @@ class Handler(BaseHTTPRequestHandler):
                     conn.commit()
                 finally:
                     conn.close()
-            transition_order_status(order, "PAID")
             log_event(order["id"], "STRIPE_PAID",
-                      f"event={eid} amount={amount} tier={tier}")
+                      f"event={eid} amount={amount} tier={tier} "
+                      f"race={'won' if won else 'lost'}")
+            # The payer hears from us immediately — a payment with no
+            # acknowledgement reads as money into a void.
+            amt_label = f"${amount / 100:,.2f}"
+            rcpt_text = (
+                f"Hi {order['name']},\n\n"
+                f"We've received your payment of {amt_label} for a "
+                f"{tier} of {order['url']}.\n\n"
+                "Your audit is now in the queue, and the delivery "
+                "times in the pricing section of our site run from "
+                "today. We confirm the scope of your app within one "
+                "business day; if the work cannot run as briefed, we "
+                "will write to you before starting and refund your "
+                "payment in full.\n\n"
+                "Questions — just reply to this email.\n\n"
+                "— ShipAudit Lab\n"
+                "Security for what you shipped.")
+            rcpt_html = email_template.render_email(
+                eyebrow="Payment received",
+                headline="Payment received.",
+                body_html=(
+                    email_template.para(f"Hi {order['name']},")
+                    + email_template.para(
+                        f"We've received your payment of {amt_label} "
+                        f"for a {tier} of {order['url']}.")
+                    + email_template.details_table([
+                        ("Reference", f"Order #{order['id']}"),
+                        ("Service", tier),
+                        ("Amount paid", amt_label),
+                        ("Target", order["url"]),
+                        ("Status", "Paid — in the queue"),
+                    ])
+                    + email_template.para(
+                        "Your audit is now in the queue, and the "
+                        "delivery times in the pricing section of our "
+                        "site run from today. We confirm the scope of "
+                        "your app within one business day; if the work "
+                        "cannot run as briefed, we will write to you "
+                        "before starting and refund your payment in "
+                        "full.")
+                    + email_template.para(
+                        "Questions — just reply to this email.")),
+                reason="You received this email because a payment "
+                       "was completed for your ShipAudit Lab order.")
+            eok, edet = send_resend(
+                order["email"], f"Payment received — {tier}",
+                rcpt_text, html=rcpt_html)
+            log_event(order["id"],
+                      "PAID_EMAIL_SENT" if eok else "PAID_EMAIL_FAILED",
+                      edet)
             send_telegram(
                 f"ShipAudit Lab: Stripe payment matched — order "
-                f"#{order['id']} ({tier}, ${amount / 100:.2f}) marked "
-                f"PAID automatically.")
+                f"#{order['id']} ({tier}, {amt_label}) marked PAID "
+                f"automatically.")
             self._send_json(200, {"ok": True, "order_id": order["id"]})
             return
         log_event(None, "STRIPE_UNMATCHED",
                   f"event={eid} tier={tier} email={email} "
-                  f"amount={amount} ambiguous={ambiguous}")
-        send_telegram(
+                  f"amount={amount} currency={currency} "
+                  f"ambiguous={ambiguous}")
+        tok, _ = send_telegram(
             f"ShipAudit Lab: Stripe payment NOT matched — tier={tier} "
-            f"email={email} amount={amount} ambiguous={ambiguous} "
-            f"event={eid}. Match it manually in the admin register.")
+            f"email={email} amount={amount} currency={currency} "
+            f"ambiguous={ambiguous} event={eid}. Match it manually "
+            f"in the admin register.")
+        if not tok:
+            # The durable log exists, but HQ has not actually been
+            # alerted: fail the delivery so Stripe retries and the
+            # alert is attempted again (the dedupe rollback in the
+            # caller clears the event row for the retry).
+            raise RuntimeError("unmatched alert telegram failed")
         self._send_json(200, {"ok": True, "matched": False})
 
     def _api_admin_post(self, path):
@@ -1506,7 +1645,11 @@ class Handler(BaseHTTPRequestHandler):
             row = dict(row)
         finally:
             conn.close()
-        transition_order_status(row, new_status)
+        if not transition_order_status(row, new_status):
+            self._send_json(409, {"ok": False,
+                                  "error": "concurrent transition; "
+                                           "status already moved"})
+            return
         self._send_json(200, {"ok": True, "id": oid, "status": new_status})
 
     def _api_admin_delete(self, path):
@@ -1814,16 +1957,26 @@ def transition_order_status(row, new_status):
     with _db_lock:
         conn = db_connect()
         try:
-            conn.execute("UPDATE orders SET status=? WHERE id=?",
-                         (new_status, oid))
+            cur = conn.execute(
+                "UPDATE orders SET status=? WHERE id=? AND status=?",
+                (new_status, oid, row["status"]))
             conn.commit()
+            won = cur.rowcount > 0
         finally:
             conn.close()
+    if not won:
+        # A concurrent transition (webhook vs admin) got there first;
+        # its side effects are the ones that count.
+        log_event(oid, "STATUS_RACE",
+                  f"{row['status']} -> {new_status} lost to a "
+                  "concurrent transition; side effects skipped")
+        return False
     log_event(oid, "STATUS_CHANGED", f"{row['status']} -> {new_status}")
     if new_status == "PAID" and row["tier"] == "Monitoring":
         activate_monitor(row)
     if new_status == "PAID" and row["tier"] == "Deep Scan":
         on_deep_scan_paid(row)
+    return True
 
 
 def _stripe_signature_ok(raw, header, secret):
@@ -1966,6 +2119,50 @@ def _scan_with_timeout(target, timeout=None):
     return box["r"]
 
 
+def _monitor_alert_parts(mon, host, order_id, d_new, d_gone,
+                         d_grade, d_score):
+    """Compose the monitoring change-alert (text + HTML)
+    for one delivered diff."""
+    body = (
+        f"Hi {mon['name']},\n\n"
+        f"Our weekly rescan of {mon['url']} found changes since the "
+        f"previous scan.\n\n"
+        f"Current grade: {d_grade} ({d_score}/100)\n\n"
+        f"New findings ({len(d_new)}):\n{_fmt_changes(d_new)}\n\n"
+        f"Resolved since the last scan ({len(d_gone)}):\n"
+        f"{_fmt_changes(d_gone)}\n\n"
+        "Reply to this email if you would like the full updated "
+        "report.\n\n"
+        "- ShipAudit Lab\n"
+        "Security for what you shipped.")
+    body_html = email_template.render_email(
+        eyebrow="Monitoring · Weekly rescan",
+        headline=f"Changes detected on {host}",
+        body_html=(
+            email_template.para(f"Hi {mon['name']},")
+            + email_template.para(
+                f"Our weekly rescan of {mon['url']} found changes "
+                f"since the previous scan.")
+            + email_template.grade_block(d_grade, d_score)
+            + email_template.details_table([
+                ("Target", mon["url"]),
+                ("Service", "Monitoring — weekly rescan"),
+                ("Reference", f"Order #{order_id}"),
+            ])
+            + email_template.list_heading(
+                f"New findings ({len(d_new)})")
+            + _fmt_changes_html(d_new)
+            + email_template.list_heading(
+                f"Resolved since the last scan ({len(d_gone)})")
+            + _fmt_changes_html(d_gone)
+            + email_template.para(
+                "Reply to this email if you would like the full "
+                "updated report.")),
+        reason="You received this email because Monitoring is active "
+               "for this app on your ShipAudit Lab account.")
+    return body, body_html
+
+
 def _run_monitor(mon):
     order_id = mon["order_id"]
     host = urllib.parse.urlparse(mon["url"]).hostname or ""
@@ -2016,96 +2213,110 @@ def _run_monitor(mon):
             prev = json.loads(mon["last_digest"])
         except Exception:
             prev = None
-    new = [d for d in digest if d not in prev] if prev is not None else []
-    gone = [d for d in prev if d not in digest] if prev is not None else []
-    changed = prev is not None and bool(new or gone)
-    alert_ok = None
-    alert_detail = ""
-    if changed:
-        log_event(order_id, "MONITOR_CHANGED",
-                  f"new={len(new)} resolved={len(gone)} "
-                  f"grade={grade} score={score}")
-    body = (
-        f"Hi {mon['name']},\n\n"
-        f"Our weekly rescan of {mon['url']} found changes since the "
-        f"previous scan.\n\n"
-        f"Current grade: {grade} ({score}/100)\n\n"
-        f"New findings ({len(new)}):\n{_fmt_changes(new)}\n\n"
-        f"Resolved since the last scan ({len(gone)}):\n"
-        f"{_fmt_changes(gone)}\n\n"
-        "Reply to this email if you would like the full updated "
-        "report.\n\n"
-        "- ShipAudit Lab\n"
-        "Security for what you shipped.")
-    body_html = email_template.render_email(
-        eyebrow="Monitoring · Weekly rescan",
-        headline=f"Changes detected on {host}",
-        body_html=(
-            email_template.para(f"Hi {mon['name']},")
-            + email_template.para(
-                f"Our weekly rescan of {mon['url']} found changes "
-                f"since the previous scan.")
-            + email_template.grade_block(grade, score)
-            + email_template.details_table([
-                ("Target", mon["url"]),
-                ("Service", "Monitoring — weekly rescan"),
-                ("Reference", f"Order #{order_id}"),
-            ])
-            + email_template.list_heading(
-                f"New findings ({len(new)})")
-            + _fmt_changes_html(new)
-            + email_template.list_heading(
-                f"Resolved since the last scan ({len(gone)})")
-            + _fmt_changes_html(gone)
-            + email_template.para(
-                "Reply to this email if you would like the full "
-                "updated report.")),
-        reason="You received this email because Monitoring is active "
-               "for this app on your ShipAudit Lab account.")
-    if changed:
-        alert_ok, alert_detail = send_resend(
+    pending = None
+    if mon.get("pending_alert"):
+        try:
+            pending = json.loads(mon["pending_alert"])
+        except Exception:
+            pending = None
+    def _save_mon(digest_json, next_run, pending_json):
+        with _db_lock:
+            conn = db_connect()
+            conn.execute(
+                "UPDATE monitors SET last_run_at=?, last_scan_id=?, "
+                "last_digest=?, next_run_at=?, pending_alert=? "
+                "WHERE id=?",
+                (time.time(), scan_id, digest_json, next_run,
+                 pending_json, mon["id"]))
+            conn.commit()
+            conn.close()
+
+    def _attempt(d_new, d_gone, d_grade, d_score):
+        body, body_html = _monitor_alert_parts(
+            mon, host, order_id, d_new, d_gone, d_grade, d_score)
+        return send_resend(
             mon["email"], f"Monitoring: changes detected on {host}",
             body, html=body_html)
-        log_event(order_id,
-                  "MONITOR_ALERT_SENT" if alert_ok
-                  else "MONITOR_ALERT_FAILED",
-                  alert_detail)
-        send_telegram(
-            f"ShipAudit Lab: monitoring changes on {mon['url']} - "
-            f"{len(new)} new, {len(gone)} resolved; grade {grade} "
-            f"({score}). Client alert: "
-            f"{'SENT' if alert_ok else 'FAILED - ' + alert_detail}")
-    # The digest advances only after the client alert is delivered.
-    # Advancing it earlier (the pre-2026-11-09 order) lost alerts
-    # forever when the send failed: the next rescan compared against
-    # the new digest and reported "no changes". A failed alert now
-    # holds the old digest and retries in an hour.
-    hold = changed and not alert_ok
+
     now = time.time()
-    with _db_lock:
-        conn = db_connect()
-        conn.execute(
-            "UPDATE monitors SET last_run_at=?, last_scan_id=?, "
-            "last_digest=?, next_run_at=? WHERE id=?",
-            (now, scan_id,
-             mon["last_digest"] if hold else json.dumps(digest),
-             now + (3600 if hold else MONITOR_INTERVAL),
-             mon["id"]))
-        conn.commit()
-        conn.close()
-    if hold:
-        log_event(order_id, "MONITOR_ALERT_RETRY",
-                  "alert failed; digest held, rescan in 1h")
+    # 1) A retained alert from an earlier failed send goes first. It
+    #    reports what was true when it was detected, even if the
+    #    findings have since reverted (Codex delta, 2026-11-09) —
+    #    retaining only the digest would have lost it. The digest
+    #    advances only when an alert is actually delivered; retries
+    #    run hourly and escalate to weekly after the 3rd failure
+    #    (GLM delta: an unbounded hourly retry spins forever).
+    if pending:
+        ok_p, det_p = _attempt(pending["new"], pending["gone"],
+                               pending["grade"], pending["score"])
+        if not ok_p:
+            attempts = int(pending.get("attempts", 1)) + 1
+            pending["attempts"] = attempts
+            log_event(order_id, "MONITOR_ALERT_FAILED",
+                      f"retained alert attempt {attempts}: {det_p}")
+            if attempts == 3:
+                log_event(order_id, "MONITOR_ALERT_ESCALATED",
+                          "retained alert undelivered after 3 "
+                          "attempts; hourly retries stop, weekly "
+                          "retries continue")
+                send_telegram(
+                    f"ShipAudit Lab: monitoring alert for "
+                    f"{mon['url']} UNDELIVERED after 3 attempts "
+                    f"({det_p}); digest held, weekly retries "
+                    f"continue. Check the mail pipeline.")
+            _save_mon(mon["last_digest"],
+                      now + (3600 if attempts < 3
+                             else MONITOR_INTERVAL),
+                      json.dumps(pending))
+            log_event(order_id, "MONITOR_ALERT_RETRY",
+                      f"attempt {attempts}; digest held")
+            return
+        log_event(order_id, "MONITOR_ALERT_SENT",
+                  f"retained alert delivered: {det_p}")
+        send_telegram(
+            f"ShipAudit Lab: retained monitoring alert for "
+            f"{mon['url']} delivered ({len(pending['new'])} new, "
+            f"{len(pending['gone'])} resolved).")
+        prev = pending["digest_after"]
+        pending = None
+    # 2) This scan's own diff, against what the client was last told.
     if prev is None:
+        _save_mon(json.dumps(digest), now + MONITOR_INTERVAL, None)
         log_event(order_id, "MONITOR_BASELINE",
                   f"grade={grade} score={score} findings={len(digest)}")
         send_telegram(
             f"ShipAudit Lab: monitoring baseline set for {mon['url']} - "
             f"grade {grade} ({score}), {len(digest)} findings. "
             "Weekly rescans from here.")
-    elif not changed:
+        return
+    new = [d for d in digest if d not in prev]
+    gone = [d for d in prev if d not in digest]
+    if not new and not gone:
+        _save_mon(json.dumps(digest), now + MONITOR_INTERVAL, None)
         log_event(order_id, "MONITOR_RESCAN",
                   f"no changes; grade={grade} score={score}")
+        return
+    log_event(order_id, "MONITOR_CHANGED",
+              f"new={len(new)} resolved={len(gone)} "
+              f"grade={grade} score={score}")
+    ok, detail = _attempt(new, gone, grade, score)
+    log_event(order_id,
+              "MONITOR_ALERT_SENT" if ok else "MONITOR_ALERT_FAILED",
+              detail)
+    send_telegram(
+        f"ShipAudit Lab: monitoring changes on {mon['url']} - "
+        f"{len(new)} new, {len(gone)} resolved; grade {grade} "
+        f"({score}). Client alert: "
+        f"{'SENT' if ok else 'FAILED - ' + detail}")
+    if ok:
+        _save_mon(json.dumps(digest), now + MONITOR_INTERVAL, None)
+    else:
+        retained = {"new": new, "gone": gone, "grade": grade,
+                    "score": score, "digest_after": digest,
+                    "attempts": 1, "since": utcnow()}
+        _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
+        log_event(order_id, "MONITOR_ALERT_RETRY",
+                  "attempt 1; alert retained, digest held")
 
 
 def _monitor_loop():
