@@ -659,6 +659,252 @@ def main():
           "the loop exits only via KeyboardInterrupt",
           ki_p and not other_p and sleep_calls_p["n"] >= 4)
 
+    # ---- (q) the recovery wait survives a BROKEN monotonic
+    #           clock: time.monotonic raises on EVERY call.
+    #           The recovery wait is a DUAL-clock wait — a
+    #           clock that raises reports no new elapsed for
+    #           that slice and the other clock governs — so
+    #           the failed iteration still waits out its
+    #           recovery delay by the wall clock (~1s between
+    #           the first and second pass) and run_loop
+    #           carries on. (On the round-4 loop, the
+    #           monotonic exception escaped _recovery_wait —
+    #           its clock calls sat outside the slice guard —
+    #           and killed run_loop outright: no second pass.)
+    #           The handler is driven by a flaky stop event
+    #           whose FIRST wait() raises (the interval wait
+    #           failing is what lands an iteration in the
+    #           recovery handler at all).
+    dirQ = os.path.join(tmp, "caseQ")
+    os.makedirs(dirQ)
+    cfgQ = {"db_path": os.path.join(dirQ, "site.db"),
+            "inbox_dir": os.path.join(dirQ, "inbox"),
+            "ledger_path": os.path.join(dirQ, "ledger.json"),
+            "poll_sec": 0.05}
+    real_export_once_q = exporter.export_once
+    real_monotonic_q = time.monotonic
+    pass_times_q = []
+    loop_end_q = {}
+
+    class FlakyEventQ:
+        """A stop event whose first wait() raises; later
+        waits are real short waits on an inner event."""
+
+        def __init__(self):
+            self._inner = threading.Event()
+            self.wait_calls = 0
+
+        def is_set(self):
+            return self._inner.is_set()
+
+        def set(self):
+            self._inner.set()
+
+        def wait(self, timeout=None):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise RuntimeError("simulated interval-wait "
+                                   "failure")
+            return self._inner.wait(
+                min(timeout if timeout is not None else 0.05,
+                    0.05))
+
+    stop_q = FlakyEventQ()
+
+    def flaky_pass_q(db_path, inbox_dir, ledger_path):
+        pass_times_q.append(time.time())
+        if len(pass_times_q) == 1:
+            raise RuntimeError("simulated first-pass failure")
+        return {"exported": 0, "errors": 0}
+
+    def raising_monotonic_q():
+        raise RuntimeError("simulated monotonic failure")
+
+    def loop_thread_q():
+        try:
+            exporter.run_loop(cfgQ, stop_q)
+            loop_end_q["how"] = "returned"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_q["how"] = f"other:{type(e).__name__}"
+
+    exporter.export_once = flaky_pass_q
+    time.monotonic = raising_monotonic_q
+    th_q = threading.Thread(target=loop_thread_q, daemon=True)
+    try:
+        th_q.start()
+        deadline_q = time.time() + 6
+        while len(pass_times_q) < 2 and time.time() < deadline_q:
+            time.sleep(0.02)
+        gap_q = (pass_times_q[1] - pass_times_q[0]
+                 if len(pass_times_q) >= 2 else 0.0)
+    finally:
+        stop_q.set()
+        th_q.join(timeout=5)
+        exporter.export_once = real_export_once_q
+        time.monotonic = real_monotonic_q
+    check("(q) a time.monotonic that raises on every call "
+          "cannot kill the loop: the dual-clock recovery wait "
+          "is governed by the wall clock, the gap between the "
+          "failed first pass and the second pass is >= 0.8x "
+          "the recovery interval, and run_loop returns "
+          "cleanly on stop",
+          loop_end_q.get("how") == "returned"
+          and gap_q >= 0.8 * exporter.RECOVERY_SLEEP_SEC
+          and not th_q.is_alive())
+
+    # ---- (r) the recovery wait survives a LYING monotonic
+    #           clock: the first read returns the start, every
+    #           later read jumps forward by 10**6 seconds.
+    #           A dual-clock wait ends only when BOTH clocks
+    #           have accumulated the interval, so one clock's
+    #           forward jump cannot end it early: the gap
+    #           between the failed first pass and the second
+    #           pass stays >= 0.8x the recovery interval by
+    #           the (honest) wall clock. (On the round-4 loop
+    #           the deadline was computed from the jumped
+    #           clock alone and the wait ended almost
+    #           immediately.) The interval wait is broken via
+    #           a size-discriminating fake sleep (waits above
+    #           0.2s raise; recovery slices are <= 0.1s and
+    #           really sleep) so every iteration lands in the
+    #           recovery handler.
+    dirR = os.path.join(tmp, "caseR")
+    os.makedirs(dirR)
+    cfgR = {"db_path": os.path.join(dirR, "site.db"),
+            "inbox_dir": os.path.join(dirR, "inbox"),
+            "ledger_path": os.path.join(dirR, "ledger.json"),
+            "poll_sec": 5}
+    real_export_once_r = exporter.export_once
+    real_monotonic_r = time.monotonic
+    real_sleep_r = time.sleep
+    pass_times_r = []
+    loop_end_r = {}
+    stop_flag_r = threading.Event()
+    mono_base_r = real_monotonic_r()
+    mono_calls_r = {"n": 0}
+
+    def jumping_monotonic_r():
+        mono_calls_r["n"] += 1
+        if mono_calls_r["n"] == 1:
+            return mono_base_r
+        return mono_base_r + 10 ** 6
+
+    def failing_pass_r(db_path, inbox_dir, ledger_path):
+        pass_times_r.append(time.time())
+        raise RuntimeError("simulated pass failure")
+
+    def fake_sleep_r(sec):
+        if stop_flag_r.is_set():
+            raise KeyboardInterrupt
+        if sec > 0.2:
+            raise RuntimeError("simulated interval-wait "
+                               "failure")
+        real_sleep_r(sec)
+
+    def loop_thread_r():
+        try:
+            exporter.run_loop(cfgR)
+            loop_end_r["how"] = "returned"
+        except KeyboardInterrupt:
+            loop_end_r["how"] = "KeyboardInterrupt"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_r["how"] = f"other:{type(e).__name__}"
+
+    exporter.export_once = failing_pass_r
+    time.monotonic = jumping_monotonic_r
+    time.sleep = fake_sleep_r
+    th_r = threading.Thread(target=loop_thread_r, daemon=True)
+    try:
+        th_r.start()
+        real_sleep_r(1.6)
+        gap_r = (pass_times_r[1] - pass_times_r[0]
+                 if len(pass_times_r) >= 2 else 0.0)
+    finally:
+        stop_flag_r.set()
+        th_r.join(timeout=5)
+        exporter.export_once = real_export_once_r
+        time.monotonic = real_monotonic_r
+        time.sleep = real_sleep_r
+    check("(r) a time.monotonic that jumps forward by 10**6s "
+          "on its second read cannot end the recovery wait "
+          "early: the gap between the failed first pass and "
+          "the second pass is >= 0.8x the recovery interval "
+          "by the wall clock, and the loop exits only via "
+          "KeyboardInterrupt",
+          gap_r >= 0.8 * exporter.RECOVERY_SLEEP_SEC
+          and loop_end_r.get("how") == "KeyboardInterrupt"
+          and not th_r.is_alive())
+
+    # ---- (s) the handler never formats the exception it
+    #           caught: an exception whose __repr__ AND
+    #           __str__ both raise is raised by the interval
+    #           wait (a size-discriminating fake sleep). The
+    #           handler's log line must carry only the
+    #           exception's TYPE name, obtained defensively —
+    #           formatting the instance would raise a second
+    #           time INSIDE the handler and escape it without
+    #           recovery. Proof of survival: the loop
+    #           completes a SECOND pass and exits only via
+    #           KeyboardInterrupt. (On the round-4 loop the
+    #           handler's f-string formatted {e!r} before the
+    #           never-raising log wrapper was reached, and
+    #           run_loop died on the first bad wait.)
+    dirS = os.path.join(tmp, "caseS")
+    os.makedirs(dirS)
+    cfgS = {"db_path": os.path.join(dirS, "site.db"),
+            "inbox_dir": os.path.join(dirS, "inbox"),
+            "ledger_path": os.path.join(dirS, "ledger.json"),
+            "poll_sec": 5}
+    real_export_once_s = exporter.export_once
+    real_sleep_s = time.sleep
+    pass_calls_s = {"n": 0}
+    loop_end_s = {}
+
+    class BadReprError(Exception):
+        def __repr__(self):
+            raise RuntimeError("repr is broken")
+
+        def __str__(self):
+            raise RuntimeError("str is broken")
+
+    def ok_pass_s(db_path, inbox_dir, ledger_path):
+        pass_calls_s["n"] += 1
+        return {"exported": 0, "errors": 0}
+
+    def fake_sleep_s(sec):
+        if sec > 0.2:
+            if pass_calls_s["n"] >= 2:
+                raise KeyboardInterrupt
+            raise BadReprError()
+        real_sleep_s(sec)
+
+    def loop_thread_s():
+        try:
+            exporter.run_loop(cfgS)
+            loop_end_s["how"] = "returned"
+        except KeyboardInterrupt:
+            loop_end_s["how"] = "KeyboardInterrupt"
+        except BaseException as e:  # noqa: BLE001
+            loop_end_s["how"] = f"other:{type(e).__name__}"
+
+    exporter.export_once = ok_pass_s
+    time.sleep = fake_sleep_s
+    th_s = threading.Thread(target=loop_thread_s, daemon=True)
+    try:
+        th_s.start()
+        th_s.join(timeout=8)
+    finally:
+        exporter.export_once = real_export_once_s
+        time.sleep = real_sleep_s
+    check("(s) an interval-wait exception whose __repr__ and "
+          "__str__ both raise cannot escape the handler: the "
+          "handler logs only its type name, the loop "
+          "completes a second pass, and exits only via "
+          "KeyboardInterrupt",
+          pass_calls_s["n"] >= 2
+          and loop_end_s.get("how") == "KeyboardInterrupt"
+          and not th_s.is_alive())
+
     failed = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(failed)}/{len(PASS)} exporter checks pass")
     if failed:

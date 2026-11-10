@@ -67,14 +67,31 @@ so no value can make `time.sleep` overflow), and an
 outermost guard catches any other exception from an
 iteration (the pass, the interval wait, the backoff sleep).
 A failed iteration always waits out its recovery deadline:
-the handler's recovery wait is a monotonic-deadline wait
-that keeps attempting small sleeps, swallowing their
-failures, until the deadline passes — so no failure of the
-sleep primitive itself can make the loop spin. Logging
-failures inside run_loop's own machinery cannot kill it
-either: startup sanitization runs inside the guarded
-structure, and every log call in run_loop's machinery goes
-through a never-raising wrapper. No failure count and no
+the handler's recovery wait is a DUAL-CLOCK deadline wait.
+Elapsed time is tracked on `time.monotonic` and `time.time`
+independently — every clock read is guarded, each clock's
+elapsed accumulates as a high-water mark — and the wait
+ends only when BOTH clocks have accumulated the full
+recovery interval. A forward jump of one clock therefore
+cannot end the wait early (the other clock has not
+accumulated); a backward jump only extends the wait; a
+clock that raises simply reports no new elapsed for that
+slice while the other governs, and a clock that has never
+read successfully does not block the exit. If neither
+clock can be read at all, the wait hangs — never spins,
+never dies — until the stop event or an interrupt
+intervenes. The wait keeps attempting small sleeps,
+swallowing their failures, so no failure of the sleep
+primitive itself can make the loop spin either. The
+handler never formats the exception it caught: its log
+lines carry only the exception's TYPE name, obtained
+through a guarded helper, so a broken `__repr__`/`__str__`
+on the exception cannot raise inside the handler before
+the log call is reached. Logging failures inside
+run_loop's own machinery cannot kill it either: startup
+sanitization runs inside the guarded structure, and every
+log call in run_loop's machinery goes through a
+never-raising wrapper. No failure count and no
 bad config value can terminate the exporter. The exporter never creates the inbox
 directory (a missing mount must stay a visible, logged retry —
 not a silently created local folder).

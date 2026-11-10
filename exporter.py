@@ -86,30 +86,97 @@ def _safe_log(msg):
         pass
 
 
+def _describe(exc):
+    """A guarded label for a caught exception, for use on
+    handler paths: ONLY the exception's type name, obtained
+    defensively — never repr()/str()/format() of the instance
+    itself, which a broken __repr__/__str__ could turn into a
+    second raise inside the handler, before any never-raising
+    log wrapper is reached. Any failure yields the constant
+    "unknown". The result is a plain str, safe to interpolate
+    into a log line."""
+    try:
+        name = type(exc).__name__
+    except Exception:
+        return "unknown"
+    return name if isinstance(name, str) else "unknown"
+
+
+def _read_clock(fn):
+    """One guarded clock read: the reading, or None if the
+    clock raised. A raising clock simply reports no new
+    elapsed for that slice; the other clock governs."""
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
 def _recovery_wait(stop_event=None):
     """The loop's rate guarantee for failed iterations: a
-    MONOTONIC-DEADLINE wait. The deadline is RECOVERY_SLEEP_SEC
-    of wall clock from now; small sleep attempts (at most 0.1s
-    each) are made until the deadline passes, and every failed
-    attempt is swallowed — so the wait consumes its full
-    wall-clock delay no matter how the sleep primitive itself
-    behaves (a sleep that raises immediately on every call
-    cannot bypass it). Returns early only if stop_event is
-    set. BaseExceptions from a sleep attempt (KeyboardInterrupt
-    / SystemExit) still propagate."""
-    deadline = time.monotonic() + RECOVERY_SLEEP_SEC
+    DUAL-CLOCK deadline wait. Elapsed time is tracked on TWO
+    clocks independently — time.monotonic and time.time —
+    each as a high-water mark over guarded reads, and the
+    wait ends only when BOTH clocks have accumulated at
+    least RECOVERY_SLEEP_SEC. Every clock read is guarded:
+    a clock that raises reports no new elapsed for that
+    slice and the other clock governs; a clock that has
+    never read successfully does not block the exit (the
+    other governs alone); if NEITHER clock ever reads, the
+    wait hangs — never spins, never dies — until the stop
+    event or a BaseException intervenes. All consequences
+    are in the safe direction: a forward jump of ONE clock
+    cannot end the wait early (the other clock has not
+    accumulated), and a backward jump only extends the wait
+    (a clock's accumulated elapsed never decreases). Small
+    sleep attempts pace the wait, and every failed attempt
+    is swallowed — a sleep that raises immediately on every
+    call cannot bypass the wait. Returns early only if
+    stop_event is set. BaseExceptions from a sleep attempt
+    (KeyboardInterrupt / SystemExit) still propagate."""
+    duration = RECOVERY_SLEEP_SEC
+    # Per clock: [read fn, baseline reading or None,
+    # accumulated elapsed (high-water mark)].
+    clocks = [[time.monotonic, None, 0.0],
+              [time.time, None, 0.0]]
     while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if stop_event is not None:
+            try:
+                if stop_event.is_set():
+                    return
+            except Exception:
+                pass
+        for clock in clocks:
+            now = _read_clock(clock[0])
+            if now is None:
+                continue
+            if clock[1] is None:
+                clock[1] = now
+            elif now - clock[1] > clock[2]:
+                clock[2] = now - clock[1]
+        live = [c for c in clocks if c[1] is not None]
+        if live and all(c[2] >= duration for c in live):
             return
+        # Pace by the least-satisfied live clock; with no
+        # live clock yet, probe again after a short slice.
+        remaining = duration
+        if live:
+            remaining = max(duration - min(c[2] for c in live),
+                            0.01)
+        slice_sec = min(remaining, 0.1)
         try:
             if stop_event is not None:
-                if stop_event.wait(min(remaining, 0.1)):
+                if stop_event.wait(slice_sec):
                     return
             else:
-                time.sleep(min(remaining, 0.1))
+                time.sleep(slice_sec)
         except Exception:
-            pass
+            # A broken wait primitive must not shorten the
+            # wait: fall back to a plain sleep for this slice.
+            try:
+                time.sleep(slice_sec)
+            except Exception:
+                pass
 
 
 def _env(name, default):
@@ -431,14 +498,18 @@ def run_loop(cfg, stop_event=None):
     falls back to the default interval, it cannot prevent the
     loop), and EVERY log call in this function's own machinery
     goes through _safe_log, which can never raise. The
-    handler's recovery wait is _recovery_wait — a
-    monotonic-deadline wait — so ANY exception inside an
-    iteration (the pass, the interval wait, the backoff sleep)
-    lands in the same handler, and every failed iteration is
-    guaranteed its wall-clock recovery delay no matter how
-    the sleep primitive behaves. KeyboardInterrupt /
-    SystemExit still exit — they are BaseExceptions, not
-    caught here."""
+    handler never formats the exception it caught: its log
+    lines carry only the exception's type name, via the
+    guarded _describe (never repr/str of the instance). The
+    handler's recovery wait is _recovery_wait — a dual-clock
+    deadline wait (time.monotonic AND time.time, every read
+    guarded, exit only when both clocks agree the interval
+    has elapsed) — so ANY exception inside an iteration (the
+    pass, the interval wait, the backoff sleep) lands in the
+    same handler, and every failed iteration is guaranteed
+    its recovery delay no matter how the sleep primitive or
+    either clock behaves. KeyboardInterrupt / SystemExit
+    still exit — they are BaseExceptions, not caught here."""
     failures = 0
     try:
         poll_sec = sanitize_poll_sec(cfg.get("poll_sec",
@@ -461,21 +532,24 @@ def run_loop(cfg, stop_event=None):
             except Exception as e:
                 failures += 1
                 wait = backoff_delay(poll_sec, failures)
-                _safe_log(f"pass failed ({e!r}); retrying in "
-                          f"{wait:.1f}s")
+                _safe_log(f"pass failed ({_describe(e)}); "
+                          f"retrying in {wait:.1f}s")
             if stop_event is not None:
                 stop_event.wait(wait)
             else:
                 time.sleep(wait)
         except Exception as e:
             # The handler itself cannot die and cannot spin:
-            # its log call goes through _safe_log (which never
-            # raises — a failing log inside the pass may be WHY
-            # we are here), and its recovery wait is the
-            # monotonic-deadline _recovery_wait, the single
-            # rate guarantee for failed iterations.
-            _safe_log(f"unexpected loop error ({e!r}); "
-                      f"continuing")
+            # it never formats the exception it caught (only
+            # its type name, via the guarded _describe — a
+            # broken __repr__/__str__ on the exception cannot
+            # raise in here), its log call goes through
+            # _safe_log (which never raises — a failing log
+            # inside the pass may be WHY we are here), and its
+            # recovery wait is the dual-clock _recovery_wait,
+            # the single rate guarantee for failed iterations.
+            _safe_log(f"unexpected loop error "
+                      f"({_describe(e)}); continuing")
             _recovery_wait(stop_event)
 
 
