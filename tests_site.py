@@ -5846,6 +5846,212 @@ check("N81 (1): fresh subprocess — an opener a host "
       and _mguard81 is not None
       and _mguard81.group(1) == "preserved")
 
+# ============================================================
+# ROUND 30 — Codex delta-28: NO-SHIP on 35f9423, ONE
+# finding, statement-layer only. Certified (untouched):
+# the double-check warm-up mechanics; pins N80/N81;
+# catalog integrity and scope. The finding: the
+# double-check also preserves an opener installed
+# DURING the warm-up build (N80's sentinel case), but
+# the JOURNAL's exclusion (i) named only openers
+# installed BEFORE import; and the statement's handler
+# rationale ("the global opener's handler passes its
+# context to every construction") is established only
+# for the STANDARD handler, not for arbitrary preserved
+# host openers. Plus a wording qualification: the
+# residual window spans from the final check until the
+# install call completes — not a literal one-bytecode
+# interval. THIS ROUND CHANGES NO PRODUCTION CODE:
+# the JOURNAL statement is corrected (generalized
+# exclusion; positive claim scoped to exchanges
+# through the default opener; window phrase fixed),
+# and N82 below is the statement's factual basis for
+# the DURING-import case: a functional foreign opener
+# installed during the build is preserved AND carries
+# a gated send on its own context, with the module
+# factory consulted 0 times. N82 is GREEN on 35f9423
+# by design — the round-29 defect was documentary, in
+# the text, not in behaviour; it is a basis pin, not
+# a defect specimen.
+
+import http.server as _hs30
+import re as _re30
+import ssl as _ssl30
+import subprocess as _sp30
+import tempfile as _tf30
+
+_certdir30 = _tf30.mkdtemp(prefix="vf-tls30-")
+_cert30 = os.path.join(_certdir30, "cert.pem")
+_key30 = os.path.join(_certdir30, "key.pem")
+_sp30.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+           "-keyout", _key30, "-out", _cert30, "-days", "2",
+           "-nodes", "-subj", "/CN=127.0.0.1",
+           "-addext", "subjectAltName=IP:127.0.0.1"],
+          check=True, capture_output=True, timeout=60)
+_srvctx30 = _ssl30.SSLContext(_ssl30.PROTOCOL_TLS_SERVER)
+_srvctx30.load_cert_chain(_cert30, _key30)
+
+
+class _TlsHandler30(_hs30.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        if self.path == "/tls-ok":
+            body = b'{"id": "mail-n82-ok"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_SRV30 = _hs30.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _TlsHandler30)
+_SRV30.socket = _srvctx30.wrap_socket(_SRV30.socket,
+                                      server_side=True)
+_PORT30 = _SRV30.server_address[1]
+_th30srv = threading.Thread(
+    target=_SRV30.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th30srv.start()
+
+# N82 (1): foreign opener installed DURING the import
+# — a FRESH SUBPROCESS specimen in N78/N80's pattern.
+# The driver patches urllib.request.build_opener
+# BEFORE importing the server module: the patched
+# builder builds the requested opener, then installs
+# a FUNCTIONAL foreign opener (a real opener whose
+# HTTPSHandler carries the unverified context the
+# local self-signed test server needs — the round-26
+# section's seam) — a host install landing DURING the
+# warm-up's build. After the import the driver asserts
+# the process-global opener IS that foreign opener
+# (preserved through the warm-up by the double-check),
+# wraps the module factory with a counter, and runs
+# ONE gated send to the local TLS server: the send
+# must classify delivered RIDING THE FOREIGN OPENER'S
+# context (the handler supplies it; the deadline class
+# uses it verbatim), with the module factory consulted
+# 0 times during the send.
+_DRIVER82 = '''import os
+import ssl
+import sys
+import urllib.request
+
+repo = sys.argv[1]
+port = int(sys.argv[2])
+dbpath = sys.argv[3]
+sys.path.insert(0, repo)
+os.environ["VF_DB_PATH"] = dbpath
+
+_real_build_opener = urllib.request.build_opener
+_FOREIGN = _real_build_opener(
+    urllib.request.HTTPSHandler(
+        context=ssl._create_unverified_context()))
+
+
+def _installing_build_opener(*a, **kw):
+    built = _real_build_opener(*a, **kw)
+    # A host install landing DURING the build — here a
+    # FUNCTIONAL opener: its HTTPSHandler carries the
+    # unverified context the local test server needs.
+    urllib.request.install_opener(_FOREIGN)
+    return built
+
+
+urllib.request.build_opener = _installing_build_opener
+
+import server as SRV
+
+print("FOREIGN82 opener=%s" % (
+    "preserved" if urllib.request._opener is _FOREIGN
+    else "replaced"), flush=True)
+
+_real_factory82 = SRV._HTTPS_CONTEXT_FACTORY
+_factory82 = [0]
+
+
+def _counting_factory82(http_vsn):
+    _factory82[0] += 1
+    return _real_factory82(http_vsn)
+
+
+SRV._HTTPS_CONTEXT_FACTORY = _counting_factory82
+
+SRV.RESEND_API_KEY = "catalog-test-key"
+SRV._GATED_SEND_DEADLINE = 10.0
+SRV._RESEND_API_URL = "https://127.0.0.1:%d/tls-ok" % port
+_conn = SRV.db_connect()
+_cur = _conn.execute(
+    "INSERT INTO orders(created_at,name,email,url,tier,"
+    "notes,amount,status) VALUES(?,?,?,?,?,?,?,?)",
+    (SRV.utcnow(), "Cat T", "n82@test.dev",
+     "https://example.com", "Deep Scan", "", 29, "PAID"))
+_oid = _cur.lastrowid
+_conn.commit()
+_conn.close()
+_res = SRV._gated_send(_oid, SRV.send_resend,
+                       "n82@test.dev",
+                       "Payment received — Deep Scan", "body")
+print("SEND status=%s id=%s factory=%d" % (
+    SRV._send_status(_res), _res[1],
+    _factory82[0]), flush=True)
+'''
+
+_drvdir30 = _tf30.mkdtemp(prefix="vf-n82-")
+_drvfile82 = os.path.join(_drvdir30, "driver82.py")
+with open(_drvfile82, "w") as _fdrv82:
+    _fdrv82.write(_DRIVER82)
+_run82 = _sp30.run(
+    [sys.executable, _drvfile82,
+     os.path.dirname(os.path.abspath(__file__)),
+     str(_PORT30), os.path.join(_drvdir30, "n82.db")],
+    capture_output=True, text=True, timeout=180)
+_out82 = _run82.stdout or ""
+print("N82 driver rc=%d stdout:\n%s"
+      % (_run82.returncode, _out82))
+if _run82.stderr:
+    print("N82 driver stderr (tail):\n"
+          + _run82.stderr[-2000:])
+_mown82 = _re30.search(
+    r"FOREIGN82 opener=(preserved|replaced)", _out82)
+_msnd82 = _re30.search(
+    r"SEND status=(\S+) id=(\S+) factory=(\d+)", _out82)
+check("N82 (1): fresh subprocess — a FUNCTIONAL foreign "
+      "opener installed DURING the warm-up's build is "
+      "preserved as the process-global opener, and a "
+      "gated send rides that opener's own machinery: "
+      "delivered on the foreign handler's context with "
+      "the module factory consulted 0 times (statement "
+      "basis pin for the generalized host-opener "
+      "exclusion; green by design on the pre-round tree "
+      "— the defect it backs was in the statement text, "
+      "not in behaviour)",
+      _run82.returncode == 0
+      and _mown82 is not None
+      and _mown82.group(1) == "preserved"
+      and _msnd82 is not None
+      and _msnd82.group(1) == "delivered"
+      and _msnd82.group(2) == "mail-n82-ok"
+      and int(_msnd82.group(3)) == 0)
+_SRV30.shutdown()
+_SRV30.server_close()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
