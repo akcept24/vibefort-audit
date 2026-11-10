@@ -7,10 +7,13 @@ a throwaway SQLite DB built with the site's REAL fulfilment_requests
 schema (copied from server.py, frozen tree 3e5d1f0).
 """
 
+import builtins
 import hashlib
+import io
 import json
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -139,15 +142,57 @@ def main():
     check("(e) site DB file byte-identical after runs (read-only)",
           sha256_file(db4) == h_before)
 
-    # ---- (f) atomic write path: os.replace onto the final name,
-    #           the final path is never opened for writing
-    src = open(os.path.join(os.path.dirname(
-        os.path.abspath(__file__)), "exporter.py"),
-        encoding="utf-8").read()
-    check("(f) writes go through os.replace onto the final name",
-          "os.replace(tmp_path, final_path)" in src
-          and 'open(final_path' not in src
-          and "open(tmp_path" in src)
+    # ---- (f) atomic write path — BEHAVIORAL. This REPLACES the
+    #           round-1 source-string check, which asserted
+    #           nothing behavioural (it searched exporter.py's
+    #           text; it never exercised a write). Now: patch
+    #           os.replace to raise after the temp file is
+    #           written -> the final name must NOT appear; a
+    #           pre-existing final file keeps its old bytes; and
+    #           opens are recorded to prove the final path is
+    #           never opened in a write mode during an export.
+    dirF = os.path.join(tmp, "caseF")
+    os.makedirs(dirF)
+    dbF = os.path.join(dirF, "site.db")
+    inboxF = os.path.join(dirF, "inbox")
+    os.makedirs(inboxF)
+    ledgerF = os.path.join(dirF, "ledger.json")
+    make_db(dbF, [(111, payload_for(111), "queued")])
+    finalF = os.path.join(inboxF, "fulfilment-111.json")
+    opened = []
+    real_open = builtins.open
+
+    def recording_open(file, mode="r", *a, **kw):
+        opened.append((os.fspath(file), mode))
+        return real_open(file, mode, *a, **kw)
+
+    real_replace = os.replace
+
+    def failing_replace(src_p, dst_p):
+        raise OSError("simulated replace failure")
+
+    ok_f1 = ok_f2 = False
+    builtins.open = recording_open
+    os.replace = failing_replace
+    try:
+        exporter.export_once(dbF, inboxF, ledgerF)
+        ok_f1 = not os.path.exists(finalF)
+        with real_open(finalF, "wb") as fh:
+            fh.write(b"OLD BYTES")
+        exporter.export_once(dbF, inboxF, ledgerF)
+        with real_open(finalF, "rb") as fh:
+            ok_f2 = fh.read() == b"OLD BYTES"
+    finally:
+        builtins.open = real_open
+        os.replace = real_replace
+    ok_f3 = all(not (p == finalF and any(c in m for c in "wax+"))
+                for p, m in opened)
+    check("(f1) replace fails after temp write: the final name "
+          "does not appear", ok_f1)
+    check("(f2) replace fails: a pre-existing final file keeps "
+          "its old bytes", ok_f2)
+    check("(f3) the final path is never opened in a write mode "
+          "during an export", ok_f3)
 
     # ---- (g) inbox missing at start: log, retry, export when it
     #           appears (live loop in a thread)
@@ -173,6 +218,153 @@ def main():
     check("(g) missing inbox: exporter survives, retries, exports "
           "once the directory appears",
           alive_blocked and os.path.isfile(f95))
+
+    # ---- (h) config guard: ledger path == DB path -> refusal.
+    #           The exporter must write NOTHING (in particular it
+    #           must never let save_ledger replace the site DB
+    #           with ledger JSON), log the misconfiguration, and
+    #           export nothing.
+    dirH = os.path.join(tmp, "caseH")
+    os.makedirs(dirH)
+    dbH = os.path.join(dirH, "site.db")
+    inboxH = os.path.join(dirH, "inbox")
+    os.makedirs(inboxH)
+    make_db(dbH, [(121, payload_for(121), "queued")])
+    with real_open(dbH, "rb") as fh:
+        dbH_bytes = fh.read()
+    refused = False
+    err_buf = io.StringIO()
+    old_stderr = sys.stderr
+    sys.stderr = err_buf
+    try:
+        try:
+            exporter.export_once(dbH, inboxH, dbH)  # ledger == DB
+        except ValueError:
+            refused = True
+    finally:
+        sys.stderr = old_stderr
+    with real_open(dbH, "rb") as fh:
+        dbH_bytes_after = fh.read()
+    check("(h) ledger path == DB path: refusal logged, DB bytes "
+          "unchanged, nothing exported, no stray files",
+          refused
+          and dbH_bytes_after == dbH_bytes
+          and os.listdir(inboxH) == []
+          and sorted(os.listdir(dirH)) == ["inbox", "site.db"]
+          and "MISCONFIGURATION" in err_buf.getvalue())
+
+    # ---- (i) filename comes from the ROW: the payload's
+    #           order_id must be a strict int (no bool, no float)
+    #           EQUAL to the row's, else the row is skipped with
+    #           no file and no ledger entry.
+    dirI = os.path.join(tmp, "caseI")
+    os.makedirs(dirI)
+    dbI = os.path.join(dirI, "site.db")
+    inboxI = os.path.join(dirI, "inbox")
+    os.makedirs(inboxI)
+    ledgerI = os.path.join(dirI, "ledger.json")
+    def payload_with(row_id, payload_order_id):
+        p = json.loads(payload_for(row_id))
+        p["order_id"] = payload_order_id
+        return json.dumps(p)
+
+    p135 = json.loads(payload_for(135))
+    del p135["order_id"]
+    make_db(dbI, [(131, payload_with(131, 132), "queued"),
+                  (133, payload_with(133, 133.0), "queued"),
+                  (134, payload_with(134, True), "queued"),
+                  (135, json.dumps(p135), "queued"),
+                  (136, payload_for(136), "queued")])
+    stats = exporter.export_once(dbI, inboxI, ledgerI)
+    ledI = exporter.load_ledger(ledgerI)
+    bad_files = [n for n in ("fulfilment-131.json",
+                             "fulfilment-132.json",
+                             "fulfilment-133.json",
+                             "fulfilment-134.json",
+                             "fulfilment-135.json",
+                             "fulfilment-1.json")
+                 if os.path.exists(os.path.join(inboxI, n))]
+    check("(i) mismatched / float / bool / missing payload "
+          "order_id skipped (no file, no ledger entry); the "
+          "matching row exports under the row's id",
+          stats["exported"] == 1 and stats["errors"] == 4
+          and bad_files == []
+          and os.path.isfile(os.path.join(inboxI,
+                                          "fulfilment-136.json"))
+          and set(ledI.keys()) == {"136"})
+
+    # ---- (j) directory fsync failure FAILS the export: no
+    #           ledger entry for the row; a later pass with
+    #           fsync healthy exports it.
+    dirJ = os.path.join(tmp, "caseJ")
+    os.makedirs(dirJ)
+    dbJ = os.path.join(dirJ, "site.db")
+    inboxJ = os.path.join(dirJ, "inbox")
+    os.makedirs(inboxJ)
+    ledgerJ = os.path.join(dirJ, "ledger.json")
+    p141 = payload_for(141)
+    make_db(dbJ, [(141, p141, "queued")])
+    real_fsync = os.fsync
+
+    def dir_failing_fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("simulated directory fsync failure")
+        return real_fsync(fd)
+
+    os.fsync = dir_failing_fsync
+    try:
+        statsJ1 = exporter.export_once(dbJ, inboxJ, ledgerJ)
+    finally:
+        os.fsync = real_fsync
+    ledJ1 = exporter.load_ledger(ledgerJ)
+    statsJ2 = exporter.export_once(dbJ, inboxJ, ledgerJ)
+    ledJ2 = exporter.load_ledger(ledgerJ)
+    check("(j) directory fsync failure: export fails with no "
+          "ledger entry; a later healthy pass exports the row",
+          statsJ1["exported"] == 0 and "141" not in ledJ1
+          and statsJ2["exported"] == 1
+          and ledJ2.get("141", {}).get("sha256")
+          == hashlib.sha256(p141.encode("utf-8")).hexdigest())
+
+    # ---- (k) the loop cannot be killed by arithmetic or config:
+    #           backoff_delay caps the exponent BEFORE
+    #           exponentiation (no OverflowError at any failure
+    #           count, result always within the cap), and an
+    #           invalid EXPORTER_POLL_SEC is sanitized to the
+    #           default at startup.
+    ok_k1 = False
+    try:
+        delays = [exporter.backoff_delay(15.0, n)
+                  for n in (0, 10, 1000, 10 ** 6)]
+        ok_k1 = all(0 < d <= exporter.BACKOFF_CAP_SEC
+                    for d in delays)
+    except Exception:
+        ok_k1 = False
+    check("(k1) backoff_delay stays within the cap at failure "
+          "counts 0 / 10 / 1000 / 10**6 and never raises", ok_k1)
+    ok_k2 = False
+    saved_poll = os.environ.get("EXPORTER_POLL_SEC")
+    try:
+        os.environ["EXPORTER_POLL_SEC"] = "not-a-number"
+        bad1 = exporter.config_from_env()["poll_sec"]
+        os.environ["EXPORTER_POLL_SEC"] = "-5"
+        bad2 = exporter.config_from_env()["poll_sec"]
+        os.environ["EXPORTER_POLL_SEC"] = "0"
+        bad3 = exporter.config_from_env()["poll_sec"]
+        os.environ["EXPORTER_POLL_SEC"] = "2.5"
+        good = exporter.config_from_env()["poll_sec"]
+        ok_k2 = (bad1 == 15 and bad2 == 15 and bad3 == 15
+                 and good == 2.5)
+    except Exception:
+        ok_k2 = False
+    finally:
+        if saved_poll is None:
+            os.environ.pop("EXPORTER_POLL_SEC", None)
+        else:
+            os.environ["EXPORTER_POLL_SEC"] = saved_poll
+    check("(k2) invalid EXPORTER_POLL_SEC (text / negative / "
+          "zero) sanitized to the 15s default; a valid value "
+          "passes through", ok_k2)
 
     failed = [n for n, ok in PASS if not ok]
     print(f"\n{len(PASS) - len(failed)}/{len(PASS)} exporter checks pass")

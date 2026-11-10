@@ -30,17 +30,50 @@ the original `python3 server.py` unchanged), `tests_exporter.py`
 exporter cannot write the site's tables. Per queued row: write the
 payload bytes to a temp file in the inbox, fsync, `os.replace` onto
 `fulfilment-<order_id>.json`, fsync the directory, *then* record
-`order_id → sha256` in the ledger. A crash between the file and the
-ledger re-exports next pass — same name, same bytes, harmless.
-A changed payload (hash mismatch) re-exports. Errors are logged and
-the loop continues with backoff; the exporter never exits fatally
-and never creates the inbox directory (a missing mount must stay a
-visible, logged retry — not a silently created local folder).
+`order_id → sha256` in the ledger. The filename comes from the
+**row's** `order_id` column, never from the payload; the payload
+must parse and carry an `order_id` that is a strict int (no bool,
+no float) equal to the row's, or the row is skipped and logged.
+A crash between the file and the ledger re-exports next pass —
+same name, same bytes, harmless. A changed payload (hash
+mismatch) re-exports. An fsync failure — file or directory —
+*fails that row's export*: no ledger entry is written, and the
+row is retried on a later pass (durability is never recorded as
+established when it was not). Errors are logged and the loop
+continues with capped backoff: the backoff exponent is capped
+before exponentiation and the poll interval is sanitized at
+startup, and an outermost guard catches any other exception, so
+no failure count and no bad config value can terminate the
+exporter. The exporter never creates the inbox directory (a
+missing mount must stay a visible, logged retry — not a silently
+created local folder).
+
+**Config guard.** At startup (and on every pass) the exporter
+resolves the ledger path and the DB path with `realpath`. If
+they are equal, that is a misconfiguration: proceeding could let
+the ledger write replace the site DB itself. The exporter then
+writes NOTHING, logs the misconfiguration loudly, and idles in
+the retry loop until the configuration is fixed. Ledger temp
+files are always created in the ledger's own directory.
+
+**Named residual — the deletion race (accepted).** There is a
+window from the moment the exporter reads a `queued` row to the
+moment its file lands in the engine inbox. If an admin deletes
+that order inside the window, the row is already read, so the
+file still lands and the engine may still deliver the report for
+that (paid) order. This residual is accepted by the parent as an
+operational residual: the order was paid before it was deleted,
+and no unpaid fulfilment, no duplicate, and no money error
+arises from this race — the worst outcome is a delivered report
+for a just-deleted paid order. (A second read before writing
+would narrow the window, not close it; it is not claimed to.)
 
 **Production wiring (parent's steps, Coolify).**
 1. On the host, note the engine app's inbox host directory (the
    `shipaudit-engine` app's `/data/inbox` volume path under
-   `/data/coolify/applications/<engine-uuid>/inbox`).
+   `/data/coolify/applications/<engine-uuid>/inbox`) — the exact
+   production host path is **confirmed at wiring time by the
+   parent**; this document does not assert it.
 2. In the SITE app (`shipauditlab`), add a volume mount: that same
    host directory → container path `/data/engine-inbox`, and set
    env `EXPORTER_INBOX_DIR=/data/engine-inbox` on the site app.
@@ -63,7 +96,10 @@ visible, logged retry — not a silently created local folder).
 3. It opens the site DB read-only, so it cannot create, alter, or
    delete orders even if it malfunctions.
 4. A duplicate or repeated file is harmless: the name is
-   deterministic per order and the engine's delivery machinery is
-   idempotent by order (send barrier + delivery evidence).
+   deterministic per order, and this bridge *relies on* the
+   engine's order-keyed delivery evidence (send barrier +
+   delivery evidence, certified in the engine wall) for
+   idempotence — that property is relied upon here, not proven
+   by this tree.
 5. Worst case of an exporter failure is a delayed report, never a
    wrong one: no file, no fulfilment — and the loop retries.
