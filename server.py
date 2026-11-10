@@ -134,7 +134,9 @@ def db_connect():
         tg_sent INTEGER DEFAULT 0)""")
     cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)")]
     for col, ddl in (("amount", "INTEGER DEFAULT 0"),
-                     ("tg_sent", "INTEGER DEFAULT 0")):
+                     ("tg_sent", "INTEGER DEFAULT 0"),
+                     ("paid_event_id", "TEXT"),
+                     ("paid_pi", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE orders ADD COLUMN {col} {ddl}")
     conn.execute("""CREATE TABLE IF NOT EXISTS events(
@@ -182,6 +184,10 @@ def db_connect():
             "ALTER TABLE stripe_events ADD COLUMN payment_intent TEXT")
     if "amount" not in scols:
         conn.execute("ALTER TABLE stripe_events ADD COLUMN amount INTEGER")
+    if "claim" not in scols:
+        conn.execute("ALTER TABLE stripe_events ADD COLUMN claim TEXT")
+    if "claimed_at" not in scols:
+        conn.execute("ALTER TABLE stripe_events ADD COLUMN claimed_at REAL")
     return conn
 
 
@@ -1441,30 +1447,33 @@ class Handler(BaseHTTPRequestHandler):
         # concurrent deliveries could otherwise both claim the same
         # NEW order (Codex delta-5 finding 1). Payment volume is
         # small; correctness beats parallelism here.
+        claim = _secrets.token_hex(8)
         with _webhook_lock:
             try:
-                self._stripe_process_locked(event, session)
+                self._stripe_process_locked(event, session, claim)
             except Exception:
                 # Roll the dedupe record back INSIDE the lock: a
                 # concurrent retry of the same event must never be
                 # mid-processing on a row that disappears under it
-                # (Codex delta-6 finding 1). Only unlinked rows are
-                # rolled back — a linked row is the recovery
-                # consult's evidence and stays.
+                # (Codex delta-6 finding 1). The delete is scoped to
+                # THIS delivery's claim token and to unlinked rows:
+                # another process that has since claimed the event
+                # keeps its row, and a linked row is the recovery
+                # consult's evidence and stays (delta-7 finding 1).
                 try:
                     with _db_lock:
                         conn = db_connect()
                         conn.execute(
                             "DELETE FROM stripe_events WHERE "
-                            "event_id=? AND order_id IS NULL",
-                            (event.get("id") or "",))
+                            "event_id=? AND order_id IS NULL AND "
+                            "claim=?", (event.get("id") or "", claim))
                         conn.commit()
                         conn.close()
                 except Exception:
                     pass
                 raise
 
-    def _stripe_process_locked(self, event, session):
+    def _stripe_process_locked(self, event, session, claim):
         etype = event.get("type") or ""
         eid = event.get("id") or ""
         amount = session.get("amount_total")
@@ -1472,50 +1481,79 @@ class Handler(BaseHTTPRequestHandler):
         pi = session.get("payment_intent")
         email = _s((session.get("customer_details") or {}).get("email")
                    or session.get("customer_email") or "").lower()
-        # Dedupe with completion awareness: an event row whose
-        # processing never reached a terminal log (crash between the
-        # dedupe commit and the transition — Codex/GLM finding
-        # 2026-11-09) is processed now, not acked as a duplicate.
+        # Dedupe with completion awareness and cross-process claim
+        # ownership (Codex delta-7 finding 1): an event row is
+        # owned by the delivery that holds its claim token. A
+        # concurrent delivery of the same event sees a live claim
+        # and steps aside (500 — Stripe retries); a stale claim
+        # (no activity for 120 s) may be stolen. The rollback in
+        # _stripe_process deletes only our own claim, and a row
+        # whose processing reached a terminal log (crash between
+        # the dedupe commit and the transition — Codex/GLM
+        # 2026-11-09) is reprocessed now, not acked as a duplicate.
+        now = time.time()
         with _db_lock:
             conn = db_connect()
             try:
                 existing = conn.execute(
-                    "SELECT order_id FROM stripe_events WHERE event_id=?",
+                    "SELECT order_id, claim, claimed_at FROM "
+                    "stripe_events WHERE event_id=?",
                     (eid,)).fetchone()
                 if existing is None:
-                    conn.execute(
-                        "INSERT INTO stripe_events(event_id, type,"
-                        " order_id, received_at, payment_intent, amount)"
-                        " VALUES(?,?,NULL,?,?,?)",
-                        (eid, etype, utcnow(), pi,
-                         session.get("amount_total")))
-                    conn.commit()
-                    state = "fresh"
-                elif existing[0] is not None:
-                    state = "done"
-                else:
-                    done_log = conn.execute(
-                        "SELECT 1 FROM events WHERE event IN "
-                        "('STRIPE_PAID','STRIPE_UNMATCHED') AND "
-                        "detail LIKE ?",
-                        (f"%event={eid}%",)).fetchone()
-                    state = "done" if done_log else "incomplete"
-                    if state == "incomplete" and pi:
-                        # Refresh the stored payment_intent: the row
-                        # may predate it (crash before the first
-                        # processing got this far), and the duplicate
-                        # check below keys on it.
+                    try:
                         conn.execute(
-                            "UPDATE stripe_events SET payment_intent=? "
-                            "WHERE event_id=?", (pi, eid))
+                            "INSERT INTO stripe_events(event_id, type,"
+                            " order_id, received_at, payment_intent,"
+                            " amount, claim, claimed_at) VALUES(?,?,"
+                            "NULL,?,?,?,?,?)",
+                            (eid, etype, utcnow(), pi,
+                             session.get("amount_total"), claim, now))
                         conn.commit()
+                        state = "fresh"
+                    except sqlite3.IntegrityError:
+                        conn.rollback()
+                        existing = conn.execute(
+                            "SELECT order_id, claim, claimed_at FROM "
+                            "stripe_events WHERE event_id=?",
+                            (eid,)).fetchone()
+                if existing is not None:
+                    if existing[0] is not None:
+                        state = "done"
+                    else:
+                        done_log = conn.execute(
+                            "SELECT 1 FROM events WHERE event IN "
+                            "('STRIPE_PAID','STRIPE_UNMATCHED') AND "
+                            "detail LIKE ?",
+                            (f"%event={eid}%",)).fetchone()
+                        if done_log:
+                            state = "done"
+                        elif existing[2] is not None and \
+                                now - existing[2] < 120:
+                            raise RuntimeError(
+                                "event in flight in another process")
+                        else:
+                            # Stale or legacy (claim NULL) row: take
+                            # ownership before processing it. The
+                            # payment_intent is refreshed here — the
+                            # row may predate it, and the duplicate
+                            # check below keys on it.
+                            conn.execute(
+                                "UPDATE stripe_events SET claim=?, "
+                                "claimed_at=?, payment_intent=COALESCE"
+                                "(?, payment_intent) WHERE event_id=?",
+                                (claim, now, pi, eid))
+                            conn.commit()
+                            state = "incomplete"
             finally:
                 conn.close()
         if state == "done":
             # Recovery consult: a linked order whose PAID side
             # effects or receipt never completed (crash in the
             # window after the status commit) is finished here,
-            # on Stripe's retry, before the duplicate ack.
+            # on Stripe's retry, before the duplicate ack. The
+            # link alone is NOT proof of a match — orders.paid_pi,
+            # committed atomically with the winning transition,
+            # is the authority (Codex delta-7 finding 2).
             linked_id = existing[0] if existing else None
             if linked_id:
                 conn = db_connect()
@@ -1528,12 +1566,46 @@ class Handler(BaseHTTPRequestHandler):
                     conn.close()
                 if orow is not None:
                     order_d = dict(orow)
+                    winner_pi = order_d.get("paid_pi")
+                    if order_d["status"] != "NEW" and winner_pi \
+                            and pi and winner_pi != pi:
+                        # This event's link was provisional: another
+                        # payment won the order and the loser crashed
+                        # before unlinking. Settle it as unmatched —
+                        # never as a matched duplicate.
+                        with _db_lock:
+                            conn = db_connect()
+                            conn.execute(
+                                "UPDATE stripe_events SET "
+                                "order_id=NULL WHERE event_id=?",
+                                (eid,))
+                            conn.commit()
+                            conn.close()
+                        tok, _ = send_telegram(
+                            f"ShipAudit Lab: Stripe payment NOT "
+                            f"matched — order #{linked_id} was "
+                            f"claimed by another payment; this one "
+                            f"(pi={pi}, amount={amount}, "
+                            f"email={email}, event={eid}) needs a "
+                            f"manual match or refund.")
+                        if not tok:
+                            raise RuntimeError(
+                                "unmatched alert telegram failed")
+                        log_event(None, "STRIPE_UNMATCHED",
+                                  f"event={eid} lost-claim "
+                                  f"order={linked_id} pi={pi} "
+                                  f"amount={amount}")
+                        self._send_json(200, {"ok": True,
+                                              "matched": False})
+                        return
                     if order_d["status"] == "NEW":
                         # Crash between linking and the transition:
                         # the verified payment stands — finish the
-                        # transition, don't just paper over it with
-                        # side effects on a NEW order.
-                        transition_order_status(order_d, "PAID")
+                        # transition, recording this event as the
+                        # winning payment in the same update.
+                        transition_order_status(
+                            order_d, "PAID", paid_event_id=eid,
+                            paid_pi=pi)
                     ensure_paid_side_effects(order_d)
                     if not _ensure_paid_receipt(order_d, amount):
                         raise RuntimeError("receipt resend failed")
@@ -1608,24 +1680,27 @@ class Handler(BaseHTTPRequestHandler):
             if cur.rowcount == 0:
                 raise RuntimeError(
                     "stripe event row vanished before linking")
-            won = transition_order_status(order, "PAID")
+            won = transition_order_status(order, "PAID",
+                                          paid_event_id=eid,
+                                          paid_pi=pi)
             if not won:
                 # The transition was claimed by someone else. If a
                 # DIFFERENT payment claimed this order (the claim
                 # window spans processes — the webhook lock is
                 # per-process, Codex delta-6 finding 3), this
                 # payment is not matched at all: unlink and let the
-                # unmatched flow below alert HQ. Same payment (a
-                # duplicate event) or an admin's manual PAID: the
-                # money is real, make the order whole and ack.
+                # unmatched flow below alert HQ. The winner is read
+                # from the order itself (paid_pi, committed with
+                # the winning transition — delta-7 finding 2), never
+                # from a possibly provisional event link. Same
+                # payment (a duplicate event) or an admin's manual
+                # PAID: the money is real, make the order whole.
                 winner_pi = None
                 conn = db_connect()
                 try:
                     wrow = conn.execute(
-                        "SELECT payment_intent FROM stripe_events "
-                        "WHERE order_id=? AND event_id<>? AND "
-                        "payment_intent IS NOT NULL",
-                        (order["id"], eid)).fetchone()
+                        "SELECT paid_pi FROM orders WHERE id=?",
+                        (order["id"],)).fetchone()
                     if wrow:
                         winner_pi = wrow[0]
                 finally:
@@ -2032,11 +2107,16 @@ class Handler(BaseHTTPRequestHandler):
 # transport between this register and the engine host is wired on
 # activation day (the payload is the contract, not the channel).
 # ---------------------------------------------------------------------------
-def transition_order_status(row, new_status):
+def transition_order_status(row, new_status, paid_event_id=None,
+                            paid_pi=None):
     """The one status-transition path: DB update + event log + the
     PAID side effects (monitoring activation, Deep Scan fulfilment
     hook). Callers validate the move first (admin API: forward-only;
-    webhook: a signature-verified payment for a NEW order)."""
+    webhook: a signature-verified payment for a NEW order). When the
+    webhook drives a NEW -> PAID move it passes the winning event's
+    identity, committed in the SAME guarded update as the status:
+    orders.paid_event_id / paid_pi are the authoritative record of
+    which payment won the order (Codex delta-7 finding 2)."""
     oid = row["id"]
     if row["status"] == "NEW" and new_status != "PAID" and \
             ORDER_STATUSES.index(new_status) > \
@@ -2055,9 +2135,16 @@ def transition_order_status(row, new_status):
     with _db_lock:
         conn = db_connect()
         try:
-            cur = conn.execute(
-                "UPDATE orders SET status=? WHERE id=? AND status=?",
-                (new_status, oid, row["status"]))
+            if new_status == "PAID" and paid_event_id is not None:
+                cur = conn.execute(
+                    "UPDATE orders SET status=?, paid_event_id=?, "
+                    "paid_pi=? WHERE id=? AND status=?",
+                    (new_status, paid_event_id, paid_pi, oid,
+                     row["status"]))
+            else:
+                cur = conn.execute(
+                    "UPDATE orders SET status=? WHERE id=? AND "
+                    "status=?", (new_status, oid, row["status"]))
             conn.commit()
             won = cur.rowcount > 0
         finally:
@@ -2137,16 +2224,21 @@ def sweep_paid_side_effects():
     conn.row_factory = sqlite3.Row
     try:
         linked_new = conn.execute(
-            "SELECT o.* FROM stripe_events se JOIN orders o "
-            "ON o.id = se.order_id WHERE o.status='NEW'").fetchall()
+            "SELECT o.*, se.event_id AS ev_id, "
+            "se.payment_intent AS ev_pi FROM stripe_events se "
+            "JOIN orders o ON o.id = se.order_id "
+            "WHERE o.status='NEW'").fetchall()
     finally:
         conn.close()
     for row in linked_new:
         # A verified payment linked to an order that never got its
         # transition (crash in the link window): the money stands,
-        # finish the transition at boot.
+        # finish the transition at boot — recording the linking
+        # event as the winning payment in the same update.
         try:
-            transition_order_status(dict(row), "PAID")
+            transition_order_status(
+                dict(row), "PAID", paid_event_id=row["ev_id"],
+                paid_pi=row["ev_pi"])
         except Exception as e:
             log(f"boot sweep: transition for linked order "
                 f"{row['id']} failed: {e!r}")
@@ -2159,8 +2251,8 @@ def sweep_paid_side_effects():
         rows = conn.execute(
             "SELECT * FROM orders WHERE status='PAID'").fetchall()
         evs = conn.execute(
-            "SELECT event_id, order_id, amount FROM stripe_events "
-            "WHERE order_id IS NOT NULL").fetchall()
+            "SELECT event_id, order_id, amount, payment_intent "
+            "FROM stripe_events WHERE order_id IS NOT NULL").fetchall()
     finally:
         conn.close()
     for row in rows:
@@ -2181,8 +2273,37 @@ def sweep_paid_side_effects():
             orow = conn.execute("SELECT * FROM orders WHERE id=?",
                                 (ev["order_id"],)).fetchone()
             conn.close()
-            if orow is not None:
-                _ensure_paid_receipt(dict(orow), ev["amount"])
+            if orow is None:
+                continue
+            order_d = dict(orow)
+            winner_pi = order_d.get("paid_pi")
+            if winner_pi and ev["payment_intent"] and \
+                    ev["payment_intent"] != winner_pi:
+                # A provisional link from a payment that lost the
+                # claim (Codex delta-7 finding 2): not a match —
+                # unlink it and surface it as unmatched instead of
+                # sending it a receipt.
+                with _db_lock:
+                    conn = db_connect()
+                    conn.execute(
+                        "UPDATE stripe_events SET order_id=NULL "
+                        "WHERE event_id=?", (ev["event_id"],))
+                    conn.commit()
+                    conn.close()
+                log_event(None, "STRIPE_UNMATCHED",
+                          f"event={ev['event_id']} lost-claim "
+                          f"order={ev['order_id']} "
+                          f"pi={ev['payment_intent']} "
+                          f"amount={ev['amount']} (boot sweep)")
+                send_telegram(
+                    f"ShipAudit Lab: Stripe payment NOT matched — "
+                    f"order #{ev['order_id']} was claimed by "
+                    f"another payment; event {ev['event_id']} "
+                    f"(pi={ev['payment_intent']}, "
+                    f"amount={ev['amount']}) needs a manual match "
+                    f"or refund.")
+                continue
+            _ensure_paid_receipt(order_d, ev["amount"])
         except Exception as e:
             log(f"boot sweep: receipt for event {ev['event_id']} "
                 f"failed: {e!r}")

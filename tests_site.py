@@ -535,11 +535,16 @@ real_t = S.transition_order_status
 race = {"fired": False}
 
 
-def racing_t(row, new_status):
+def racing_t(row, new_status, **kw):
+    # CONTRACT CHANGE (round 7, flagged): the winning transition
+    # now records the winning payment's identity on the order, so
+    # the simulated winner passes its event/pi explicitly. The
+    # invariant asserted below is unchanged.
     if not race["fired"] and row["id"] == o13:
         race["fired"] = True
-        real_t(row, new_status)  # the winner's transition lands
-    return real_t(row, new_status)
+        real_t(row, new_status, paid_event_id="evt_w13_win",
+               paid_pi="pi_w13_win")  # the winner's transition lands
+    return real_t(row, new_status, **kw)
 
 
 S.transition_order_status = racing_t
@@ -597,6 +602,78 @@ S._paid_effects_done = real_done
 check("A3b marker failure leaves recoverable PAID", refused
       and order_status(oa5) == "PAID"
       and count("fulfilment_requests", "order_id=?", (oa5,)) == 1)
+
+# ---- Delta-7 catalog (added 2026-11-09, round 7) ----
+# W14: a provisional link is not a match. The order was won by
+#      another payment (paid_pi on the order is the authority);
+#      the loser's retry settles it as unmatched — no receipt, no
+#      duplicate ack, HQ alerted exactly once.
+o14 = mk_order("w14@test.dev", "Deep Scan", 29)
+c = db()
+row_14 = dict(c.execute("SELECT * FROM orders WHERE id=?",
+                        (o14,)).fetchone())
+c.close()
+S.transition_order_status(row_14, "PAID",
+                          paid_event_id="evt_w14_win",
+                          paid_pi="pi_w14_win")
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount) VALUES"
+          "('evt_w14_lose','checkout.session.completed',?,?,?,2900)",
+          (o14, S.utcnow(), "pi_w14_lose"))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w14_lose"),
+                sess(2900, "w14@test.dev", pi="pi_w14_lose"))
+c = db()
+loser14 = c.execute(
+    "SELECT order_id FROM stripe_events WHERE "
+    "event_id='evt_w14_lose'").fetchone()[0]
+c.close()
+check("W14 provisional loser settled as unmatched",
+      r[1].get("matched") is False and loser14 is None
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w14_lose%'", ()) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o14,)) == 0
+      and count("fulfilment_requests", "order_id=?", (o14,)) == 1)
+
+# W15: claim ownership — a live claim held by another process
+#      makes this delivery step aside (500, row untouched); once
+#      the claim is stale, the next delivery steals it and the
+#      event completes exactly once.
+c = S.db_connect()
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at,payment_intent,amount,claim,claimed_at) "
+          "VALUES('evt_w15','checkout.session.completed',NULL,?,?,"
+          "200,'otherproc',?)",
+          (S.utcnow(), "pi_w15", time.time()))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w15"), sess(200, "w15@test.dev",
+                                     pi="pi_w15"))
+c = db()
+claim15 = c.execute(
+    "SELECT claim FROM stripe_events WHERE "
+    "event_id='evt_w15'").fetchone()[0]
+c.close()
+check("W15 live foreign claim: step aside, row untouched",
+      r[0] == 500 and claim15 == "otherproc"
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w15%'", ()) == 0)
+c = S.db_connect()
+c.execute("UPDATE stripe_events SET claimed_at=? WHERE "
+          "event_id='evt_w15'", (time.time() - 300,))
+c.commit()
+c.close()
+r = stripe_call(evt("evt_w15"), sess(200, "w15@test.dev",
+                                     pi="pi_w15"))
+r3 = stripe_call(evt("evt_w15"), sess(200, "w15@test.dev",
+                                      pi="pi_w15"))
+check("W15 stale claim stolen, event completes once",
+      r[1].get("matched") is False and r3[1].get("duplicate") is True
+      and count("events", "event='STRIPE_UNMATCHED' AND "
+                "detail LIKE '%evt_w15%'", ()) == 1)
 
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
