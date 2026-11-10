@@ -2375,6 +2375,526 @@ check("N19 escalation: accept-lost -> treated as delivered, "
 
 _ureq18.urlopen = _real_urlopen18
 
+# ---- Round 19 catalog (added 2026-11-10, Codex delta-18
+#      NO-SHIP: classification specimens, the Resend 24h
+#      post-window rule, the periodic production driver,
+#      orphans, driver isolation, atomic reconcile claims) ----
+# Delta-18 certified the N3 contract change and the unmatched
+# alert, and refuted four things: (a) a Resend 2xx without an
+# id (and a Telegram 2xx without an ok field) were classified
+# as definite outcomes instead of unknown; (b) the exactly-
+# once claim ignored Resend's 24h idempotency retention — an
+# unknown outcome recovered past the window could duplicate;
+# (c) the pending-notification driver ran only in the startup
+# sweep, order deletion orphaned its locks/links, and one bad
+# lookup skipped the rest of a sweep; (d) the sent-unconfirmed
+# reconciles (monitor + receipt) had no atomic claim, so two
+# racers could both insert + emit. The pins below continue the
+# N-block (N20+) against the same beneath-wrapper transport.
+import threading as _th19
+
+
+class _Provider19(_Provider18):
+    """Delta-18 (a) specimens: provider answers whose shape
+    carries NO proof of acceptance — a Resend 2xx with an
+    empty body, a Telegram 2xx with no ok field. Everything
+    else inherits the round-18 provider model."""
+
+    def _mail(self, req):
+        if self.mail_mode == "empty-ok":
+            key = None
+            for hk, hv in req.headers.items():
+                if hk.lower() == "idempotency-key":
+                    key = hv
+            to = json.loads(req.data.decode())["to"][0]
+            self.mail_requests.append((key, to))
+            return _Resp18(b"{}")
+        return super()._mail(req)
+
+    def _tg(self, req):
+        if self.tg_mode == "no-ok":
+            text = _uparse18.parse_qs(
+                req.data.decode())["text"][0]
+            self.tg_requests.append(text)
+            return _Resp18(b'{"result":{"message_id":1}}')
+        return super()._tg(req)
+
+
+PROV19 = _Provider19()
+_ureq18.urlopen = PROV19.urlopen
+
+
+def email_state19(notif_key):
+    """The email_delivery row as a tuple, or None — including
+    on the pre-fix tree, where the table does not exist."""
+    c = db()
+    try:
+        r = c.execute(
+            "SELECT first_unknown_at, post_window_used, settled "
+            "FROM email_delivery WHERE notif_key=?",
+            (notif_key,)).fetchone()
+        return tuple(r) if r is not None else None
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        c.close()
+
+
+def shift_unknown19(notif_key, when):
+    c = db()
+    try:
+        c.execute(
+            "UPDATE email_delivery SET first_unknown_at=? "
+            "WHERE notif_key=?", (when, notif_key))
+        c.commit()
+    except sqlite3.OperationalError:
+        pass  # pre-fix tree: no table, the pin's state reads fail
+    finally:
+        c.close()
+
+
+# N20 (a): a Resend 2xx WITHOUT an id is not proof of
+#      acceptance — the wrapper must call it unknown. With an
+#      id it is delivered, as before.
+PROV19.mail_mode = "empty-ok"
+r20a = SR.send_resend("n20@test.dev", "Subject", "body")
+PROV19.mail_mode = "ok"
+r20b = SR.send_resend("n20@test.dev", "Subject", "body")
+check("N20 (a): Resend 2xx without an id -> unknown; with "
+      "an id -> delivered",
+      SR._send_status(r20a) == "unknown" and r20a[0] is False
+      and SR._send_status(r20b) == "delivered"
+      and r20b[0] is True)
+
+# N21 (a): a Telegram 2xx WITHOUT an ok field is neither
+#      ok:true nor ok:false — unknown, not a definite failure.
+PROV19.tg_mode = "no-ok"
+r21a = SR.send_telegram("n21 specimen")
+PROV19.tg_mode = "ok"
+r21b = SR.send_telegram("n21 specimen")
+check("N21 (a): Telegram 2xx without ok -> unknown; ok:true "
+      "-> delivered",
+      SR._send_status(r21a) == "unknown"
+      and SR._send_status(r21b) == "delivered")
+
+# N22 (b): a receipt whose first attempt ends UNKNOWN gets
+#      its first-attempt time stamped durably; a recovery 2h
+#      later (inside the window) retries under the same key —
+#      one logical delivery, as in round 18.
+o22 = mk_order("n22@test.dev", "Deep Scan", 29, status="PAID")
+row22 = row_of18(o22)
+PROV19.mail_mode = "accept-lost"
+r22a = SR._ensure_paid_receipt(row22, 2900)
+st22a = email_state19(f"receipt:{o22}")
+shift_unknown19(f"receipt:{o22}", time.time() - 2 * 3600)
+PROV19.mail_mode = "ok"
+r22b = SR._ensure_paid_receipt(row22, 2900)
+keys22 = PROV19.mail_keys_to("n22@test.dev")
+st22b = email_state19(f"receipt:{o22}")
+check("N22 (b): receipt unknown -> durable first-attempt "
+      "stamp; +2h retry same key, one delivery",
+      r22a is False and r22b is True
+      and st22a is not None and st22a[0] is not None
+      and abs(st22a[0] - time.time()) < 120
+      and st22b is not None and st22b[1] == 0 and st22b[2] == 0
+      and len(keys22) == 2
+      and keys22[0] == keys22[1] == f"receipt:{o22}"
+      and PROV19.mail_delivered_count("n22@test.dev") == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o22,)) == 1)
+
+# N23 (b): the same receipt recovered 25h after its first
+#      unknown attempt — past Resend's retention. Exactly ONE
+#      further same-key resend is permitted; whatever its
+#      outcome (here: the answer is lost again) the receipt
+#      settles as sent-unconfirmed, and a second post-window
+#      recovery makes NO further attempt.
+o23r = mk_order("n23@test.dev", "Deep Scan", 29, status="PAID")
+row23 = row_of18(o23r)
+PROV19.mail_mode = "accept-lost"
+r23a = SR._ensure_paid_receipt(row23, 2900)
+shift_unknown19(f"receipt:{o23r}", time.time() - 25 * 3600)
+r23b = SR._ensure_paid_receipt(row23, 2900)
+r23c = SR._ensure_paid_receipt(row23, 2900)
+keys23 = PROV19.mail_keys_to("n23@test.dev")
+st23 = email_state19(f"receipt:{o23r}")
+check("N23 (b): receipt past window: one post-window resend, "
+      "then settled, no third attempt",
+      r23a is False and r23b is True and r23c is True
+      and len(keys23) == 2
+      and keys23[0] == keys23[1] == f"receipt:{o23r}"
+      and PROV19.mail_delivered_count("n23@test.dev") == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o23r,)) == 1
+      and st23 is not None and st23[1] == 1 and st23[2] == 1)
+
+# N24 (b): a monitoring alert's first UNKNOWN outcome starts
+#      its post-window clock durably (first_unknown_at on the
+#      retained record); a recovery 2h later retries under the
+#      same key — one logical delivery, digest advances.
+o24 = mk_order("n24@test.dev", "Monitoring", 79, status="PAID")
+pend24 = {"new": ["MEDIUM|N24 hole"], "gone": [], "grade": "B",
+          "score": 88,
+          "digest_after": ["LOW|base", "MEDIUM|N24 hole"],
+          "attempts": 1, "since": SR.utcnow()}
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o24, "example.com", "n24@test.dev", "N24", SR.utcnow(),
+           time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend24)))
+c.commit()
+c.close()
+SR._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"},
+     {"severity": "medium", "title": "N24 hole"}],
+    {"host": "example.com", "errors": []})
+PROV19.mail_mode = "accept-lost"
+SR._run_monitor(mon_row16(o24))
+m24a = mon_row16(o24)
+p24a = json.loads(m24a["pending_alert"])
+stamp24 = p24a.get("first_unknown_at")
+if stamp24:
+    p24a["first_unknown_at"] = time.time() - 2 * 3600
+    c = db()
+    c.execute("UPDATE monitors SET pending_alert=? WHERE id=?",
+              (json.dumps(p24a), m24a["id"]))
+    c.commit()
+    c.close()
+PROV19.mail_mode = "ok"
+SR._run_monitor(mon_row16(o24))
+m24b = mon_row16(o24)
+keys24 = PROV19.mail_keys_to("n24@test.dev")
+check("N24 (b): monitor alert unknown -> clock stamped; +2h "
+      "retry same key, one delivery",
+      stamp24 is not None and abs(stamp24 - time.time()) < 120
+      and len(keys24) == 2 and keys24[0] is not None
+      and keys24[0] == keys24[1]
+      and PROV19.mail_delivered_count("n24@test.dev") == 1
+      and m24b["pending_alert"] is None
+      and json.loads(m24b["last_digest"])
+      == ["LOW|base", "MEDIUM|N24 hole"])
+
+# N25 (b): a monitoring alert recovered 25h after its first
+#      unknown outcome gets exactly ONE further same-key
+#      resend; when that resend's answer is lost too, the
+#      alert settles as sent-unconfirmed (pending cleared,
+#      digest advanced) and a second post-window recovery
+#      attempts nothing.
+o25 = mk_order("n25@test.dev", "Monitoring", 79, status="PAID")
+pend25 = {"new": ["MEDIUM|N25 hole"], "gone": [], "grade": "B",
+          "score": 88,
+          "digest_after": ["LOW|base", "MEDIUM|N25 hole"],
+          "attempts": 1, "since": SR.utcnow(),
+          "send_intent": SR.utcnow(), "last_outcome": "unknown",
+          "idem": "monitor-alert:n25-pin",
+          "first_unknown_at": time.time() - 25 * 3600}
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,created_at,"
+          "next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o25, "example.com", "n25@test.dev", "N25", SR.utcnow(),
+           time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend25)))
+c.commit()
+c.close()
+SR._scan_with_timeout = lambda url: (
+    [{"severity": "low", "title": "base"},
+     {"severity": "medium", "title": "N25 hole"}],
+    {"host": "example.com", "errors": []})
+PROV19.mail_mode = "accept-lost"
+SR._run_monitor(mon_row16(o25))
+PROV19.mail_mode = "ok"
+SR._run_monitor(mon_row16(o25))
+m25 = mon_row16(o25)
+keys25 = PROV19.mail_keys_to("n25@test.dev")
+check("N25 (b): monitor alert past window: one post-window "
+      "resend, settled, no further attempt",
+      len(keys25) == 1 and keys25[0] == "monitor-alert:n25-pin"
+      and m25["pending_alert"] is None
+      and json.loads(m25["last_digest"])
+      == ["LOW|base", "MEDIUM|N25 hole"]
+      and count("events", "order_id=? AND event='MONITOR_ALERT_SENT'",
+                (o25,)) == 1)
+
+# N26 (c1): the production scheduler tick — not a consult,
+#      not a webhook, not the startup sweep — drives a pending
+#      ping while the process lives. The order has already
+#      advanced; every monitor is parked so the tick's monitor
+#      half is idle and only the driver can act.
+o26 = mk_order("n26@test.dev", "Deep Scan", 29)
+row26 = row_of18(o26)
+PROV19.tg_mode = "http4xx"
+SR.transition_order_status(row26, "PAID")
+SR.transition_order_status(row_of18(o26), "IN_PROGRESS")
+c = db()
+c.execute("UPDATE monitors SET next_run_at=?",
+          (time.time() + 10 ** 9,))
+c.commit()
+c.close()
+PROV19.tg_mode = "ok"
+tick19 = getattr(SR, "_monitor_tick", None)
+if tick19 is not None:
+    tick19()
+check("N26 (c1): production tick drives the pending ping",
+      tick19 is not None
+      and len(PROV19.tg_pings(o26)) == 1
+      and count("events",
+                "order_id=? AND event='DEEPSCAN_NOTIFIED'",
+                (o26,)) == 1)
+
+# N27 (c1): the driver's failure inside a tick is isolated —
+#      the tick returns normally, so the scheduler loop (which
+#      calls the tick, then sleeps) can never be killed by it.
+_real_driver19 = SR._drive_pending_notifications
+
+
+def _boom_driver19():
+    raise RuntimeError("simulated driver failure")
+
+
+SR._drive_pending_notifications = _boom_driver19
+iso27 = tick19 is not None
+try:
+    if tick19 is not None:
+        tick19()
+except Exception:
+    iso27 = False
+SR._drive_pending_notifications = _real_driver19
+check("N27 (c1): a failing driver cannot kill the scheduler "
+      "tick", iso27)
+
+# N28 (c2): the admin order-delete removes, in the same
+#      transaction, the order's notification locks and its
+#      stripe_events link rows — nothing is left for the
+#      driver to chase or the sweep to misread.
+o28 = mk_order("n28@test.dev", "Deep Scan", 29, status="PAID")
+c = db()
+for _k28, _p28 in ((f"notify:{o28}", "deepscan-notify-pending"),
+                   (f"receipt:{o28}", "receipt"),
+                   (f"monitor-activate:{o28}", "monitor-activate")):
+    c.execute("INSERT INTO event_locks(event_id,purpose,"
+              "claimed_at,owner) VALUES(?,?,?,?)",
+              (_k28, _p28, time.time(), "pin28"))
+c.execute("INSERT INTO stripe_events(event_id,type,order_id,"
+          "received_at) VALUES(?,?,?,?)",
+          ("evt_n28", "checkout.session.completed", o28,
+           SR.utcnow()))
+c.commit()
+c.close()
+
+
+class FakeSelf19(SR.Handler):
+    """The real admin entry point with a captured reply."""
+
+    def __init__(self):
+        self.replies = []
+        self.headers = {"X-Admin-Token": "catalog-admin"}
+
+    def _send_json(self, code, payload):
+        self.replies.append((code, payload))
+
+
+SR.ADMIN_TOKEN = "catalog-admin"
+fs19 = FakeSelf19()
+SR.Handler._api_admin_delete(fs19, f"/api/orders/{o28}")
+check("N28 (c2): admin delete removes locks + stripe links "
+      "with the order",
+      fs19.replies[-1][0] == 200
+      and count("orders", "id=?", (o28,)) == 0
+      and count("event_locks", "event_id IN (?,?,?)",
+                (f"notify:{o28}", f"receipt:{o28}",
+                 f"monitor-activate:{o28}")) == 0
+      and count("stripe_events", "order_id=?", (o28,)) == 0)
+
+# N29 (c2): a notify lock whose order no longer exists (the
+#      pre-round-19 delete left such rows) is garbage-collected
+#      by the driver instead of being skipped forever.
+ghost29 = 987650
+c = db()
+c.execute("INSERT INTO event_locks(event_id,purpose,claimed_at,"
+          "owner) VALUES(?,?,?,?)",
+          (f"notify:{ghost29}", "deepscan-notify-pending",
+           time.time(), "pin29"))
+c.commit()
+c.close()
+SR._drive_pending_notifications()
+check("N29 (c2): driver collects an orphan notify lock",
+      lock_row18(f"notify:{ghost29}") is None)
+
+# N30 (c3): one poisoned item — a database failure on its
+#      order lookup — is logged and deferred; the SAME sweep
+#      still drives the later item.
+o30a = mk_order("n30a@test.dev", "Deep Scan", 29)
+o30b = mk_order("n30b@test.dev", "Deep Scan", 29)
+PROV19.tg_mode = "http4xx"
+SR.transition_order_status(row_of18(o30a), "PAID")
+SR.transition_order_status(row_of18(o30b), "PAID")
+c = db()
+_order30 = [r[0] for r in c.execute(
+    "SELECT event_id FROM event_locks WHERE "
+    "event_id LIKE 'notify:%' AND purpose IN "
+    "('deepscan-notify-pending', 'deepscan-notify-intent', "
+    "'deepscan-notify-pending-unknown', "
+    "'deepscan-notified-unconfirmed')").fetchall()]
+c.close()
+_pair30 = [e for e in _order30
+           if e in (f"notify:{o30a}", f"notify:{o30b}")]
+first30 = int(_pair30[0].split(":", 1)[1])
+second30 = o30b if first30 == o30a else o30a
+_real_conn19 = SR.db_connect
+
+
+class _PoisonConn19:
+    """Raises on the order lookup for ONE order id — the
+    delta-18 (c3) specimen. Everything else delegates."""
+
+    def __init__(self, real):
+        self._real = real
+
+    def execute(self, sql, args=()):
+        if "FROM orders WHERE id=?" in sql and args \
+                and args[0] == first30:
+            raise sqlite3.OperationalError(
+                "simulated lookup failure (pin N30)")
+        return self._real.execute(sql, args)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        if name == "_real":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(self._real, name, value)
+
+
+SR.db_connect = lambda: _PoisonConn19(_real_conn19())
+PROV19.tg_mode = "ok"
+escaped30 = False
+try:
+    SR._drive_pending_notifications()
+except Exception:
+    escaped30 = True
+SR.db_connect = _real_conn19
+check("N30 (c3): poisoned lookup deferred, later item still "
+      "driven in the same sweep",
+      not escaped30
+      and len(PROV19.tg_pings(second30)) == 1
+      and len(PROV19.tg_pings(first30)) == 0)
+
+# N31 (d): two racing MONITOR_ACTIVATED reconciles — both
+#      observe the unconfirmed state, but the reconcile is
+#      claimed atomically first: exactly one event record and
+#      one process-log emission. The slow log_event widens the
+#      race so both racers reach the branch before either
+#      writes.
+o31 = mk_order("n31@test.dev", "Monitoring", 79, status="PAID")
+row31 = row_of18(o31)
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
+          (o31, "https://example.com", "n31@test.dev", "N31",
+           SR.utcnow(), time.time() + 10 ** 9))
+c.execute("INSERT INTO event_locks(event_id,purpose,claimed_at,"
+          "owner) VALUES(?,?,?,?)",
+          (f"monitor-activate:{o31}",
+           "monitor-activated-unconfirmed", time.time(), "pin31"))
+c.commit()
+c.close()
+_real_le31 = SR.log_event
+
+
+def _slow_le31(order_id, event, detail=""):
+    if event == "MONITOR_ACTIVATED" and order_id == o31:
+        time.sleep(0.5)
+    return _real_le31(order_id, event, detail)
+
+
+EMIT31 = []
+_real_log31 = SR.log
+
+
+def _counting31(msg):
+    EMIT31.append(msg)
+    return _real_log31(msg)
+
+
+SR.log_event = _slow_le31
+SR.log = _counting31
+_ths31 = [_th19.Thread(target=SR.activate_monitor, args=(row31,))
+          for _ in range(2)]
+for _t in _ths31:
+    _t.start()
+for _t in _ths31:
+    _t.join()
+SR.log_event = _real_le31
+SR.log = _real_log31
+_em31 = [m for m in EMIT31
+         if f"order={o31} event=MONITOR_ACTIVATED" in m]
+check("N31 (d): racing monitor reconciles -> one record, "
+      "one emission",
+      len(_em31) == 1
+      and count("events",
+                "order_id=? AND event='MONITOR_ACTIVATED'",
+                (o31,)) == 1
+      and count("monitors", "order_id=?", (o31,)) == 1)
+
+# N32 (d): two racing receipt reconciles on the durable
+#      sent-unconfirmed record — the claim lives on the lock
+#      row's purpose (a takeover transitions the row that
+#      already exists; the send path and A5's lifecycle are
+#      untouched): exactly one PAID_EMAIL_SENT record and one
+#      emission, and the reconcile never sends.
+o32 = mk_order("n32@test.dev", "Deep Scan", 29, status="PAID")
+row32 = row_of18(o32)
+c = db()
+c.execute("INSERT INTO event_locks(event_id,purpose,claimed_at,"
+          "owner) VALUES(?,?,?,?)",
+          (f"receipt:{o32}", "receipt-sent-unconfirmed",
+           time.time(), "pin32"))
+c.commit()
+c.close()
+_real_le32 = SR.log_event
+
+
+def _slow_le32(order_id, event, detail=""):
+    if event == "PAID_EMAIL_SENT" and order_id == o32:
+        time.sleep(0.5)
+    return _real_le32(order_id, event, detail)
+
+
+EMIT32 = []
+_real_log32 = SR.log
+
+
+def _counting32(msg):
+    EMIT32.append(msg)
+    return _real_log32(msg)
+
+
+SR.log_event = _slow_le32
+SR.log = _counting32
+_ths32 = [_th19.Thread(target=SR._ensure_paid_receipt,
+                       args=(row32, 2900)) for _ in range(2)]
+for _t in _ths32:
+    _t.start()
+for _t in _ths32:
+    _t.join()
+SR.log_event = _real_le32
+SR.log = _real_log32
+_em32 = [m for m in EMIT32
+         if f"order={o32} event=PAID_EMAIL_SENT" in m]
+check("N32 (d): racing receipt reconciles -> one record, "
+      "one emission, no send",
+      len(_em32) == 1
+      and count("events", "order_id=? AND event='PAID_EMAIL_SENT'",
+                (o32,)) == 1
+      and PROV19.mail_keys_to("n32@test.dev") == [])
+
+_ureq18.urlopen = _real_urlopen18
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
