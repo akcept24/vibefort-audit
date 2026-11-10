@@ -3641,6 +3641,375 @@ check("N52 (5b): order deleted between the QUEUED record "
       PROV21.tg_attempts(o52) == []
       and lock_row18(f"notify:{o52}") is None)
 
+# ============================================================
+# Round 22 (Codex delta-20): tombstone-first deletion,
+# no-resurrect bookkeeping, first-unknown basis restored.
+# Delta-20 refuted round 21 on three arms: (1) outcome
+# bookkeeping RESURRECTS state after deletion
+# (_email_note_unknown / _email_mark are UPSERTs; the final
+# _record_effects_ok recreates an orphan SIDE_EFFECTS_OK
+# event); (2) the existence checks and the sends are separate
+# operations — a deletion landing in the check-to-send gap
+# still starts a NEW send, and the monitor ESCALATION
+# Telegram send has no existence check at all; (3) round 21's
+# window basis (the earliest stamp of the row, i.e. the first
+# ATTEMPT) is a contract change against round 19's
+# first-UNKNOWN basis — the parent REJECTED the widening.
+# Round 22: the admin delete writes a durable tombstone
+# (deleted_orders) FIRST, inside the same _db_lock
+# transaction; every send seam (receipt email, Deep Scan HQ
+# ping, monitor alert email, monitor escalation Telegram)
+# re-consults existence+tombstone at the seam under the same
+# lock discipline, so a seam check after the tombstone aborts
+# with no send and no writes; the email bookkeeping writers
+# are UPDATE-only / tombstone-guarded; the window basis is
+# the first UNKNOWN outcome again, with the conservative
+# crash arm (an attempt whose outcome was never recorded
+# counts its pre-send attempt stamp). The pins below drive
+# the genuine wrappers through SR with the transport stubbed
+# beneath them; deletions are executed through the REAL
+# admin endpoint (FakeSelf19) from inside the wrapped seam.
+PROV22 = _Provider21()
+_ureq18.urlopen = PROV22.urlopen
+
+
+def tombstone_of22(oid):
+    """The durable deleted-order tombstone, or False — on the
+    pre-fix tree the table does not exist."""
+    c = db()
+    try:
+        r = c.execute("SELECT 1 FROM deleted_orders WHERE "
+                      "order_id=?", (oid,)).fetchone()
+        return r is not None
+    except sqlite3.OperationalError:
+        return False
+    finally:
+        c.close()
+
+
+def admin_delete22(oid):
+    fs = FakeSelf19()
+    SR.Handler._api_admin_delete(fs, f"/api/orders/{oid}")
+    return fs.replies[-1][0] if fs.replies else None
+
+
+def _stale_wrap22(target):
+    """Wrap SR's existence checks so a deletion lands INSIDE
+    the check-to-send gap: the first check for the target
+    order executes the real admin delete and still returns
+    the stale pre-deletion answer; every later check for that
+    order keeps returning the stale answer, modelling a
+    caller acting on a decision taken before the deletion.
+    The round-22 seam gate consults the tombstone directly
+    (not through these helpers), which is exactly the
+    serialization the fix adds."""
+    real_exists = SR._order_exists
+    real_alive = getattr(SR, "_order_alive", None)
+    box = {"done": False}
+
+    def _stale(oid):
+        if oid == target:
+            if not box["done"]:
+                box["done"] = True
+                admin_delete22(oid)
+            return True
+        return real_exists(oid)
+
+    SR._order_exists = _stale
+    if real_alive is not None:
+        SR._order_alive = _stale
+
+    def _restore():
+        SR._order_exists = real_exists
+        if real_alive is not None:
+            SR._order_alive = real_alive
+    return _restore
+
+
+# N53 (1): the receipt seam — a deletion landing inside the
+#      entry-check-to-send gap (through the real admin
+#      endpoint, inside the wrapped existence check) must
+#      abort the send at the round-22 gate: no email starts,
+#      no email_delivery row is created, no lock is left.
+o53 = mk_order("n53@test.dev", "Deep Scan", 29, status="PAID")
+row53 = row_of18(o53)
+_restore53 = _stale_wrap22(o53)
+PROV22.mail_mode = "ok"
+r53 = SR._ensure_paid_receipt(row53, 2900)
+_restore53()
+check("N53 (1): receipt — deletion inside the check-to-send "
+      "gap aborts at the seam gate: no send, no email row, "
+      "no lock, tombstone recorded",
+      r53 is False
+      and PROV22.mail_keys_to("n53@test.dev") == []
+      and email_state19(f"receipt:{o53}") is None
+      and lock_row18(f"receipt:{o53}") is None
+      and tombstone_of22(o53))
+
+# N54 (1): the Deep Scan ping seam, same gap: the ping never
+#      starts and the notify lock the fire claimed on the way
+#      in is released again.
+o54 = mk_order("n54@test.dev", "Deep Scan", 29, status="PAID")
+row54 = row_of18(o54)
+_restore54 = _stale_wrap22(o54)
+PROV22.tg_mode = "ok"
+SR._fire_deep_scan_notification(row54)
+_restore54()
+check("N54 (1): ping — deletion inside the check-to-send "
+      "gap aborts at the seam gate: no ping attempted, no "
+      "notify lock left",
+      PROV22.tg_attempts(o54) == []
+      and lock_row18(f"notify:{o54}") is None
+      and tombstone_of22(o54))
+
+# N55 (1): the monitor alert email seam — the deletion lands
+#      during alert composition (inside the wrapped parts
+#      builder, after every earlier existence check passed):
+#      the send must not start.
+o55 = mk_order("n55@test.dev", "Monitoring", 79, status="PAID")
+pend55 = {"since": SR.utcnow(), "new": [], "gone": [],
+          "grade": "B", "score": 88,
+          "digest_after": "d55", "attempts": 1}
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o55, "example.com", "n55@test.dev", "N55",
+           SR.utcnow(), time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend55)))
+c.commit()
+c.close()
+m55 = mon_row16(o55)
+_real_parts55 = SR._monitor_alert_parts
+
+
+def _deleting_parts55(mon, host, order_id, new, gone,
+                      grade, score):
+    parts = _real_parts55(mon, host, order_id, new, gone,
+                          grade, score)
+    admin_delete22(o55)
+    return parts
+
+
+SR._monitor_alert_parts = _deleting_parts55
+PROV22.mail_mode = "ok"
+SR._run_monitor(dict(m55))
+SR._monitor_alert_parts = _real_parts55
+check("N55 (1): monitor alert — deletion during composition "
+      "aborts at the seam gate: no alert email starts",
+      PROV22.mail_keys_to("n55@test.dev") == []
+      and count("events", "order_id=?", (o55,)) == 0)
+
+# N56 (1): the monitor ESCALATION Telegram send — delta-20
+#      found it has NO existence check at all. A retained
+#      alert fails definitely for the third time; the
+#      deletion lands inside the failure log write, after
+#      which the escalation would start: it must not.
+o56 = mk_order("n56@test.dev", "Monitoring", 79, status="PAID")
+pend56 = {"since": SR.utcnow(), "new": [], "gone": [],
+          "grade": "B", "score": 88,
+          "digest_after": "d56", "attempts": 2}
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o56, "https://n56.example.com", "n56@test.dev",
+           "N56", SR.utcnow(), time.time(),
+           json.dumps(["LOW|base"]), json.dumps(pend56)))
+c.commit()
+c.close()
+m56 = mon_row16(o56)
+_real_le56 = SR.log_event
+
+
+def _deleting_le56(order_id, event, detail=""):
+    out = _real_le56(order_id, event, detail)
+    if event == "MONITOR_ALERT_FAILED" and order_id == o56:
+        admin_delete22(o56)
+    return out
+
+
+SR.log_event = _deleting_le56
+PROV22.mail_mode = "http4xx"
+PROV22.tg_mode = "ok"
+SR._run_monitor(dict(m56))
+SR.log_event = _real_le56
+check("N56 (1): escalation — order deleted after the third "
+      "failed attempt, before the escalation send: no "
+      "escalation Telegram starts",
+      [t for t in PROV22.tg_requests
+       if "n56.example.com" in t] == [])
+
+# N57 (1): a pending-work driver pass over a TOMBSTONED
+#      order (its order row still present — the tombstone,
+#      not the row removal, is what marks the work dead):
+#      the pending ping is dropped without firing and the GC
+#      collects the notify lock and the receipt email row.
+o57 = mk_order("n57@test.dev", "Deep Scan", 29, status="PAID")
+c = db()
+c.execute("INSERT INTO event_locks(event_id, purpose, "
+          "claimed_at, owner) VALUES(?,?,?,?)",
+          (f"notify:{o57}", "deepscan-notify-pending",
+           SR.time.time(), "owner-57"))
+try:
+    c.execute("INSERT INTO email_delivery(notif_key) "
+              "VALUES(?)", (f"receipt:{o57}",))
+except sqlite3.OperationalError:
+    pass
+try:
+    c.execute("INSERT INTO deleted_orders(order_id, "
+              "deleted_at) VALUES(?,?)",
+              (o57, SR.time.time()))
+except sqlite3.OperationalError:
+    pass  # pre-fix tree: no tombstone table — the driver
+    # fires the pending ping and the pin fails as required
+c.commit()
+c.close()
+PROV22.tg_mode = "ok"
+SR._drive_pending_notifications()
+check("N57 (1): driver over a tombstoned order: pending "
+      "ping dropped unfired, notify lock and receipt email "
+      "row collected, order row itself untouched",
+      PROV22.tg_attempts(o57) == []
+      and lock_row18(f"notify:{o57}") is None
+      and email_state19(f"receipt:{o57}") is None
+      and count("orders", "id=?", (o57,)) == 1)
+
+# N58 (2): an in-flight receipt send whose answer is lost
+#      (unknown) AFTER the order was deleted mid-send (the
+#      deletion executes inside the wrapped transport): the
+#      outcome bookkeeping must not resurrect the
+#      email_delivery row the delete transaction removed,
+#      and no event may be written for the dead order. The
+#      direct-call arm pins the writers themselves.
+o58 = mk_order("n58@test.dev", "Deep Scan", 29, status="PAID")
+row58 = row_of18(o58)
+_real_send58 = SR.send_resend
+
+
+def _deleting_send58(to, subject, text, html=None):
+    admin_delete22(o58)
+    return SR._SendOutcome(False, "answer lost after "
+                           "acceptance", "unknown")
+
+
+SR.send_resend = _deleting_send58
+r58 = SR._ensure_paid_receipt(row58, 2900)
+SR.send_resend = _real_send58
+SR._email_note_unknown(f"receipt:{o58}")
+SR._email_mark(f"receipt:{o58}", "settled")
+check("N58 (2): unknown outcome recorded after deletion "
+      "does not resurrect the email row; no orphan events",
+      r58 is False
+      and email_state19(f"receipt:{o58}") is None
+      and count("events", "order_id=?", (o58,)) == 0)
+
+# N59 (2): ensure_paid_side_effects paused after its entry
+#      check (the wrapped activate_monitor deletes the order
+#      through the real endpoint, then runs the real
+#      activation, which no-ops on the dead order): the final
+#      _record_effects_ok must skip — no orphan
+#      SIDE_EFFECTS_OK event is recreated.
+o59 = mk_order("n59@test.dev", "Monitoring", 79, status="PAID")
+row59 = row_of18(o59)
+_real_act59 = SR.activate_monitor
+
+
+def _deleting_act59(order):
+    admin_delete22(o59)
+    return _real_act59(order)
+
+
+SR.activate_monitor = _deleting_act59
+SR.ensure_paid_side_effects(row59)
+SR.activate_monitor = _real_act59
+check("N59 (2): ensure resumed after deletion writes no "
+      "SIDE_EFFECTS_OK event for the dead order",
+      count("events", "order_id=? AND event='SIDE_EFFECTS_OK'",
+            (o59,)) == 0
+      and count("events", "order_id=?", (o59,)) == 0)
+
+# N60 (3): the restored first-UNKNOWN basis, arm (i) — a
+#      definite failure at T0 never starts the window: age
+#      the attempt stamp 25h, then lose the next answer
+#      (unknown). The recovery must still retry FREELY (no
+#      post-window claim consumed, nothing settled), and a
+#      third attempt still goes out.
+o60 = mk_order("n60@test.dev", "Deep Scan", 29, status="PAID")
+row60 = row_of18(o60)
+PROV22.mail_mode = "http4xx"
+r60a = SR._ensure_paid_receipt(row60, 2900)
+shift_attempt21(f"receipt:{o60}", time.time() - 25 * 3600)
+PROV22.mail_mode = "accept-lost"
+r60b = SR._ensure_paid_receipt(row60, 2900)
+r60c = SR._ensure_paid_receipt(row60, 2900)
+st60 = email_state19(f"receipt:{o60}")
+check("N60 (3): definite failure at T0 + first unknown at "
+      "T0+25h: recovery retries freely — no post-window "
+      "claim, no settle, third attempt sent",
+      r60a is False and r60b is False and r60c is False
+      and len(PROV22.mail_keys_to("n60@test.dev")) == 3
+      and st60 is not None and st60[0] is not None
+      and st60[1] == 0 and st60[2] == 0)
+
+# N61 (3): the same arm on the monitor alert window — a
+#      definite failure must not leave a first_unknown_at
+#      stamp on the retained record (round 21's pre-send
+#      stamp is popped when the attempt it belonged to ends
+#      definitely), so a later unknown starts the window at
+#      its own time and retries continue freely.
+o61 = mk_order("n61@test.dev", "Monitoring", 79, status="PAID")
+pend61 = {"since": SR.utcnow(), "new": [], "gone": [],
+          "grade": "B", "score": 88,
+          "digest_after": "d61", "attempts": 1}
+c = db()
+c.execute("INSERT INTO monitors(order_id,url,email,name,"
+          "created_at,next_run_at,last_digest,pending_alert) "
+          "VALUES(?,?,?,?,?,?,?,?)",
+          (o61, "example.com", "n61@test.dev", "N61",
+           SR.utcnow(), time.time(), json.dumps(["LOW|base"]),
+           json.dumps(pend61)))
+c.commit()
+c.close()
+m61 = mon_row16(o61)
+SR._scan_with_timeout = lambda url, stored=None: (
+    True, "ok", {"findings": []}, "d61")
+PROV22.mail_mode = "http4xx"
+SR._run_monitor(dict(m61))
+c = db()
+row61a = c.execute("SELECT pending_alert FROM monitors "
+                   "WHERE id=?", (m61["id"],)).fetchone()
+c.close()
+pend61a = json.loads(row61a[0]) if row61a and row61a[0] \
+    else None
+# Age whatever stamp the definite attempt left (pre-fix:
+# round 21's pre-send stamp survives and would start the
+# window 25h ago; post-fix: none was left to age).
+if pend61a is not None and pend61a.get("first_unknown_at"):
+    pend61a["first_unknown_at"] = time.time() - 25 * 3600
+    c = db()
+    c.execute("UPDATE monitors SET pending_alert=? WHERE "
+              "id=?", (json.dumps(pend61a), m61["id"]))
+    c.commit()
+    c.close()
+PROV22.mail_mode = "accept-lost"
+SR._run_monitor(dict(m61))
+SR._run_monitor(dict(m61))
+c = db()
+row61b = c.execute("SELECT pending_alert FROM monitors "
+                   "WHERE id=?", (m61["id"],)).fetchone()
+c.close()
+pend61b = json.loads(row61b[0]) if row61b and row61b[0] \
+    else None
+check("N61 (3): monitor — definite failure leaves no "
+      "window stamp; the later unknown retries freely and "
+      "the alert stays pending, unspent",
+      pend61a is not None
+      and not pend61a.get("first_unknown_at")
+      and len(PROV22.mail_keys_to("n61@test.dev")) == 3
+      and pend61b is not None
+      and not pend61b.get("post_window_used"))
+
 _ureq18.urlopen = _real_urlopen18
 
 failed = [n for n, ok in PASS if not ok]

@@ -192,6 +192,34 @@ def db_connect():
         conn.execute(
             "ALTER TABLE email_delivery ADD COLUMN "
             "first_attempt_at REAL")
+    # Round 22 (Codex delta-20): the email window basis is the
+    # first UNKNOWN outcome again (the round-21 first-attempt
+    # widening was rejected by the parent as a contract
+    # change). Two outcome columns let a later decision tell a
+    # recorded outcome from an attempt whose outcome was never
+    # recorded (crash between acceptance and outcome write):
+    # last_attempt_at moves at every pre-send stamp,
+    # last_outcome_at moves only when an outcome is recorded.
+    if "last_attempt_at" not in ecols:
+        conn.execute(
+            "ALTER TABLE email_delivery ADD COLUMN "
+            "last_attempt_at REAL")
+    if "last_outcome_at" not in ecols:
+        conn.execute(
+            "ALTER TABLE email_delivery ADD COLUMN "
+            "last_outcome_at REAL")
+    # Round 22: durable deleted-order tombstones. The admin
+    # delete writes the tombstone FIRST, inside the same
+    # _db_lock transaction that removes the order's rows;
+    # every send seam re-consults existence+tombstone under
+    # the same lock discipline before its HTTP call, so a
+    # deletion that lands in the check-to-send gap aborts the
+    # send instead of racing it. Order ids are AUTOINCREMENT
+    # and never reused, so a tombstone can never condemn a
+    # future order.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS deleted_orders("
+        "order_id INTEGER PRIMARY KEY, deleted_at REAL NOT NULL)")
     lcols = [r[1] for r in conn.execute("PRAGMA table_info(event_locks)")]
     if "owner" not in lcols:
         conn.execute("ALTER TABLE event_locks ADD COLUMN owner TEXT")
@@ -2141,6 +2169,24 @@ class Handler(BaseHTTPRequestHandler):
             conn = db_connect()
             try:
                 if kind == "orders":
+                    # Round 22 (Codex delta-20): the tombstone
+                    # goes FIRST — before any row is removed,
+                    # inside this same _db_lock transaction.
+                    # Send seams serialize against this write
+                    # through the same lock (see _send_gate):
+                    # a seam check that runs before this
+                    # transaction is legitimately in-flight (the
+                    # accepted residual); a check that runs
+                    # after it sees the tombstone and aborts
+                    # with no send and no writes. Only an order
+                    # that exists is tombstoned.
+                    if conn.execute(
+                            "SELECT 1 FROM orders WHERE id=?",
+                            (oid,)).fetchone():
+                        conn.execute(
+                            "INSERT OR IGNORE INTO deleted_orders"
+                            "(order_id, deleted_at) VALUES(?,?)",
+                            (oid, time.time()))
                     # The order's monitor ids first (round 21):
                     # their monitor:<id> locks are deleted by id
                     # below, in this same transaction.
@@ -2602,7 +2648,17 @@ def _record_effects_ok(order_id, tier, note=""):
     courtesy logs too), so the marker is verified by reading it
     back; an unpersisted marker raises instead of letting the
     order advance on a completion that exists only in memory
-    (Codex delta-6 finding 2)."""
+    (Codex delta-6 finding 2).
+
+    Round 22 (Codex delta-20): a caller that paused after its
+    entry check and resumes after the order was deleted must
+    not recreate the marker as an orphan event — the marker
+    is skipped entirely for a dead order (no write, and no
+    raise: nothing is owed for an order that no longer
+    exists, and the read-back below would otherwise report
+    the skip as a persistence failure)."""
+    if _order_dead(order_id):
+        return
     log_event(order_id, "SIDE_EFFECTS_OK",
               f"tier={tier}" + (f" {note}" if note else ""))
     if not _paid_effects_done(order_id):
@@ -2616,12 +2672,14 @@ def ensure_paid_side_effects(order):
     never recorded. No-op when SIDE_EFFECTS_OK is already logged."""
     if _paid_effects_done(order["id"]):
         return
-    if not _order_exists(order["id"]):
+    if not _order_alive(order["id"]):
         # Round 21 (Codex delta-19 (c)): recovery driven for
         # a deleted order fires nothing — the appliers below
         # are existence-guarded individually as well, and the
         # completion marker must not be written for an order
-        # that no longer exists.
+        # that no longer exists. Round 22: tombstone-aware —
+        # a tombstoned order's row may still exist mid-delete,
+        # and its work is already dead.
         return
     if order["tier"] == "Monitoring":
         activate_monitor(order)
@@ -2655,7 +2713,11 @@ def _gc_notification_orphans():
     rows orphaned before that, and for anything a deletion
     race could leave. A lock or row whose owner EXISTS is
     never touched — a live monitor's run lock is its mutex.
-    Every item is isolated, like the driver's items below."""
+    Every item is isolated, like the driver's items below.
+
+    Round 22: "owner gone" is tombstone-aware — an owner
+    under a deleted-order tombstone counts as gone even
+    while its row still exists mid-delete."""
     conn = db_connect()
     try:
         mlocks = [r[0] for r in conn.execute(
@@ -2670,7 +2732,20 @@ def _gc_notification_orphans():
         try:
             mid = int(eid.split(":", 1)[1])
             if _monitor_alive(mid):
-                continue
+                # Round 22: a live monitor whose ORDER is
+                # tombstoned is dead work too — its lock is
+                # collected even while both rows still exist
+                # (the delete transaction is mid-flight).
+                _mrow = None
+                conn = db_connect()
+                try:
+                    _mrow = conn.execute(
+                        "SELECT order_id FROM monitors WHERE "
+                        "id=?", (mid,)).fetchone()
+                finally:
+                    conn.close()
+                if _mrow is not None and _order_alive(_mrow[0]):
+                    continue
             with _db_lock:
                 conn = db_connect()
                 conn.execute(
@@ -2687,7 +2762,10 @@ def _gc_notification_orphans():
     for nkey in erows:
         try:
             oid = int(nkey.split(":", 1)[1])
-            if _order_exists(oid):
+            # Round 22: tombstone-aware — a tombstoned order's
+            # receipt row is collected even while the order
+            # row still exists mid-delete.
+            if _order_alive(oid):
                 continue
             with _db_lock:
                 conn = db_connect()
@@ -2753,7 +2831,10 @@ def _drive_pending_notifications():
                     (oid,)).fetchone()
             finally:
                 conn.close()
-            if orow is None:
+            if orow is None or _order_dead(oid):
+                # Round 22: a tombstoned order's pending work
+                # is dead even while its row still exists
+                # mid-delete — drop it; never fire it.
                 with _db_lock:
                     conn = db_connect()
                     conn.execute(
@@ -3022,17 +3103,26 @@ def _send_paid_receipt(order, amount_cents):
                "was completed for your ShipAudit Lab order.")
     _idem_tok = _MAIL_IDEM.set(f"receipt:{order['id']}")
     try:
+        if not _send_gate(order["id"]):
+            # Round 22: the FINAL receipt seam, inside the
+            # send itself — every earlier check a caller made
+            # may be stale by the time composition finishes.
+            # A tombstone here aborts with no HTTP call; the
+            # caller reads the definite outcome and retries
+            # nothing (its own entry check stops it first).
+            return "failed"
         res = send_resend(
             order["email"], f"Payment received — {tier}",
             rcpt_text, html=rcpt_html)
     finally:
         _MAIL_IDEM.reset(_idem_tok)
     status = _send_status(res)
-    log_event(order["id"],
-              "PAID_EMAIL_SENT" if status == "delivered"
-              else "PAID_EMAIL_FAILED",
-              res[1] if status != "unknown"
-              else f"transport outcome unknown: {res[1]}")
+    _log_event_alive(
+        order["id"],
+        "PAID_EMAIL_SENT" if status == "delivered"
+        else "PAID_EMAIL_FAILED",
+        res[1] if status != "unknown"
+        else f"transport outcome unknown: {res[1]}")
     return status
 
 
@@ -3254,42 +3344,118 @@ _RESEND_IDEM_SAFE_AGE = 23 * 3600
 def _email_state(notif_key):
     """The email_delivery row for one logical notification as
     (first_unknown_at, post_window_used, settled,
-    first_attempt_at), or None."""
+    first_attempt_at, last_attempt_at, last_outcome_at), or
+    None. The first four indices are the round-19/21 shape;
+    the round-22 pair is appended, never reordered."""
     conn = db_connect()
     try:
         return conn.execute(
             "SELECT first_unknown_at, post_window_used, settled, "
-            "first_attempt_at FROM email_delivery "
-            "WHERE notif_key=?", (notif_key,)).fetchone()
+            "first_attempt_at, last_attempt_at, last_outcome_at "
+            "FROM email_delivery WHERE notif_key=?",
+            (notif_key,)).fetchone()
     finally:
         conn.close()
 
 
+def _email_window_basis(state):
+    """Round 22: the post-window clock's basis for one
+    email_delivery state row — the first UNKNOWN outcome's
+    time, restored as the basis after the parent rejected
+    round 21's first-attempt widening as a contract change.
+    Three arms: (i) a recorded unknown outcome starts the
+    window at that outcome's time (first_unknown_at, stamped
+    from the pre-send stamp of THAT attempt); (ii) definite
+    failures NEVER start it — an attempt whose outcome was
+    recorded as definite contributes nothing; (iii) the
+    conservative crash arm — an attempt whose outcome was
+    never recorded (last_attempt_at with no outcome at or
+    after it) counts its own pre-send attempt stamp: the
+    earliest such stamp when no outcome was ever recorded
+    (first_attempt_at), otherwise the unrecorded attempt's
+    own stamp (last_attempt_at)."""
+    if state is None:
+        return None
+    cands = []
+    if state[0]:
+        cands.append(state[0])
+    if state[4]:
+        if state[5] is None:
+            cands.append(state[3] or state[4])
+        elif state[5] < state[4]:
+            cands.append(state[4])
+    return min(cands) if cands else None
+
+
 def _email_note_attempt(notif_key):
-    """Stamp the FIRST attempt's time for a logical email
-    notification, BEFORE the send it belongs to (round 21,
-    Codex delta-19 (a2)). First-stamp-wins, exactly like
-    _email_note_unknown — of which this is the pre-send twin:
-    round 19 stamped only the unknown OUTCOME, after the
-    send, so a crash between an accepted send and the outcome
-    bookkeeping left no stamp at all and a recovery past the
-    window read the notification as never attempted. The
-    post-window clock (see _ensure_paid_receipt) runs from
-    the earliest stamp on the row: for any send whose outcome
-    was recorded the two stamps are one send apart; where
-    they differ — the outcome recording was lost, or the
-    first outcome was a definite failure — the earlier,
-    conservative reading governs."""
+    """Stamp an attempt's time for a logical email
+    notification, BEFORE the send it belongs to (round 21's
+    pre-send stamp, kept; round 22 re-bases its meaning).
+    first_attempt_at is first-stamp-wins; last_attempt_at
+    moves at EVERY attempt. Before last_attempt_at is
+    overwritten, a previous attempt whose outcome was never
+    recorded is promoted into first_unknown_at (the crash
+    arm of the basis): its stamp becomes the window start,
+    so a later-recorded unknown cannot move the start later
+    than the crashed attempt. Round 22 also makes this
+    writer tombstone-aware IN THE SAME locked transaction:
+    the row is the receipt bookkeeping of one order, and a
+    send path resuming for a deleted order must not recreate
+    the row the delete transaction removed."""
+    with _db_lock:
+        conn = db_connect()
+        try:
+            if notif_key.startswith("receipt:"):
+                try:
+                    _oid = int(notif_key.split(":", 1)[1])
+                except ValueError:
+                    _oid = None
+                if _oid is not None and conn.execute(
+                        "SELECT 1 FROM deleted_orders WHERE "
+                        "order_id=?", (_oid,)).fetchone():
+                    return
+                if _oid is not None and not conn.execute(
+                        "SELECT 1 FROM orders WHERE id=?",
+                        (_oid,)).fetchone():
+                    return
+            stamp = time.time()
+            row = conn.execute(
+                "SELECT first_unknown_at, first_attempt_at, "
+                "last_attempt_at, last_outcome_at FROM "
+                "email_delivery WHERE notif_key=?",
+                (notif_key,)).fetchone()
+            promote = None
+            if row is not None and row[2] and (
+                    row[3] is None or row[3] < row[2]):
+                promote = row[0] or (
+                    row[1] if row[3] is None else row[2])
+            conn.execute(
+                "INSERT INTO email_delivery(notif_key,"
+                " first_attempt_at, last_attempt_at) VALUES(?,?,?)"
+                " ON CONFLICT(notif_key) DO UPDATE SET"
+                " first_attempt_at = COALESCE(first_attempt_at,"
+                " excluded.first_attempt_at),"
+                " last_attempt_at = excluded.last_attempt_at,"
+                " first_unknown_at = COALESCE(first_unknown_at,"
+                " ?)",
+                (notif_key, stamp, stamp, promote))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _email_note_outcome(notif_key):
+    """Round 22: record that the latest attempt's outcome WAS
+    recorded (delivered or definite). UPDATE-only: a row the
+    delete transaction removed is never recreated — the
+    write is a no-op for a dead notification."""
     with _db_lock:
         conn = db_connect()
         try:
             conn.execute(
-                "INSERT INTO email_delivery(notif_key,"
-                " first_attempt_at) VALUES(?,?)"
-                " ON CONFLICT(notif_key) DO UPDATE SET"
-                " first_attempt_at = COALESCE(first_attempt_at,"
-                " excluded.first_attempt_at)",
-                (notif_key, time.time()))
+                "UPDATE email_delivery SET last_outcome_at=? "
+                "WHERE notif_key=?",
+                (time.time(), notif_key))
             conn.commit()
         finally:
             conn.close()
@@ -3335,23 +3501,86 @@ def _order_exists(order_id):
         conn.close()
 
 
+def _order_dead(order_id):
+    """Round 22: an order is dead when it is tombstoned OR its
+    row is gone. Self-contained SQL on purpose: the send
+    seams and the bookkeeping guards consult the order
+    through this, never through a helper a caller may have
+    left holding a stale answer."""
+    conn = db_connect()
+    try:
+        if conn.execute(
+                "SELECT 1 FROM deleted_orders WHERE order_id=?",
+                (order_id,)).fetchone():
+            return True
+        return conn.execute(
+            "SELECT 1 FROM orders WHERE id=?",
+            (order_id,)).fetchone() is None
+    finally:
+        conn.close()
+
+
+def _order_alive(order_id):
+    return not _order_dead(order_id)
+
+
+def _send_gate(order_id):
+    """Round 22: THE send-seam consult, evaluated under
+    _db_lock — the same lock the admin delete transaction
+    holds from its tombstone write to its commit. The gate
+    therefore runs entirely before or entirely after a
+    deletion: a gate that passes means no tombstone existed
+    at consult time, and the HTTP call the caller issues
+    immediately afterwards is either pre-deletion or the
+    accepted in-flight residual (a send already inside its
+    HTTP call when the deletion lands); a gate that runs
+    after the tombstone aborts the send with no send and no
+    writes."""
+    with _db_lock:
+        return not _order_dead(order_id)
+
+
+def _log_event_alive(order_id, event, detail=""):
+    """Round 22: log_event for the recovery paths — an event
+    row is a durable write, and a recovery resuming after its
+    order was deleted must not recreate one for the dead
+    order (delta-20's orphan SIDE_EFFECTS_OK arm)."""
+    if _order_alive(order_id):
+        log_event(order_id, event, detail)
+
+
 def _email_note_unknown(notif_key):
     """Stamp the FIRST unknown outcome's time for a logical
     email notification (round 19). The first stamp wins — the
     post-window clock runs from the first attempt whose
     acceptance could not be ruled out, not from later retries.
-    The write is committed under the DB lock like every durable
-    record in this file."""
+    The stamp written is the unknown attempt's own pre-send
+    stamp (the row's last_attempt_at, set by
+    _email_note_attempt just before this send), never the
+    bookkeeping time and never an earlier definite attempt's
+    stamp — unless an earlier attempt's outcome was never
+    recorded, whose stamp _email_note_attempt has already
+    promoted into first_unknown_at (the crash arm; the min
+    below keeps it). Round 22: UPDATE-only (delta-20's
+    resurrection arm) — if the delete transaction removed
+    the row, this write is a no-op and recreates nothing.
+    The write is committed under the DB lock like every
+    durable record in this file."""
     with _db_lock:
         conn = db_connect()
         try:
+            row = conn.execute(
+                "SELECT first_unknown_at, last_attempt_at FROM "
+                "email_delivery WHERE notif_key=?",
+                (notif_key,)).fetchone()
+            if row is None:
+                return
+            cands = [v for v in row if v]
+            value = min(cands) if cands else time.time()
             conn.execute(
-                "INSERT INTO email_delivery(notif_key,"
-                " first_unknown_at) VALUES(?,?)"
-                " ON CONFLICT(notif_key) DO UPDATE SET"
-                " first_unknown_at = COALESCE(first_unknown_at,"
-                " excluded.first_unknown_at)",
-                (notif_key, time.time()))
+                "UPDATE email_delivery SET first_unknown_at=?, "
+                "last_outcome_at=? WHERE notif_key=?",
+                (value, time.time(), notif_key))
             conn.commit()
         finally:
             conn.close()
@@ -3359,16 +3588,17 @@ def _email_note_unknown(notif_key):
 
 def _email_mark(notif_key, column):
     """Set one durable flag (post_window_used / settled) on a
-    logical email notification's row, creating the row if the
-    flag is somehow the first write. `column` is only ever one
-    of the two literals at this function's call sites."""
+    logical email notification's row. Round 22: UPDATE-only
+    (delta-20's resurrection arm) — if the delete transaction
+    removed the row, the flag write is a no-op and recreates
+    nothing. `column` is only ever one of the two literals at
+    this function's call sites."""
     with _db_lock:
         conn = db_connect()
         try:
             conn.execute(
-                f"INSERT INTO email_delivery(notif_key, {column})"
-                f" VALUES(?,1) ON CONFLICT(notif_key) DO UPDATE"
-                f" SET {column}=1", (notif_key,))
+                f"UPDATE email_delivery SET {column}=1 "
+                "WHERE notif_key=?", (notif_key,))
             conn.commit()
         finally:
             conn.close()
@@ -3450,10 +3680,23 @@ def _ensure_paid_receipt(order, amount_cents):
     recovery is existence-guarded: an order deleted before
     or during the pass — checked at entry, again after the
     claim, and again at the send seam — gets no state
-    written and no send attempted."""
+    written and no send attempted.
+
+    Round 22 (Codex delta-20): the basis is the first UNKNOWN
+    outcome again — the round-21 sentence above ("the clock
+    runs from the earliest stamp on the row") is superseded:
+    the parent rejected the first-attempt widening as a
+    contract change. _email_window_basis implements the three
+    arms (recorded unknown starts the window; definite
+    failures never do; an unrecorded-outcome attempt counts
+    its pre-send stamp). The seam consult is the tombstone
+    gate (_send_gate), serialized against the delete
+    transaction; the outcome bookkeeping is UPDATE-only, so
+    a receipt send that resolves after its order was deleted
+    recreates nothing."""
     if _receipt_logged(order["id"]):
         return True
-    if not _order_exists(order["id"]):
+    if not _order_alive(order["id"]):
         return False
     key = f"receipt:{order['id']}"
     lock = _lock_row(key)
@@ -3463,9 +3706,10 @@ def _ensure_paid_receipt(order, amount_cents):
             lock[2])
         if not token:
             return _receipt_logged(order["id"])
-        log_event(order["id"], "PAID_EMAIL_SENT",
-                  "reconciled from the durable sent-unconfirmed "
-                  "record; the original send was delivered")
+        _log_event_alive(order["id"], "PAID_EMAIL_SENT",
+                         "reconciled from the durable "
+                         "sent-unconfirmed record; the original "
+                         "send was delivered")
         if _receipt_logged(order["id"]):
             return True
         # The reconcile's own record did not persist: hand the
@@ -3485,7 +3729,7 @@ def _ensure_paid_receipt(order, amount_cents):
         # taken for a send that will not happen — is released.
         _release_event_lock(key, token)
         return True
-    if not _order_exists(order["id"]):
+    if not _order_alive(order["id"]):
         # Deleted while this driver claimed: the delete
         # transaction removed the order's bookkeeping; leave
         # nothing behind.
@@ -3500,6 +3744,11 @@ def _ensure_paid_receipt(order, amount_cents):
         # Settled by the post-window rule on an earlier pass;
         # the settle's own completion record is this write (if
         # it already persisted, the check at the top returned).
+        # Round 22: a dead order gets no completion record
+        # recreated for it — the receipt question is moot.
+        if not _order_alive(order["id"]):
+            _release_event_lock(key, token)
+            return False
         log_event(order["id"], "PAID_EMAIL_SENT",
                   "settled as sent-unconfirmed: the Resend "
                   "idempotency window passed and the single "
@@ -3507,18 +3756,23 @@ def _ensure_paid_receipt(order, amount_cents):
                   "again")
         _release_event_lock(key, token)
         return True
-    stamps = [s for s in (state[3], state[0]) if s] \
-        if state is not None else []
-    basis = min(stamps) if stamps else None
+    # The window basis (round 22): the first UNKNOWN outcome,
+    # with the crash arm — see _email_window_basis. Definite
+    # failures, however early, never start this clock.
+    basis = _email_window_basis(state)
     if basis is not None and \
             time.time() - basis > _RESEND_IDEM_SAFE_AGE:
         if not _email_claim_post_window(key):
-            # The one post-window resend is already spent —
-            # its flag was claimed before its send, but the
-            # settle never landed (a crash in between), or a
-            # racing driver claimed it first. Settle WITHOUT
-            # another attempt: a second post-window resend is
-            # never permitted.
+            # The one post-window resend OPPORTUNITY is
+            # already claimed — its flag was claimed before
+            # its send, but the settle never landed (a crash
+            # in between — possibly before the HTTP call was
+            # ever made), or a racing driver claimed it
+            # first. Settle WITHOUT another attempt: a second
+            # post-window resend is never permitted.
+            if not _order_alive(order["id"]):
+                _release_event_lock(key, token)
+                return False
             _email_mark(key, "settled")
             log_event(order["id"], "PAID_EMAIL_SENT",
                       "settled as sent-unconfirmed: the single "
@@ -3531,36 +3785,43 @@ def _ensure_paid_receipt(order, amount_cents):
         # a crash around the send spends the attempt rather
         # than permitting a second one.
         final_attempt = True
-    # The first-attempt stamp lands BEFORE the send (round
-    # 21): an attempt whose outcome recording is lost to a
-    # crash is still on the post-window clock above.
+    # The attempt stamp lands BEFORE the send (round 21,
+    # kept): an attempt whose outcome recording is lost to a
+    # crash is on the post-window clock through the crash arm
+    # of the basis above.
     _email_note_attempt(key)
-    if not _order_exists(order["id"]):
-        # The send seam (round 21): the order was deleted in
-        # the gap before this send — abort it. The delete
-        # transaction already removed the stamp and this lock
-        # row; the release below is then a no-op, and the
-        # driver's GC collects anything a wider race leaves.
+    if not _send_gate(order["id"]):
+        # The send seam (round 21's check, round 22's gate):
+        # the order was deleted — tombstone written — in the
+        # gap before this send: abort it, serialized against
+        # the delete transaction by _db_lock. The delete
+        # already removed the stamp and this lock row; the
+        # release below is then a no-op, and the driver's GC
+        # collects anything a wider race leaves.
         _release_event_lock(key, token)
         return False
     status = _send_paid_receipt(order, amount_cents)
     if status == "delivered" and not _receipt_logged(order["id"]):
         if _set_lock_purpose(key, token,
                              "receipt-sent-unconfirmed"):
+            _email_note_outcome(key)
             return True
         status = "failed"
     if status != "delivered":
         _release_event_lock(key, token)
         if status == "unknown":
             _email_note_unknown(key)
+        else:
+            _email_note_outcome(key)
         if final_attempt:
             _email_mark(key, "settled")
-            log_event(order["id"], "PAID_EMAIL_SENT",
+            _log_event_alive(order["id"], "PAID_EMAIL_SENT",
                       "settled as sent-unconfirmed: the single "
                       f"post-window resend ended {status}; not "
                       "attempted again")
             return True
         return False
+    _email_note_outcome(key)
     return True
 
 
@@ -3634,6 +3895,13 @@ def on_deep_scan_paid(order):
                 (order["id"],)).fetchone()
             if alive is None:
                 return
+            # Round 22: tombstone-guarded in the same
+            # transaction too — mid-delete, the row can still
+            # exist while its work is already dead.
+            if conn.execute(
+                    "SELECT 1 FROM deleted_orders WHERE "
+                    "order_id=?", (order["id"],)).fetchone():
+                return
             conn.execute(
                 "INSERT OR IGNORE INTO fulfilment_requests(order_id,kind,"
                 "payload,status,created_at) VALUES(?,?,?,?,?)",
@@ -3691,9 +3959,16 @@ def _fire_deep_scan_notification(order):
     this fire, or in the gap before its send, gets no lock
     claimed and no ping attempted (the send-seam re-check
     below).
+
+    Round 22 (Codex delta-20): the entry check is
+    tombstone-aware and the seam consult is the serialized
+    gate (_send_gate) — a deletion landing anywhere in the
+    check-to-send gap aborts the fire at the gate; the
+    outcome/reconcile event writes are guarded the same way
+    (no event is recreated for a dead order).
     """
     oid = order["id"]
-    if not _order_exists(oid):
+    if not _order_alive(oid):
         return
     if _deepscan_notified(oid):
         return
@@ -3703,14 +3978,16 @@ def _fire_deep_scan_notification(order):
         row = _lock_row(key)
         purpose = row[0] if row else None
         if purpose == "deepscan-notified-unconfirmed":
-            log_event(oid, "DEEPSCAN_NOTIFIED",
-                      "reconciled from the durable sent-unconfirmed "
-                      "record; the original ping was delivered")
+            _log_event_alive(
+                oid, "DEEPSCAN_NOTIFIED",
+                "reconciled from the durable sent-unconfirmed "
+                "record; the original ping was delivered")
             return
         if purpose == "deepscan-notify-pending-unknown":
-            log_event(oid, "DEEPSCAN_NOTIFIED",
-                      "the original ping's transport outcome was "
-                      "unknown; treated as delivered, not re-sent")
+            _log_event_alive(
+                oid, "DEEPSCAN_NOTIFIED",
+                "the original ping's transport outcome was "
+                "unknown; treated as delivered, not re-sent")
             return
         if purpose == "deepscan-notify-intent":
             if row[1] and time.time() - row[1] <= 3600:
@@ -3725,10 +4002,11 @@ def _fire_deep_scan_notification(order):
             if _cas_lock_purpose(
                     key, row[2], "deepscan-notify-intent",
                     "deepscan-notify-pending-unknown"):
-                log_event(oid, "DEEPSCAN_NOTIFIED",
-                          "delivery intent on record from an "
-                          "interrupted fire; treated as "
-                          "delivered, not re-sent")
+                _log_event_alive(
+                    oid, "DEEPSCAN_NOTIFIED",
+                    "delivery intent on record from an "
+                    "interrupted fire; treated as "
+                    "delivered, not re-sent")
             return
         if purpose == "deepscan-notify-pending":
             token = _takeover_event_lock(
@@ -3752,15 +4030,17 @@ def _fire_deep_scan_notification(order):
         # resolution); whatever it is now, it is durable.
         return
     if not _deepscan_queued_logged(oid):
-        log_event(oid, "DEEPSCAN_QUEUED",
-                  "fulfilment request recorded for the engine "
-                  "worker")
-    if not _order_exists(oid):
-        # The send seam (round 21): the order was deleted in
-        # the gap before this send — drop the fire. The
-        # delete transaction removed this intent row with the
-        # order (the release below is then a no-op); a ping
-        # for a deleted order is never attempted.
+        _log_event_alive(oid, "DEEPSCAN_QUEUED",
+                         "fulfilment request recorded for the "
+                         "engine worker")
+    if not _send_gate(oid):
+        # The send seam (round 21's check, round 22's gate):
+        # the order was deleted — tombstone written — in the
+        # gap before this send: drop the fire, serialized
+        # against the delete transaction by _db_lock. The
+        # delete removed this intent row with the order (the
+        # release below is then a no-op); a ping for a
+        # deleted order is never attempted.
         _release_event_lock(key, token)
         return
     res = send_telegram(
@@ -3770,7 +4050,7 @@ def _fire_deep_scan_notification(order):
     status = _send_status(res)
     det = res[1]
     if status == "delivered":
-        log_event(oid, "DEEPSCAN_NOTIFIED", det)
+        _log_event_alive(oid, "DEEPSCAN_NOTIFIED", det)
         if not _deepscan_notified(oid):
             if _set_lock_purpose(key, token,
                                  "deepscan-notified-unconfirmed"):
@@ -3789,9 +4069,9 @@ def _fire_deep_scan_notification(order):
                 "deepscan-notify-pending-unknown"):
             raise RuntimeError(
                 "Deep Scan HQ notification state did not persist")
-        log_event(oid, "DEEPSCAN_NOTIFIED",
-                  "transport outcome unknown; treated as "
-                  "delivered, not re-sent")
+        _log_event_alive(oid, "DEEPSCAN_NOTIFIED",
+                         "transport outcome unknown; treated as "
+                         "delivered, not re-sent")
         return
     # Definite rejection: nothing was delivered. Record the
     # durable pending state and return WITHOUT raising (the
@@ -3802,8 +4082,9 @@ def _fire_deep_scan_notification(order):
             "deepscan-notify-pending"):
         raise RuntimeError(
             "Deep Scan HQ notification state did not persist")
-    log_event(oid, "DEEPSCAN_NOTIFY_FAILED",
-              f"definite rejection; delivery pending retry: {det}")
+    _log_event_alive(
+        oid, "DEEPSCAN_NOTIFY_FAILED",
+        f"definite rejection; delivery pending retry: {det}")
 
 
 # ---------------------------------------------------------------------------
@@ -3853,6 +4134,13 @@ def activate_monitor(order):
                 (order["id"],)).fetchone()
             if alive is None:
                 return
+            # Round 22: tombstone-guarded in the same
+            # transaction too — mid-delete, the row can still
+            # exist while its work is already dead.
+            if conn.execute(
+                    "SELECT 1 FROM deleted_orders WHERE "
+                    "order_id=?", (order["id"],)).fetchone():
+                return
             conn.execute(
                 "INSERT OR IGNORE INTO monitors(order_id,url,email,name,"
                 "created_at,next_run_at) VALUES(?,?,?,?,?,?)",
@@ -3862,7 +4150,7 @@ def activate_monitor(order):
         finally:
             conn.close()
     oid = order["id"]
-    if not _order_exists(oid):
+    if not _order_alive(oid):
         # Deleted in the gap after the insert (round 21): the
         # delete transaction removed the row just written;
         # claim no activation lock and write no log for it.
@@ -3890,9 +4178,10 @@ def activate_monitor(order):
             key, mrow[0], "monitor-activated-reconciling", mrow[2])
         if not token:
             return  # another reconcile claimed it first
-        log_event(oid, "MONITOR_ACTIVATED",
-                  "reconciled from the durable sent-unconfirmed "
-                  "record; the original log line was written")
+        _log_event_alive(
+            oid, "MONITOR_ACTIVATED",
+            "reconciled from the durable sent-unconfirmed "
+            "record; the original log line was written")
         if _monitor_activated_logged(oid):
             return
         # The reconcile's own record did not persist: hand the
@@ -3915,8 +4204,9 @@ def activate_monitor(order):
             return
         raise RuntimeError(
             "monitor activation log lock lost before firing")
-    log_event(oid, "MONITOR_ACTIVATED",
-              "weekly rescan scheduled; baseline due on next tick")
+    _log_event_alive(
+        oid, "MONITOR_ACTIVATED",
+        "weekly rescan scheduled; baseline due on next tick")
     if not _monitor_activated_logged(oid):
         if _set_lock_purpose(key, token,
                              "monitor-activated-unconfirmed"):
@@ -4077,7 +4367,15 @@ def _alert_window_spent(pending):
 def _send_monitor_alert(mon, host, order_id, pending):
     """One monitoring change-alert send, under the alert's
     idempotency key (round 18). Returns the wrapper's
-    tri-state-carrying result."""
+    tri-state-carrying result.
+
+    Round 22: the FINAL monitor seam is inside this function,
+    after composition — a tombstone written while the alert
+    was being composed aborts the send before any HTTP call.
+    The abort returns a plain (False, ...) tuple, which
+    _send_status classifies as a definite outcome: the
+    callers' retry bookkeeping runs, its UPDATEs no-op on the
+    removed monitor row, and its event writes are guarded."""
     body, body_html = _monitor_alert_parts(
         mon, host, order_id, pending["new"], pending["gone"],
         pending["grade"], pending["score"])
@@ -4085,6 +4383,9 @@ def _send_monitor_alert(mon, host, order_id, pending):
         pending.get("idem")
         or _monitor_alert_idem(mon, pending))
     try:
+        if not _send_gate(order_id):
+            return (False, "aborted before send: the order "
+                           "was deleted")
         return send_resend(
             mon["email"],
             f"Monitoring: changes detected on {host}",
@@ -4188,16 +4489,19 @@ def _run_monitor_locked(mon):
             # without another attempt: past Resend's retention
             # window a further same-key resend could deliver a
             # second copy, and the rule permits exactly one.
-            log_event(order_id, "MONITOR_ALERT_SENT",
-                      "retained alert settled as sent-unconfirmed: "
-                      "the Resend idempotency window passed and "
-                      "the single post-window resend is spent; "
-                      "not attempted again")
-            send_telegram(
-                f"ShipAudit Lab: retained monitoring alert for "
-                f"{mon['url']} settled as sent-unconfirmed "
-                f"({len(_pending['new'])} new, "
-                f"{len(_pending['gone'])} resolved).")
+            _log_event_alive(
+                order_id, "MONITOR_ALERT_SENT",
+                "retained alert settled as sent-unconfirmed: "
+                "the Resend idempotency window passed and "
+                "the single post-window resend is spent; "
+                "not attempted again")
+            if _send_gate(order_id):
+                send_telegram(
+                    f"ShipAudit Lab: retained monitoring alert "
+                    f"for {mon['url']} settled as "
+                    f"sent-unconfirmed "
+                    f"({len(_pending['new'])} new, "
+                    f"{len(_pending['gone'])} resolved).")
             with _db_lock:
                 conn = db_connect()
                 conn.execute(
@@ -4214,21 +4518,24 @@ def _run_monitor_locked(mon):
                 not _pending.get("escalated"):
             _pending["escalated"] = True
             del _pending["escalation_intent"]
-            log_event(order_id, "MONITOR_ALERT_ESCALATED",
-                      "escalation intent on record from an "
-                      "interrupted run; treated as delivered, "
-                      "not re-sent")
+            _log_event_alive(
+                order_id, "MONITOR_ALERT_ESCALATED",
+                "escalation intent on record from an "
+                "interrupted run; treated as delivered, "
+                "not re-sent")
         if _pending and _pending.get("send_intent") and \
                 not _unknown_retry:
-            log_event(order_id, "MONITOR_ALERT_SENT",
-                      "retained alert treated as delivered: "
-                      "delivery intent on record from an "
-                      "interrupted run; not re-sent")
-            send_telegram(
-                f"ShipAudit Lab: retained monitoring alert for "
-                f"{mon['url']} delivered "
-                f"({len(_pending['new'])} new, "
-                f"{len(_pending['gone'])} resolved).")
+            _log_event_alive(
+                order_id, "MONITOR_ALERT_SENT",
+                "retained alert treated as delivered: "
+                "delivery intent on record from an "
+                "interrupted run; not re-sent")
+            if _send_gate(order_id):
+                send_telegram(
+                    f"ShipAudit Lab: retained monitoring alert "
+                    f"for {mon['url']} delivered "
+                    f"({len(_pending['new'])} new, "
+                    f"{len(_pending['gone'])} resolved).")
             with _db_lock:
                 conn = db_connect()
                 conn.execute(
@@ -4247,11 +4554,12 @@ def _run_monitor_locked(mon):
         # (its intent was cleared by a later definite failure,
         # so the settle arm above did not claim it). Settle
         # WITHOUT sending: no further attempt is permitted.
-        log_event(order_id, "MONITOR_ALERT_SENT",
-                  "retained alert settled as sent-unconfirmed: "
-                  "the Resend idempotency window passed and "
-                  "the single post-window resend is spent; "
-                  "not attempted again")
+        _log_event_alive(
+            order_id, "MONITOR_ALERT_SENT",
+            "retained alert settled as sent-unconfirmed: "
+            "the Resend idempotency window passed and "
+            "the single post-window resend is spent; "
+            "not attempted again")
         with _db_lock:
             conn = db_connect()
             conn.execute(
@@ -4282,6 +4590,16 @@ def _run_monitor_locked(mon):
         # a crash between an accepted send and that write left
         # the attempt unstamped (the receipt path's twin fix
         # is _email_note_attempt).
+        # Round 22: the stamp is PROVISIONAL for this attempt.
+        # The basis is the first UNKNOWN outcome again (the
+        # parent rejected the first-attempt widening): if this
+        # attempt ends DEFINITELY and the stamp was set by
+        # this attempt, the outcome write below removes it
+        # again — a definite failure never starts the window.
+        # A stamp locked by an earlier unknown is never
+        # removed; an attempt whose outcome is never recorded
+        # keeps it (the crash arm).
+        _fua_pre22 = _pending.get("first_unknown_at")
         if not _pending.get("first_unknown_at"):
             _pending["first_unknown_at"] = time.time()
         if _final19:
@@ -4309,10 +4627,11 @@ def _run_monitor_locked(mon):
             # alert WHATEVER its outcome — no retry bookkeeping,
             # no escalation, no further attempt. The digest
             # advances exactly as for a reconciled delivery.
-            log_event(order_id, "MONITOR_ALERT_SENT",
-                      "retained alert settled as sent-unconfirmed: "
-                      f"the single post-window resend ended "
-                      f"{_pstatus} ({_pdet}); not attempted again")
+            _log_event_alive(
+                order_id, "MONITOR_ALERT_SENT",
+                "retained alert settled as sent-unconfirmed: "
+                f"the single post-window resend ended "
+                f"{_pstatus} ({_pdet}); not attempted again")
             with _db_lock:
                 conn = db_connect()
                 conn.execute(
@@ -4342,6 +4661,13 @@ def _run_monitor_locked(mon):
             else:
                 _pending.pop("send_intent", None)
                 _pending.pop("last_outcome", None)
+                # Round 22: a definite outcome also removes
+                # the provisional stamp THIS attempt set (see
+                # the pre-send write) — definite failures never
+                # start the window. A stamp locked by an
+                # earlier unknown outcome stays.
+                if not _fua_pre22:
+                    _pending.pop("first_unknown_at", None)
             # The outcome is known: persist it FIRST, so a crash
             # from here on cannot be misread by the
             # reconciliation above as an interrupted delivery.
@@ -4353,9 +4679,10 @@ def _run_monitor_locked(mon):
                     (json.dumps(_pending), mon["id"]))
                 conn.commit()
                 conn.close()
-            log_event(order_id, "MONITOR_ALERT_FAILED",
-                      f"retained alert attempt {_attempts} "
-                      f"({_pstatus}): {_pdet}")
+            _log_event_alive(
+                order_id, "MONITOR_ALERT_FAILED",
+                f"retained alert attempt {_attempts} "
+                f"({_pstatus}): {_pdet}")
             if _attempts >= 3 and not _pending.get("escalated"):
                 # Durable escalation intent, persisted with the
                 # attempt bookkeeping, BEFORE the send (round
@@ -4371,27 +4698,42 @@ def _run_monitor_locked(mon):
                          time.time() + 3600, mon["id"]))
                     conn.commit()
                     conn.close()
-                _eres = send_telegram(
-                    f"ShipAudit Lab: monitoring alert for "
-                    f"{mon['url']} UNDELIVERED after 3 attempts "
-                    f"({_pdet}); digest held, weekly retries "
-                    f"continue. Check the mail pipeline.")
-                _estatus = _send_status(_eres)
-                if _estatus == "delivered":
-                    _pending["escalated"] = True
-                    log_event(order_id, "MONITOR_ALERT_ESCALATED",
-                              "retained alert undelivered after 3 "
-                              "attempts; hourly retries stop, weekly "
-                              "retries continue")
-                elif _estatus == "unknown":
-                    # Telegram is at-most-once (round 18): an
-                    # ambiguous outcome counts as delivered and
-                    # is never re-escalated.
-                    _pending["escalated"] = True
-                    log_event(order_id, "MONITOR_ALERT_ESCALATED",
-                              "escalation transport outcome "
-                              "unknown; treated as delivered, not "
-                              "re-sent")
+                # Round 22 (Codex delta-20): this escalation
+                # send had NO existence check at all — it is
+                # now behind the same tombstone gate as every
+                # other seam. A gate that fails means the
+                # order was deleted after the failed attempt:
+                # no escalation starts, and the escalated
+                # bookkeeping below is skipped with it (the
+                # persists that follow write to a monitor row
+                # the delete transaction already removed).
+                _eres = None
+                if _send_gate(order_id):
+                    _eres = send_telegram(
+                        f"ShipAudit Lab: monitoring alert for "
+                        f"{mon['url']} UNDELIVERED after 3 "
+                        f"attempts ({_pdet}); digest held, "
+                        f"weekly retries continue. Check the "
+                        f"mail pipeline.")
+                if _eres is not None:
+                    _estatus = _send_status(_eres)
+                    if _estatus == "delivered":
+                        _pending["escalated"] = True
+                        _log_event_alive(
+                            order_id, "MONITOR_ALERT_ESCALATED",
+                            "retained alert undelivered after 3 "
+                            "attempts; hourly retries stop, "
+                            "weekly retries continue")
+                    elif _estatus == "unknown":
+                        # Telegram is at-most-once (round 18):
+                        # an ambiguous outcome counts as
+                        # delivered and is never re-escalated.
+                        _pending["escalated"] = True
+                        _log_event_alive(
+                            order_id, "MONITOR_ALERT_ESCALATED",
+                            "escalation transport outcome "
+                            "unknown; treated as delivered, not "
+                            "re-sent")
                 del _pending["escalation_intent"]
             with _db_lock:
                 conn = db_connect()
@@ -4406,11 +4748,11 @@ def _run_monitor_locked(mon):
                      mon["id"]))
                 conn.commit()
                 conn.close()
-            log_event(order_id, "MONITOR_ALERT_RETRY",
-                      f"attempt {_attempts}; digest held")
+            _log_event_alive(order_id, "MONITOR_ALERT_RETRY",
+                             f"attempt {_attempts}; digest held")
             return
-        log_event(order_id, "MONITOR_ALERT_SENT",
-                  f"retained alert delivered: {_pdet}")
+        _log_event_alive(order_id, "MONITOR_ALERT_SENT",
+                         f"retained alert delivered: {_pdet}")
         send_telegram(
             f"ShipAudit Lab: retained monitoring alert for "
             f"{mon['url']} delivered ({len(_pending['new'])} new, "
@@ -4556,20 +4898,26 @@ def _run_monitor_locked(mon):
         _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
     else:
         del retained["send_intent"]
+        # Round 22: the record is new and its stamp was this
+        # attempt's — a definite outcome removes it with the
+        # intent (definite failures never start the window;
+        # see the retained path's twin arm).
+        retained.pop("first_unknown_at", None)
         _save_mon(json.dumps(prev), now + 3600, json.dumps(retained))
-    log_event(order_id,
-              "MONITOR_ALERT_SENT" if status == "delivered"
-              else "MONITOR_ALERT_FAILED",
-              detail if status != "unknown"
-              else f"transport outcome unknown: {detail}")
+    _log_event_alive(
+        order_id,
+        "MONITOR_ALERT_SENT" if status == "delivered"
+        else "MONITOR_ALERT_FAILED",
+        detail if status != "unknown"
+        else f"transport outcome unknown: {detail}")
     send_telegram(
         f"ShipAudit Lab: monitoring changes on {mon['url']} - "
         f"{len(new)} new, {len(gone)} resolved; grade {grade} "
         f"({score}). Client alert: "
         f"{'SENT' if status == 'delivered' else 'FAILED - ' + detail}")
     if status != "delivered":
-        log_event(order_id, "MONITOR_ALERT_RETRY",
-                  "attempt 1; alert retained, digest held")
+        _log_event_alive(order_id, "MONITOR_ALERT_RETRY",
+                         "attempt 1; alert retained, digest held")
 
 
 def _monitor_tick():
