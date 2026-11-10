@@ -458,9 +458,51 @@ _MAIL_IDEM = contextvars.ContextVar("vf_mail_idem", default=None)
 # exists), connect-phase failures force-close in
 # _deadline_connect, and the wrappers close HTTPError
 # responses explicitly on armed exchanges.
+#
+# Round 27 (Codex delta-25): delta-25 certified the
+# round-26 construction, per-attempt capping, tunnel,
+# cleanup and catalog, and refuted three points.
+# (1) The deadline HTTPS class DISCARDED a
+# caller-supplied SSLContext and substituted a
+# factory default — but on the genuine urllib path
+# trust arrives exactly as a supplied context: the
+# opener's HTTPS handler passes its context object
+# into every construction. The class is now a faithful
+# drop-in (see _DeadlineHTTPSConnection): a supplied
+# context is used verbatim on both connect paths, and
+# the factory serves context=None constructions only.
+# (2) The factory ran per connection, inside the
+# timed path; factory contexts are now cached
+# process-wide per factory (see
+# _cached_factory_context), so context creation is a
+# per-process act, not an exchange operation.
+# (3) A redirect inside one exchange opened further
+# connections, each resolving the host again; armed
+# resolutions are now cached per exchange (see
+# _SEND_RESOLUTION_CACHE), and the JOURNAL bound
+# counts the resolver residual per distinct host
+# within the exchange.
 _GATED_SEND_DEADLINE = 30.0
 _SEND_DEADLINE_AT = contextvars.ContextVar(
     "vf_send_deadline_at", default=None)
+
+# Round 27 (Codex delta-25 finding 1): one gated
+# exchange can open several connections — a provider
+# redirect inside a single urlopen call constructs
+# another connection — and EVERY connection used to
+# resolve the host again, so the bound's resolver
+# residual was per connection, not per exchange.
+# _send_urlopen — the one place all of an armed
+# exchange's connections are created — installs a
+# fresh dict here for the duration of the call, and
+# _deadline_tcp_connect consults it before resolving
+# and populates it after a successful resolution:
+# within one exchange each distinct host is resolved
+# at most once, redirects included. Outside an armed
+# _send_urlopen call the value is None and resolution
+# keeps the legacy per-connection behaviour.
+_SEND_RESOLUTION_CACHE = contextvars.ContextVar(
+    "vf_send_resolution_cache", default=None)
 
 # The providers' endpoints, as constants (round 25) so the
 # catalog can point the genuine wrappers at a local test
@@ -735,15 +777,57 @@ _ORIG_HTTPS_CONNECTION = http.client.HTTPSConnection
 _SEND_TIMEOUT_DEFAULT = http.client.socket \
     ._GLOBAL_DEFAULT_TIMEOUT
 
-# The module's HTTPS-context seam: a deadline HTTPS
-# connection takes its TLS context from this factory —
-# in production the stdlib's own default-context
-# creator, which is also what the global opener's
-# HTTPS handler builds its context with, so the swap
-# changes nothing about TLS trust on the real path.
-# The catalog patches this reference to trust a local
-# test certificate.
+# The module's HTTPS-context seam (rounds 26-27): a
+# deadline HTTPS connection constructed with
+# context=None takes its TLS context from this factory
+# — in production the stdlib's own default-context
+# creator, captured here at module level, so no
+# call-time global lookup (and no eagerly evaluated
+# globals().get fallback, the round-26 shape delta-25
+# flagged) can influence construction. A construction
+# WITH a supplied context never consults the factory:
+# the caller's context is used verbatim, exactly as
+# the stdlib constructor does (that is how trust
+# arrives on the urllib path — the opener's HTTPS
+# handler passes its context into every construction).
+# The catalog patches this reference to observe and
+# control factory consultations.
 _HTTPS_CONTEXT_FACTORY = http.client._create_https_context
+
+# Round 27 (Codex delta-25 finding 2): factory contexts
+# are cached process-wide, keyed by (factory, HTTP
+# version). The first context=None construction under
+# a given factory creates the context; every later one
+# reuses the cached object, so context creation —
+# which loads trust configuration and cannot be
+# deadline-capped — happens once per factory per
+# process instead of inside every timed exchange.
+# Sharing one SSLContext across connections is the
+# stdlib's own pattern on the urllib path: the global
+# opener's HTTPS handler creates ONE context and
+# passes that same object to every connection it
+# builds, and a context's verification posture does
+# not change by being shared.
+_HTTPS_CONTEXT_CACHE = {}
+_HTTPS_CONTEXT_CACHE_LOCK = threading.Lock()
+
+
+def _cached_factory_context(http_vsn):
+    """The process-cached TLS context for the module
+    factory's product at the given HTTP version,
+    creating it on first use under the CURRENT factory
+    (the module global is read by name at call time —
+    the module's ordinary patch seam)."""
+    factory = _HTTPS_CONTEXT_FACTORY
+    key = (factory, http_vsn)
+    ctx = _HTTPS_CONTEXT_CACHE.get(key)
+    if ctx is None:
+        with _HTTPS_CONTEXT_CACHE_LOCK:
+            ctx = _HTTPS_CONTEXT_CACHE.get(key)
+            if ctx is None:
+                ctx = factory(http_vsn)
+                _HTTPS_CONTEXT_CACHE[key] = ctx
+    return ctx
 
 
 def _armed_remaining_or_raise():
@@ -758,21 +842,35 @@ def _armed_remaining_or_raise():
 
 def _deadline_tcp_connect(conn):
     """Armed TCP establishment, attempt by attempt
-    (round 26): the name is resolved ONCE — a single
-    blocking getaddrinfo call, the one sub-operation
-    that cannot be capped by construction and that the
-    JOURNAL statement names as the bound's only
-    exception — and the addresses are then iterated
-    HERE: before every attempt the remaining budget is
-    recomputed and that attempt's socket timeout is
-    capped at min(20, remaining), so an attempt starting
-    inside the budget ends by the deadline at the
-    latest, and a spent budget refuses the next attempt
-    before it starts."""
+    (round 26): the name is resolved — a blocking
+    getaddrinfo call, the one sub-operation that
+    cannot be capped by construction and that the
+    JOURNAL statement names as the bound's exception —
+    and the addresses are then iterated HERE: before
+    every attempt the remaining budget is recomputed
+    and that attempt's socket timeout is capped at
+    min(20, remaining), so an attempt starting inside
+    the budget ends by the deadline at the latest, and
+    a spent budget refuses the next attempt before it
+    starts. Round 27 (delta-25 finding 1): the
+    resolution consults the per-exchange cache
+    _send_urlopen installs (keyed by (host, port); the
+    call's family/type arguments are this call site's
+    constants), so a host already resolved in this
+    exchange — e.g. by the connection a redirect
+    started from — is not resolved again; with no
+    cache installed the resolution is the legacy
+    per-connection one."""
     sys.audit("http.client.connect", conn, conn.host,
               conn.port)
-    infos = socket.getaddrinfo(conn.host, conn.port, 0,
-                               socket.SOCK_STREAM)
+    cache = _SEND_RESOLUTION_CACHE.get()
+    key = (conn.host, conn.port)
+    infos = cache.get(key) if cache is not None else None
+    if infos is None:
+        infos = socket.getaddrinfo(conn.host, conn.port, 0,
+                                   socket.SOCK_STREAM)
+        if cache is not None:
+            cache[key] = infos
     last_exc = None
     for family, socktype, proto, _canon, sockaddr in infos:
         remaining = _armed_remaining_or_raise()
@@ -906,14 +1004,22 @@ class _DeadlineHTTPSConnection(_ORIG_HTTPS_CONNECTION):
             self, host, port, timeout=timeout,
             source_address=source_address,
             blocksize=blocksize)
-        # The TLS context comes from the module factory
-        # (see _HTTPS_CONTEXT_FACTORY above), never from
-        # the original __init__ — whose explicit-super
-        # lookup is exactly what broke under the swap.
-        factory = globals().get(
-            "_HTTPS_CONTEXT_FACTORY",
-            http.client._create_https_context)
-        self._context = factory(self._http_vsn)
+        # A faithful drop-in for the stdlib constructor
+        # (round 27, Codex delta-25 findings 1 and 3):
+        # mirror its context logic case by case — a
+        # SUPPLIED context is used verbatim (self._context
+        # IS the caller's object; on the urllib path this
+        # is the opener handler's context, which is how
+        # trust actually arrives), and the module factory
+        # serves context=None constructions only, through
+        # the process-wide cache. The original __init__
+        # itself still never runs — its explicit-super
+        # lookup is exactly what broke under the swap —
+        # but everything it would have decided about the
+        # context is decided here, identically.
+        if context is None:
+            context = _cached_factory_context(self._http_vsn)
+        self._context = context
 
     def connect(self):
         _deadline_connect(self, tls=True)
@@ -957,7 +1063,13 @@ def _send_urlopen(req):
     replaced-global super() failure; and an armed
     exchange's connection establishment is itself
     budget-capped attempt by attempt (see
-    _deadline_connect)."""
+    _deadline_connect). Round 27 (Codex delta-25): for
+    the duration of the call a fresh per-exchange
+    resolution cache is installed in
+    _SEND_RESOLUTION_CACHE (set/reset with the swap),
+    so every connection this call creates — redirects
+    included — resolves each distinct host at most
+    once; the cache dies with the call."""
     remaining = _send_deadline_remaining()
     if remaining is None:
         return urllib.request.urlopen(req, timeout=20)
@@ -970,10 +1082,12 @@ def _send_urlopen(req):
                  http.client.HTTPSConnection)
         http.client.HTTPConnection = _DeadlineHTTPConnection
         http.client.HTTPSConnection = _DeadlineHTTPSConnection
+        cache_tok = _SEND_RESOLUTION_CACHE.set({})
         try:
             return urllib.request.urlopen(
                 req, timeout=min(20, remaining))
         finally:
+            _SEND_RESOLUTION_CACHE.reset(cache_tok)
             http.client.HTTPConnection = saved[0]
             http.client.HTTPSConnection = saved[1]
 
@@ -4456,7 +4570,14 @@ def _gated_send(order_id, send_fn, *args, **kwargs):
     and armed connect is capped attempt by attempt
     (address connects, proxy tunnel, TLS handshake);
     the single getaddrinfo call is the statement's one
-    named exception. Returns
+    named exception. Round 27 (Codex delta-25): the
+    resolver exception is restated — at most one
+    getaddrinfo per distinct host WITHIN the exchange
+    (per-exchange resolution cache, see
+    _SEND_RESOLUTION_CACHE) — and a supplied TLS
+    context is used verbatim, factory contexts being
+    process-cached (see _DeadlineHTTPSConnection).
+    Returns
     None when the gate aborts; otherwise the send
     function's own result."""
     with _db_lock:

@@ -4799,10 +4799,14 @@ _SRV25.server_close()
 # the stated 30 s bound (which includes connect) did
 # not hold. These pins cover the PRODUCTION SCHEME: a
 # local TLS server (self-signed; the genuine wrapper is
-# made to trust it through the server module's HTTPS
-# context factory seam), a TLS-handshake stall, and an
-# unarmed HTTPS send executed while an armed exchange's
-# swap window is open.
+# made to trust it the way stdlib supplies trust on the
+# urllib path — an installed opener whose HTTPS handler
+# carries the unverified context into every construction
+# [round-27 contract change: the seam originally used
+# here, patching the server module's context factory,
+# is one urllib never consults — see JOURNAL round 27]),
+# a TLS-handshake stall, and an unarmed HTTPS send
+# executed while an armed exchange's swap window is open.
 
 import http.client as _hc26
 import socket as _sock26
@@ -4937,11 +4941,13 @@ _orig_http26 = _hc26.HTTPConnection
 _orig_https26 = _hc26.HTTPSConnection
 _saved_open26 = _ureq18.urlopen
 _saved_url26 = SR._RESEND_API_URL
-_saved_factory26 = getattr(SR, "_HTTPS_CONTEXT_FACTORY", None)
+_saved_opener26 = _ureq18._opener
 _saved_dl26 = SR._GATED_SEND_DEADLINE
 _ureq18.urlopen = _real_urlopen18
-SR._HTTPS_CONTEXT_FACTORY = (
-    lambda version: _ssl26._create_unverified_context())
+_testopener26 = _ureq18.build_opener(
+    _ureq18.HTTPSHandler(
+        context=_ssl26._create_unverified_context()))
+_ureq18.install_opener(_testopener26)
 SR._GATED_SEND_DEADLINE = 2.0
 
 # N72 (2): plain armed HTTPS SUCCESS — the genuine
@@ -5054,16 +5060,290 @@ check("N74 (1): unarmed HTTPS send during an armed "
 _ureq18.urlopen = _saved_open26
 SR._RESEND_API_URL = _saved_url26
 SR._GATED_SEND_DEADLINE = _saved_dl26
-if _saved_factory26 is None:
-    try:
-        delattr(SR, "_HTTPS_CONTEXT_FACTORY")
-    except AttributeError:
-        pass
-else:
-    SR._HTTPS_CONTEXT_FACTORY = _saved_factory26
+_ureq18.install_opener(_saved_opener26)
 _SRV26.shutdown()
 _SRV26.server_close()
 _STALL26.close()
+
+# ============================================================
+# Round 27 (Codex delta-25): FAITHFUL CONTEXTS, CACHED
+# FACTORY CONTEXTS, PER-EXCHANGE RESOLUTIONS — delta-25
+# certified round 26's construction safety, per-attempt
+# capping, tunnel, cleanup and catalog, and refuted
+# three points: (1) the deadline HTTPS class DISCARDED
+# a caller-supplied SSLContext and substituted a
+# factory default — while on the genuine urllib path
+# trust arrives exactly as a supplied context (the
+# opener's HTTPS handler passes its context object into
+# every construction; the handler itself is never
+# consulted about the module factory). The round-26
+# pins above originally patched that factory — a seam
+# urllib never consults; under the round-27 CONTRACT
+# CHANGE (parent ruling, JOURNAL round 27) their SETUP
+# now installs an opener whose handler carries the
+# unverified context, every assertion byte-identical —
+# so N72/N73/N74 now prove the wrapper path carries
+# the handler's context through the swapped class.
+# (2) The factory ran per connection inside the timed
+# path; factory contexts are now cached process-wide
+# per factory. (3) A redirect inside one exchange
+# resolved the host once per connection; armed
+# resolutions are now cached per exchange. The pins
+# below drive DIRECT constructions — the path where
+# caller contexts and the factory are the whole story.
+
+import socket as _sock27
+import ssl as _ssl27
+import subprocess as _sp27
+import tempfile as _tf27
+
+_certdir27 = _tf27.mkdtemp(prefix="vf-tls27-")
+_cert27 = os.path.join(_certdir27, "cert.pem")
+_key27 = os.path.join(_certdir27, "key.pem")
+_sp27.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+           "-keyout", _key27, "-out", _cert27, "-days", "2",
+           "-nodes", "-subj", "/CN=127.0.0.1",
+           "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost"],
+          check=True, capture_output=True, timeout=60)
+_srvctx27 = _ssl27.SSLContext(_ssl27.PROTOCOL_TLS_SERVER)
+_srvctx27.load_cert_chain(_cert27, _key27)
+
+
+class _TlsHandler27(_hs25.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        if self.path == "/ok":
+            body = b'{"id": "mail-n27-ok"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_SRV27 = _hs25.ThreadingHTTPServer(("127.0.0.1", 0),
+                                   _TlsHandler27)
+_SRV27.socket = _srvctx27.wrap_socket(_SRV27.socket,
+                                      server_side=True)
+_PORT27 = _SRV27.server_address[1]
+_th27srv = threading.Thread(
+    target=_SRV27.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th27srv.start()
+
+
+class _RedirHandler27(_hs25.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        try:
+            left = int(self.headers.get("Content-Length") or 0)
+        except Exception:
+            left = 0
+        try:
+            while left > 0:
+                piece = self.rfile.read(min(left, 65536))
+                if not piece:
+                    break
+                left -= len(piece)
+        except Exception:
+            return
+        if self.path == "/redir":
+            self.connection.sendall(
+                b"HTTP/1.1 302 Found\r\n"
+                b"Location: /target\r\n"
+                b"Content-Length: 0\r\n\r\n")
+
+    def do_GET(self):
+        if self.path == "/target":
+            body = b'{"id": "mail-n76-ok"}'
+            self.connection.sendall(
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body)
+                + body)
+
+
+_RSRV27 = _hs25.ThreadingHTTPServer(("127.0.0.1", 0),
+                                    _RedirHandler27)
+_RPORT27 = _RSRV27.server_address[1]
+_th27rsrv = threading.Thread(
+    target=_RSRV27.serve_forever,
+    kwargs={"poll_interval": 0.05}, daemon=True)
+_th27rsrv.start()
+
+_saved_url27 = SR._RESEND_API_URL
+_saved_dl27 = SR._GATED_SEND_DEADLINE
+_saved_open27 = _ureq18.urlopen
+_saved_factory27 = SR._HTTPS_CONTEXT_FACTORY
+
+
+def _direct27(port, context, armed):
+    """One direct deadline-HTTPS construction + GET /ok;
+    returns the body, or the exception the exchange
+    raised. The deadline is armed generously when
+    `armed` — arming is the only difference between the
+    two connect paths."""
+    tok = None
+    if armed:
+        tok = SR._SEND_DEADLINE_AT.set(time.monotonic() + 10.0)
+    try:
+        conn = SR._DeadlineHTTPSConnection(
+            "127.0.0.1", port, context=context)
+        conn.request("GET", "/ok")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        return body
+    except BaseException as exc:
+        return exc
+    finally:
+        if tok is not None:
+            SR._SEND_DEADLINE_AT.reset(tok)
+
+
+# N75: caller-context fidelity, two discriminating arms
+# x both connect paths. Arm (i): the caller supplies an
+# UNVERIFIED context while the factory would produce a
+# VERIFYING one — the exchange succeeds only if the
+# caller's context is used verbatim, and the counting
+# factory proves it was never consulted. Arm (ii): the
+# caller supplies a VERIFYING context (system roots —
+# the local self-signed certificate is not among them)
+# while the factory would produce an UNVERIFIED one —
+# the exchange must FAIL with a certificate error.
+_calls75 = []
+
+
+def _factory75_verify(vsn):
+    _calls75.append(vsn)
+    return _ssl27.create_default_context()
+
+
+def _factory75_unverified(vsn):
+    _calls75.append(vsn)
+    return _ssl27._create_unverified_context()
+
+
+SR._HTTPS_CONTEXT_FACTORY = _factory75_verify
+_calls75.clear()
+_r75a = _direct27(_PORT27, _ssl27._create_unverified_context(),
+                  armed=True)
+check("N75 (1): direct construction, armed — a supplied "
+      "unverified context is used verbatim (the exchange "
+      "succeeds against the self-signed server) and the "
+      "verifying factory is never consulted",
+      _r75a == b'{"id": "mail-n27-ok"}' and _calls75 == [])
+
+_calls75.clear()
+_r75b = _direct27(_PORT27, _ssl27._create_unverified_context(),
+                  armed=False)
+check("N75 (2): direct construction, unarmed — a supplied "
+      "unverified context is used verbatim and the "
+      "verifying factory is never consulted",
+      _r75b == b'{"id": "mail-n27-ok"}' and _calls75 == [])
+
+SR._HTTPS_CONTEXT_FACTORY = _factory75_unverified
+_calls75.clear()
+_r75c = _direct27(_PORT27, _ssl27.create_default_context(),
+                  armed=True)
+check("N75 (3): direct construction, armed — a supplied "
+      "verifying context is used verbatim (the exchange "
+      "fails with a certificate error against the "
+      "self-signed server) and the unverified factory is "
+      "never consulted",
+      isinstance(_r75c, _ssl27.SSLError) and _calls75 == [])
+
+_calls75.clear()
+_r75d = _direct27(_PORT27, _ssl27.create_default_context(),
+                  armed=False)
+check("N75 (4): direct construction, unarmed — a supplied "
+      "verifying context is used verbatim (certificate "
+      "error) and the unverified factory is never "
+      "consulted",
+      isinstance(_r75d, _ssl27.SSLError) and _calls75 == [])
+
+SR._HTTPS_CONTEXT_FACTORY = _saved_factory27
+
+# N76 (1): per-exchange resolution cache — a genuine
+# wrapper exchange redirected (302) to a second path on
+# the SAME host opens a second connection inside the
+# same urlopen call; the host is resolved exactly once
+# for the whole exchange (pre-fix: once per connection).
+_real_gai27 = _sock27.getaddrinfo
+_gai27 = []
+
+
+def _counting_gai27(host, port, *a, **kw):
+    if host == "127.0.0.1":
+        _gai27.append((host, port))
+    return _real_gai27(host, port, *a, **kw)
+
+
+_ureq18.urlopen = _real_urlopen18
+SR._GATED_SEND_DEADLINE = 10.0
+SR._RESEND_API_URL = f"http://127.0.0.1:{_RPORT27}/redir"
+_sock27.getaddrinfo = _counting_gai27
+o76 = mk_order("n76@test.dev", "Deep Scan", 29, status="PAID")
+res76 = SR._gated_send(o76, SR.send_resend, "n76@test.dev",
+                       "Payment received — Deep Scan", "body")
+_sock27.getaddrinfo = _real_gai27
+check("N76 (1): redirected gated exchange — the final "
+      "response classifies delivered and the host is "
+      "resolved exactly once across both connections of "
+      "the exchange",
+      res76 is not None
+      and SR._send_status(res76) == "delivered"
+      and res76[1] == "mail-n76-ok"
+      and len(_gai27) == 1)
+_ureq18.urlopen = _saved_open27
+
+# N77 (1): factory-context cache — two context=None
+# constructions of the deadline HTTPS class under one
+# counting factory consult it exactly once, both
+# constructions carry the same cached context object,
+# and the cached context is functionally used (the
+# first construction completes a TLS exchange).
+_ctxobj77 = _ssl27._create_unverified_context()
+_calls77 = []
+
+
+def _factory77(vsn):
+    _calls77.append(vsn)
+    return _ctxobj77
+
+
+SR._HTTPS_CONTEXT_FACTORY = _factory77
+_c77a = SR._DeadlineHTTPSConnection("127.0.0.1", _PORT27)
+_c77b = SR._DeadlineHTTPSConnection("127.0.0.1", _PORT27)
+_c77a.request("GET", "/ok")
+_resp77 = _c77a.getresponse()
+_body77 = _resp77.read()
+_c77a.close()
+_c77b.close()
+SR._HTTPS_CONTEXT_FACTORY = _saved_factory27
+check("N77 (1): two context=None constructions under one "
+      "factory consult it exactly once; both carry the "
+      "cached context object, which completes a real TLS "
+      "exchange",
+      len(_calls77) == 1
+      and _c77a._context is _ctxobj77
+      and _c77b._context is _ctxobj77
+      and _body77 == b'{"id": "mail-n27-ok"}')
+
+SR._RESEND_API_URL = _saved_url27
+SR._GATED_SEND_DEADLINE = _saved_dl27
+_SRV27.shutdown()
+_SRV27.server_close()
+_RSRV27.shutdown()
+_RSRV27.server_close()
 
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
