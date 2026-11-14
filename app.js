@@ -31,8 +31,20 @@ async function runScan(url, consent) {
   }
 }
 if (scanForm) scanForm.addEventListener('submit', async event => {
-  event.preventDefault(); if (!scanForm.reportValidity()) return;
-  const url = document.querySelector('#scan-url').value; const consent = scanForm.querySelector('.check input').checked; const button = scanForm.querySelector('button'); button.disabled = true;
+  event.preventDefault();
+  const urlInput = document.querySelector('#scan-url'); const consentBox = scanForm.querySelector('.check input'); const button = scanForm.querySelector('button'); const scanError = document.querySelector('#scan-error');
+  const showScanError = msg => { if (scanError) { scanError.textContent = msg; scanError.hidden = false; } };
+  if (scanError) { scanError.hidden = true; scanError.textContent = ''; }
+  // Accept the address the way people type it: a bare domain is normal.
+  // Normalize here — never let native form validation wall off the scan.
+  let rawUrl = urlInput.value.trim();
+  if (rawUrl.startsWith('//')) rawUrl = rawUrl.slice(2);
+  if (rawUrl && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rawUrl)) rawUrl = 'https://' + rawUrl;
+  let parsedUrl = null;
+  try { parsedUrl = new URL(rawUrl); } catch (e) { parsedUrl = null; }
+  if (!parsedUrl || !parsedUrl.hostname || !parsedUrl.hostname.includes('.')) { showScanError("Enter your app's address — for example yourapp.com"); urlInput.focus(); return; }
+  if (!consentBox.checked) { showScanError('Tick the box to confirm this is your site, then run the scan.'); consentBox.focus(); return; }
+  const url = rawUrl; const consent = consentBox.checked; button.disabled = true;
   output.innerHTML = `<div class="scan-panel"><div class="scan-panel-head"><span>SURFACE CHECK / CHECKLIST</span><span>IN PROGRESS</span></div><div class="checklist">${checks.map((c,i)=>`<div data-check="${i}"><span>${String(i+1).padStart(2,'0')} / ${c}</span><b>WAITING</b></div>`).join('')}</div></div>`;
   try {
     const result = await runScan(url, consent);
