@@ -62,10 +62,23 @@ if (scanForm) scanForm.addEventListener('submit', async event => {
     const cta = output.querySelector('.scan-deep-cta');
     if (cta) cta.addEventListener('click', () => { const trigger = document.querySelector('.brief-trigger[data-tier="Deep Scan"]'); if (trigger) trigger.click(); });
   } catch (err) {
-    output.innerHTML = `<div class="scan-panel"><div class="scan-panel-head"><span>SURFACE CHECK / ERROR</span><span>NOT COMPLETED</span></div><p class="scan-notice">We couldn't complete the scan. Check that the address is a public site starting with https:// and try again — or send us the URL by email and we'll run it for you.</p></div>`;
+    const mailtoFail = `mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent('Free scan request')}&body=${encodeURIComponent('Please run a free scan for: ' + url)}`;
+    output.innerHTML = `<div class="scan-panel"><div class="scan-panel-head"><span>SURFACE CHECK / ERROR</span><span>NOT COMPLETED</span></div><p class="scan-notice">We couldn't complete the scan. Check that the address is a public site starting with https:// and try again — or send us the URL by email and we'll run it for you.</p><p><a class="button outline" href="${mailtoFail}">Email us this address — we'll run it and send the results</a></p></div>`;
   }
   button.disabled = false;
 });
+// Human fallback under the scan form: keep the mailto's body in sync with
+// whatever address is currently typed, so a stuck visitor's address reaches
+// us without retyping. An empty field still sends the plain prefilled body.
+const scanMailto = document.querySelector('#scan-mailto');
+if (scanForm && scanMailto) {
+  const scanUrlField = document.querySelector('#scan-url');
+  const buildScanMailto = addr => `mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent('Free scan request')}&body=${encodeURIComponent('Please run a free scan for: ' + addr)}`;
+  const refreshScanMailto = () => { scanMailto.href = buildScanMailto(scanUrlField.value.trim()); };
+  scanUrlField.addEventListener('input', refreshScanMailto);
+  scanMailto.addEventListener('click', refreshScanMailto);
+  refreshScanMailto();
+}
 const dialog = document.querySelector('#brief-dialog');
 if (dialog) {
   const form = document.querySelector('#brief-form');
