@@ -1,7 +1,7 @@
 FROM python:3.12-alpine
 RUN apk add --no-cache curl
 WORKDIR /app
-COPY server.py email_template.py index.html report.html terms.html privacy.html style.css app.js favicon.svg robots.txt sitemap.xml exporter.py entrypoint.sh /app/
+COPY server.py email_template.py index.html report.html terms.html privacy.html methodology.html checklist.html style.css app.js favicon.svg robots.txt sitemap.xml exporter.py entrypoint.sh /app/
 RUN chmod +x /app/entrypoint.sh
 COPY .well-known/security.txt /app/.well-known/security.txt
 ENV PORT=80 VF_DB_PATH=/data/vibefort.db
