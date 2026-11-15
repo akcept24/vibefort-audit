@@ -104,6 +104,8 @@ STATIC_FILES = {
     "/.well-known/security.txt": (".well-known/security.txt", "text/plain"),
     "/terms.html": ("terms.html", "text/html"),
     "/privacy.html": ("privacy.html", "text/html"),
+    "/methodology.html": ("methodology.html", "text/html"),
+    "/checklist.html": ("checklist.html", "text/html"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
     "/robots.txt": ("robots.txt", "text/plain"),
     "/sitemap.xml": ("sitemap.xml", "application/xml"),
