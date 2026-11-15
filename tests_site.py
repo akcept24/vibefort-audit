@@ -7030,6 +7030,289 @@ check("N86 (1): fresh subprocess — the module's own "
 _SRV33.shutdown()
 _SRV33.server_close()
 
+# ------------------------------------------------------------------
+# Incident 2026-11-15 (GLM backstop, variant 6): the frozen
+# zone's courtesy HQ Telegram pings inside _run_monitor_locked
+# fired BEFORE the acknowledgement commit with no intent
+# record and no consult of the MONITOR_ALERT_SENT event — a
+# crash between the ping and the commit made the next run's
+# reconcile arm re-send the identical ping and write a second
+# MONITOR_ALERT_SENT row. Twin: the "payment matched" HQ ping
+# was unguarded, so two events for the same payment racing
+# the transition both fired it. The fix gives every one of
+# these pings the round-16 intent discipline: the monitor
+# arms persist hq_ping_intent (clearing send_intent) after
+# logging the event and before sending, and the reconcile's
+# first arm completes the acknowledgement from the intent
+# alone; the payment ping rides a durable paidping:<order>
+# claim taken before the send. The pins below crash the run
+# at the ping itself (the wrapper delivers, then raises —
+# death after the send, before the ack commit) and assert
+# the re-run neither re-pings nor re-logs.
+PROV19.mail_mode = "ok"
+PROV19.tg_mode = "ok"
+_prev_open87 = _ureq18.urlopen
+_ureq18.urlopen = PROV19.urlopen
+_real_gated87 = SR._gated_send
+_crash87 = {"armed": False, "fragment": None, "deliver_first": True}
+
+
+def _gated_crash87(order_id, send_fn, *args, **kwargs):
+    text = args[0] if args else ""
+    if _crash87["armed"] and _crash87["fragment"] \
+            and isinstance(text, str) \
+            and _crash87["fragment"] in text:
+        _crash87["armed"] = False
+        if _crash87["deliver_first"]:
+            _real_gated87(order_id, send_fn, *args, **kwargs)
+        raise RuntimeError("simulated crash at the HQ ping")
+    return _real_gated87(order_id, send_fn, *args, **kwargs)
+
+
+def mon_row87(oid):
+    c = db()
+    m = dict(c.execute("SELECT * FROM monitors WHERE order_id=?",
+                       (oid,)).fetchone())
+    c.close()
+    return m
+
+
+def tg87(fragment):
+    return [t for t in PROV19.tg_deliveries if fragment in t]
+
+
+def mk_monitor87(oid, url, email, name, pending):
+    c = db()
+    c.execute("INSERT INTO monitors(order_id,url,email,name,"
+              "created_at,next_run_at,last_digest,pending_alert) "
+              "VALUES(?,?,?,?,?,?,?,?)",
+              (oid, url, email, name, SR.utcnow(), time.time(),
+               json.dumps(["LOW|base"]),
+               json.dumps(pending) if pending is not None
+               else None))
+    c.commit()
+    c.close()
+
+
+_scan87 = SR._scan_with_timeout
+
+
+def scan87_for(title):
+    return lambda url: (
+        [{"severity": "low", "title": "base"},
+         {"severity": "medium", "title": title}],
+        {"host": "example.com", "errors": []})
+
+# N87: the retained path's send step delivers the alert,
+#      logs MONITOR_ALERT_SENT and sends the HQ ping — then
+#      the process dies before the acknowledgement commit.
+#      The re-run completes the ack from the ping intent
+#      alone: no second email attempt, no second event, no
+#      second ping.
+o87 = mk_order("n87@test.dev", "Monitoring", 79, status="PAID")
+mk_monitor87(o87, "n87.example.com", "n87@test.dev", "N87",
+             {"new": ["MEDIUM|N87 hole"], "gone": [], "grade": "B",
+              "score": 88,
+              "digest_after": ["LOW|base", "MEDIUM|N87 hole"],
+              "attempts": 2, "since": SR.utcnow(),
+              "send_intent": SR.utcnow(), "last_outcome": "unknown",
+              "idem": "monitor-alert:n87-pin",
+              "first_unknown_at": time.time() - 60})
+SR._scan_with_timeout = scan87_for("N87 hole")
+_crash87.update({"armed": True,
+                 "fragment": "n87.example.com delivered",
+                 "deliver_first": True})
+SR._gated_send = _gated_crash87
+crashed87 = False
+try:
+    SR._run_monitor(mon_row87(o87))
+except RuntimeError:
+    crashed87 = True
+SR._gated_send = _real_gated87
+SR._run_monitor(mon_row87(o87))
+m87 = mon_row87(o87)
+check("N87 delivered-arm ping crash: re-run acks from the "
+      "intent, nothing re-sent or re-logged",
+      crashed87
+      and len(tg87("n87.example.com delivered")) == 1
+      and count("events", "order_id=? AND event='MONITOR_ALERT_SENT'",
+                (o87,)) == 1
+      and len(PROV19.mail_keys_to("n87@test.dev")) == 1
+      and m87["pending_alert"] is None
+      and json.loads(m87["last_digest"])
+      == ["LOW|base", "MEDIUM|N87 hole"])
+
+# N88: two events for the SAME payment (different event ids)
+#      race the transition — the second event's whole webhook
+#      runs inside the first's transition call, wins it, and
+#      the loser falls through the same-payment recovery arm
+#      to the ping block. Exactly one "payment matched" ping.
+o88 = mk_order("n88@test.dev", "Deep Scan", 29)
+TG88 = {"matched": []}
+_prev_tg88 = S.send_telegram
+
+
+def tg88(text):
+    if "Stripe payment matched" in text:
+        TG88["matched"].append(text)
+    return True, "stub"
+
+
+S.send_telegram = tg88
+_prev_resend88 = S.send_resend
+S.send_resend = lambda to, subject, text, html=None: \
+    (True, "stub-id")
+real_t88 = S.transition_order_status
+race88 = {"fired": False, "reply": None}
+
+
+def racing_t88(row, new_status, **kw):
+    if not race88["fired"] and row["id"] == o88:
+        race88["fired"] = True
+        race88["reply"] = stripe_call(
+            evt("evt_n88b"),
+            sess(2900, "n88@test.dev", pi="pi_n88"))
+    return real_t88(row, new_status, **kw)
+
+
+S.transition_order_status = racing_t88
+r88 = stripe_call(evt("evt_n88a"),
+                  sess(2900, "n88@test.dev", pi="pi_n88"))
+S.transition_order_status = real_t88
+S.send_telegram = _prev_tg88
+S.send_resend = _prev_resend88
+check("N88 racing same-payment events: exactly one "
+      "payment-matched HQ ping",
+      r88 == (200, {"ok": True, "order_id": o88})
+      and race88["reply"] == (200, {"ok": True, "order_id": o88})
+      and len(TG88["matched"]) == 1
+      and order_status(o88) == "PAID"
+      and count("fulfilment_requests", "order_id=?", (o88,)) == 1)
+
+# N89 (1): the round-19 settle arm — the alert was settled
+#      as sent-unconfirmed, the event logged, the HQ ping
+#      sent, then death before the ack. The re-run must not
+#      re-fire the settle (its condition died with the
+#      send_intent the intent write cleared): one ping, one
+#      event, ack completed, no email ever attempted.
+o89a = mk_order("n89a@test.dev", "Monitoring", 79, status="PAID")
+mk_monitor87(o89a, "n89a.example.com", "n89a@test.dev", "N89A",
+             {"new": ["MEDIUM|N89 hole"], "gone": [], "grade": "B",
+              "score": 88,
+              "digest_after": ["LOW|base", "MEDIUM|N89 hole"],
+              "attempts": 3, "since": SR.utcnow(),
+              "send_intent": SR.utcnow(), "last_outcome": "unknown",
+              "idem": "monitor-alert:n89a-pin",
+              "first_unknown_at": time.time() - 200000,
+              "post_window_used": 1})
+SR._scan_with_timeout = scan87_for("N89 hole")
+_crash87.update({"armed": True,
+                 "fragment": "n89a.example.com settled as",
+                 "deliver_first": True})
+SR._gated_send = _gated_crash87
+crashed89a = False
+try:
+    SR._run_monitor(mon_row87(o89a))
+except RuntimeError:
+    crashed89a = True
+SR._gated_send = _real_gated87
+SR._run_monitor(mon_row87(o89a))
+m89a = mon_row87(o89a)
+check("N89 (1) settle-arm ping crash: single-fire under "
+      "re-entry",
+      crashed89a
+      and len(tg87("n89a.example.com settled as")) == 1
+      and count("events", "order_id=? AND event='MONITOR_ALERT_SENT'",
+                (o89a,)) == 1
+      and len(PROV19.mail_keys_to("n89a@test.dev")) == 0
+      and m89a["pending_alert"] is None
+      and json.loads(m89a["last_digest"])
+      == ["LOW|base", "MEDIUM|N89 hole"])
+
+# N89 (2): the reconcile arm itself — a bare delivery intent
+#      from an interrupted run is adjudicated delivered, the
+#      event logged, the HQ ping sent, then death before the
+#      ack. Same single-fire contract.
+o89b = mk_order("n89b@test.dev", "Monitoring", 79, status="PAID")
+mk_monitor87(o89b, "n89b.example.com", "n89b@test.dev", "N89B",
+             {"new": ["MEDIUM|N89 hole"], "gone": [], "grade": "B",
+              "score": 88,
+              "digest_after": ["LOW|base", "MEDIUM|N89 hole"],
+              "attempts": 1, "since": SR.utcnow(),
+              "send_intent": SR.utcnow(),
+              "idem": "monitor-alert:n89b-pin"})
+SR._scan_with_timeout = scan87_for("N89 hole")
+_crash87.update({"armed": True,
+                 "fragment": "n89b.example.com delivered",
+                 "deliver_first": True})
+SR._gated_send = _gated_crash87
+crashed89b = False
+try:
+    SR._run_monitor(mon_row87(o89b))
+except RuntimeError:
+    crashed89b = True
+SR._gated_send = _real_gated87
+SR._run_monitor(mon_row87(o89b))
+m89b = mon_row87(o89b)
+check("N89 (2) reconcile-arm ping crash: single-fire under "
+      "re-entry",
+      crashed89b
+      and len(tg87("n89b.example.com delivered")) == 1
+      and count("events", "order_id=? AND event='MONITOR_ALERT_SENT'",
+                (o89b,)) == 1
+      and len(PROV19.mail_keys_to("n89b@test.dev")) == 0
+      and m89b["pending_alert"] is None
+      and json.loads(m89b["last_digest"])
+      == ["LOW|base", "MEDIUM|N89 hole"])
+
+# N90: the delivered arm's intent write itself — death AT
+#      the ping (never delivered) leaves a persisted record
+#      whose send_intent is already cleared and whose
+#      hq_ping_intent stands; the re-run honours the intent
+#      (the ping is treated as delivered, never sent) and
+#      completes the ack. Pins the send_intent clearing the
+#      GLM verdict named as missing in the delivered arm.
+o90 = mk_order("n90@test.dev", "Monitoring", 79, status="PAID")
+mk_monitor87(o90, "n90.example.com", "n90@test.dev", "N90",
+             {"new": ["MEDIUM|N90 hole"], "gone": [], "grade": "B",
+              "score": 88,
+              "digest_after": ["LOW|base", "MEDIUM|N90 hole"],
+              "attempts": 2, "since": SR.utcnow(),
+              "send_intent": SR.utcnow(), "last_outcome": "unknown",
+              "idem": "monitor-alert:n90-pin",
+              "first_unknown_at": time.time() - 60})
+SR._scan_with_timeout = scan87_for("N90 hole")
+_crash87.update({"armed": True,
+                 "fragment": "n90.example.com delivered",
+                 "deliver_first": False})
+SR._gated_send = _gated_crash87
+crashed90 = False
+try:
+    SR._run_monitor(mon_row87(o90))
+except RuntimeError:
+    crashed90 = True
+SR._gated_send = _real_gated87
+m90mid = mon_row87(o90)
+pend90 = json.loads(m90mid["pending_alert"]) \
+    if m90mid["pending_alert"] else None
+SR._run_monitor(mon_row87(o90))
+m90 = mon_row87(o90)
+check("N90 delivered arm clears send_intent in its intent "
+      "write; intent honoured, ping never sent",
+      crashed90
+      and pend90 is not None
+      and "send_intent" not in pend90
+      and bool(pend90.get("hq_ping_intent"))
+      and len(tg87("n90.example.com delivered")) == 0
+      and count("events", "order_id=? AND event='MONITOR_ALERT_SENT'",
+                (o90,)) == 1
+      and len(PROV19.mail_keys_to("n90@test.dev")) == 1
+      and m90["pending_alert"] is None
+      and json.loads(m90["last_digest"])
+      == ["LOW|base", "MEDIUM|N90 hole"])
+SR._scan_with_timeout = _scan87
+_ureq18.urlopen = _prev_open87
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

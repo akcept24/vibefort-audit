@@ -2992,11 +2992,36 @@ class Handler(BaseHTTPRequestHandler):
                 # courtesy is outstanding).
                 if not _ensure_paid_receipt(order, amount):
                     raise RuntimeError("receipt send failed")
-                _gated_send(
-                    order["id"], send_telegram,
-                    f"ShipAudit Lab: Stripe payment matched — order "
-                    f"#{order['id']} ({tier}, ${amount / 100:,.2f}) "
-                    f"marked PAID automatically.")
+                # Incident 2026-11-15 (GLM backstop variant 6,
+                # twin): the courtesy HQ ping gets the round-16
+                # intent discipline. Two events for the SAME
+                # payment (completed + async_payment_succeeded)
+                # racing the transition can both fall through
+                # to here — the loser via the same-payment
+                # recovery arm — and the ping had no guard at
+                # all, so it fired twice. The durable claim on
+                # paidping:<order_id>, taken BEFORE the send,
+                # is the intent record: whoever finds the claim
+                # held skips the ping (the intent is honoured
+                # as delivered, never re-sent — the Telegram
+                # class rule), and a lock taken for a fire is
+                # its fired record, as with receipt:/notify:.
+                # A gate abort (the order was deleted before
+                # the send could start, so nothing was
+                # attempted) releases the claim again, mirroring
+                # the deepscan fire.
+                _pp6_key = f"paidping:{order['id']}"
+                _pp6_token = _claim_event_lock(
+                    _pp6_key, "payment-matched-ping")
+                if _pp6_token is not None:
+                    _pp6_res = _gated_send(
+                        order["id"], send_telegram,
+                        f"ShipAudit Lab: Stripe payment matched "
+                        f"— order #{order['id']} ({tier}, "
+                        f"${amount / 100:,.2f}) marked PAID "
+                        f"automatically.")
+                    if _pp6_res is None:
+                        _release_event_lock(_pp6_key, _pp6_token)
                 self._send_json(200, {"ok": True,
                                       "order_id": order["id"]})
                 return
@@ -3149,9 +3174,10 @@ class Handler(BaseHTTPRequestHandler):
                         # nothing.
                         conn.execute(
                             "DELETE FROM event_locks WHERE "
-                            "event_id IN (?,?,?)",
+                            "event_id IN (?,?,?,?)",
                             (f"notify:{oid}", f"receipt:{oid}",
-                             f"monitor-activate:{oid}"))
+                             f"monitor-activate:{oid}",
+                             f"paidping:{oid}"))
                         conn.execute(
                             "DELETE FROM stripe_events WHERE "
                             "order_id=?", (oid,))
@@ -4112,7 +4138,9 @@ def _lock_key_alive(key):
     INSERT a fresh order-keyed lock row — state created
     after the tombstone, left standing by a crash until the
     GC. The order-keyed namespaces carry an order id
-    (receipt:, notify:, monitor-activate:); monitor: carries
+    (receipt:, notify:, monitor-activate:, paidping: —
+    the last added by the 2026-11-15 incident fix);
+    monitor: carries
     a monitor id, alive when the monitor row exists and its
     order is not dead. An unparseable id in a keyed
     namespace is refused (fail closed — the namespaces are
@@ -4120,7 +4148,7 @@ def _lock_key_alive(key):
     namespace (alert:<stripe event id>) is not order-keyed
     and is always claimable."""
     ns, _, ident = key.partition(":")
-    if ns in ("receipt", "notify", "monitor-activate"):
+    if ns in ("receipt", "notify", "monitor-activate", "paidping"):
         try:
             oid = int(ident)
         except ValueError:
@@ -5487,6 +5515,37 @@ def _alert_window_spent(pending):
         and (time.time() - first) > _RESEND_IDEM_SAFE_AGE
 
 
+def _monitor_hq_ping_intent(mon, pending):
+    """Incident 2026-11-15 (GLM backstop variant 6): persist
+    the courtesy-HQ-ping intent for a retained alert whose
+    delivery has just been adjudicated — the round-16 intent
+    discipline the deepscan ping got, applied to the monitor
+    run's HQ Telegram. The calling arm logs MONITOR_ALERT_SENT
+    FIRST, records this intent SECOND, sends the ping THIRD
+    and acknowledges LAST: a crash after the intent leaves a
+    record the reconcile's first arm completes WITHOUT
+    re-sending the ping or re-logging the event (the intent
+    is honoured as delivered, the Telegram class rule), and
+    a crash before it re-runs the adjudicating arm, which
+    has not pinged yet. The delivery send_intent is cleared
+    in the same write — its adjudication is complete, and
+    leaving it standing is what let the reconcile arm
+    re-fire the ping as if the delivery itself were still
+    unadjudicated. Mutates the caller's dict to match the
+    persisted record."""
+    pending.pop("send_intent", None)
+    pending["hq_ping_intent"] = utcnow()
+    with _db_lock:
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE monitors SET pending_alert=? WHERE id=?",
+                (json.dumps(pending), mon["id"]))
+            conn.commit()
+        finally:
+            conn.close()
+
+
 def _send_monitor_alert(mon, host, order_id, pending):
     """One monitoring change-alert send, under the alert's
     idempotency key (round 18). Returns the wrapper's
@@ -5604,10 +5663,37 @@ def _run_monitor_locked(mon):
         # (Resend dedupes an accepted first attempt), so the
         # record falls through to the send step below instead of
         # being reconciled as delivered.
-        _unknown_retry = bool(_pending.get("send_intent")) and \
+        if _pending.get("hq_ping_intent"):
+            # Incident 2026-11-15 (GLM backstop variant 6):
+            # an earlier arm of this reconcile — or the
+            # delivering run itself — adjudicated this alert,
+            # logged MONITOR_ALERT_SENT and persisted the
+            # HQ-ping intent, then died before the
+            # acknowledgement commit (or after the ping,
+            # inside that same window). The intent is the
+            # round-16 discipline applied to the courtesy
+            # ping: intent on record means the ping is
+            # honoured as delivered and NEVER re-sent, and
+            # the event is already on record — so this arm
+            # only completes the acknowledgement the
+            # interrupted run owed.
+            with _db_lock:
+                conn = db_connect()
+                conn.execute(
+                    "UPDATE monitors SET pending_alert=NULL, "
+                    "last_digest=? WHERE id=?",
+                    (json.dumps(_pending["digest_after"]),
+                     mon["id"]))
+                conn.commit()
+                conn.close()
+            mon["pending_alert"] = None
+            mon["last_digest"] = json.dumps(_pending["digest_after"])
+            _pending = None
+        _unknown_retry = bool(_pending and
+                              _pending.get("send_intent")) and \
             _pending.get("last_outcome") == "unknown" and \
             not _alert_window_spent(_pending)
-        if _pending.get("send_intent") and \
+        if _pending and _pending.get("send_intent") and \
                 _pending.get("last_outcome") == "unknown" and \
                 _alert_window_spent(_pending):
             # Round 19 (Codex delta-18 (b)): the single
@@ -5623,6 +5709,7 @@ def _run_monitor_locked(mon):
                 "the Resend idempotency window passed and "
                 "the single post-window resend is spent; "
                 "not attempted again")
+            _monitor_hq_ping_intent(mon, _pending)
             _gated_send(
                 order_id, send_telegram,
                 f"ShipAudit Lab: retained monitoring alert "
@@ -5658,6 +5745,7 @@ def _run_monitor_locked(mon):
                 "retained alert treated as delivered: "
                 "delivery intent on record from an "
                 "interrupted run; not re-sent")
+            _monitor_hq_ping_intent(mon, _pending)
             _gated_send(
                 order_id, send_telegram,
                 f"ShipAudit Lab: retained monitoring alert "
@@ -5883,6 +5971,7 @@ def _run_monitor_locked(mon):
             return
         _log_event_alive(order_id, "MONITOR_ALERT_SENT",
                          f"retained alert delivered: {_pdet}")
+        _monitor_hq_ping_intent(mon, _pending)
         _gated_send(
             order_id, send_telegram,
             f"ShipAudit Lab: retained monitoring alert for "
