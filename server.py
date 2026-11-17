@@ -167,6 +167,9 @@ def db_connect():
         bucket TEXT NOT NULL, ip TEXT NOT NULL, ts REAL NOT NULL)""")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_rate_hits"
                  " ON rate_hits(bucket, ip, ts)")
+    conn.execute("""CREATE TABLE IF NOT EXISTS funnel_events(
+        id INTEGER PRIMARY KEY, ts TEXT, event TEXT, device TEXT,
+        source TEXT, page TEXT)""")
     conn.execute("""CREATE TABLE IF NOT EXISTS monitors(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         order_id INTEGER UNIQUE NOT NULL,
@@ -2239,7 +2242,20 @@ def ui_findings(findings):
 # shared by every thread/process using this register), and the bucket key
 # comes from _client_ip(), which trusts only the hop Traefik appended.
 # ---------------------------------------------------------------------------
-RATE_LIMITS = {"brief": (5, 600), "scan": (3, 600)}  # (max hits, window sec)
+RATE_LIMITS = {"brief": (5, 600), "scan": (3, 600),
+               "event": (120, 3600)}  # (max hits, window sec)
+
+# Funnel analytics (CRO wave, 2026-11-17): the only event names the
+# public /api/event sink accepts, and the shapes of the only two
+# free-text fields it stores. Everything else in an event body is
+# ignored and never persisted — no scanned URLs, no findings, no
+# emails ever enter this table.
+FUNNEL_EVENTS = frozenset({
+    "scan_form_viewed", "scan_url_entered", "scan_submit_clicked",
+    "scan_authorization_missing", "scan_validation_failed",
+    "scan_started", "scan_completed", "scan_failed"})
+FUNNEL_PAGE_RX = re.compile(r"/[A-Za-z0-9/_-]*")
+FUNNEL_SOURCE_RX = re.compile(r"[a-z0-9_-]{0,32}")
 
 
 def rate_ok(bucket, ip):
@@ -2417,6 +2433,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._api_brief()
             elif path == "/api/scan":
                 self._api_scan()
+            elif path == "/api/event":
+                self._api_event()
             elif path == "/api/stripe-webhook":
                 self._api_stripe_webhook()
             elif path.startswith("/api/orders/"):
@@ -2519,6 +2537,21 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 self._send_json(200, {"ok": True,
                                       "order": self._order_dict(conn, row)})
+            elif path == "/api/events":
+                counts = {}
+                by_device = {}
+                by_source = {}
+                for ev, dev, src, n in conn.execute(
+                        "SELECT event, device, source, COUNT(*) FROM"
+                        " funnel_events GROUP BY event, device, source"):
+                    counts[ev] = counts.get(ev, 0) + n
+                    dmap = by_device.setdefault(ev, {})
+                    dmap[dev] = dmap.get(dev, 0) + n
+                    smap = by_source.setdefault(ev, {})
+                    smap[src] = smap.get(src, 0) + n
+                self._send_json(200, {"ok": True, "counts": counts,
+                                      "by_device": by_device,
+                                      "by_source": by_source})
             elif path == "/api/scans":
                 rows = conn.execute(
                     "SELECT id,created_at,url,email,grade,score,results_json"
@@ -3488,6 +3521,62 @@ class Handler(BaseHTTPRequestHandler):
             f"findings={len(findings)}")
         self._send_json(200, {"ok": True, "grade": grade, "score": score,
                               "findings": ui_findings(findings)})
+
+    # -- /api/event ---------------------------------------------------------------
+    def _api_event(self):
+        """Funnel analytics sink: one row per client-side funnel
+        event. Deliberately content-free — only the event name, the
+        page path, a coarse traffic source and a UA-derived device
+        class are stored; any other key in the body is ignored and
+        never persisted (no scanned URLs, no findings, no emails).
+        Answers 204 with no body on success."""
+        ip = self._client_ip()
+        if not rate_ok("event", ip):
+            log(f"event rate-limited ip={ip}")
+            self._send_json(429, {"ok": False,
+                                  "error": "too many requests — please try again later"})
+            return
+        data = self._read_json(2048)
+        if data is None:
+            self._send_json(400, {"ok": False, "error": "invalid JSON body"})
+            return
+        event = data.get("event")
+        if not isinstance(event, str) or event not in FUNNEL_EVENTS:
+            self._send_json(400, {"ok": False, "error": "unknown event"})
+            return
+        page = data.get("page")
+        if not (isinstance(page, str) and len(page) <= 80
+                and FUNNEL_PAGE_RX.fullmatch(page)):
+            page = "/"
+        source = data.get("source")
+        if not (isinstance(source, str)
+                and FUNNEL_SOURCE_RX.fullmatch(source)):
+            source = ""
+        ua = self.headers.get("User-Agent") or ""
+        if "iPhone" in ua or "iPad" in ua:
+            device = "ios"
+        elif "Android" in ua:
+            device = "android"
+        elif "Mobile" in ua:
+            device = "mobile"
+        else:
+            device = "desktop"
+        with _db_lock:
+            conn = db_connect()
+            try:
+                conn.execute(
+                    "INSERT INTO funnel_events(ts,event,device,source,page)"
+                    " VALUES(?,?,?,?,?)",
+                    (utcnow(), event, device, source, page))
+                conn.commit()
+            finally:
+                conn.close()
+        self.send_response(204)
+        for k, v in SECURITY_HEADERS:
+            self.send_header(k, v)
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        self.end_headers()
 
 
 # ---------------------------------------------------------------------------

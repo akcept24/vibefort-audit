@@ -7313,6 +7313,139 @@ check("N90 delivered arm clears send_intent in its intent "
 SR._scan_with_timeout = _scan87
 _ureq18.urlopen = _prev_open87
 
+# ---------------------------------------------------------------------------
+# CRO wave (2026-11-17): the funnel analytics sink (POST /api/event,
+# GET /api/events) and the landing-copy pins. The sink is deliberately
+# content-free: it stores ONLY the event name, the page path, a coarse
+# traffic source and a UA-derived device class — injected keys (url,
+# email, findings) must land NOWHERE in the stored row.
+import http.client as _hcCRO
+import http.server as _hsCRO
+import threading as _thCRO
+
+SR.ADMIN_TOKEN = "catalog-admin"
+_SRV_CRO = _hsCRO.ThreadingHTTPServer(("127.0.0.1", 0), SR.Handler)
+_PORT_CRO = _SRV_CRO.server_address[1]
+_thCRO.Thread(target=_SRV_CRO.serve_forever,
+              kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+
+def _cro_req(method, path, body=None, headers=None, raw=None):
+    conn = _hcCRO.HTTPConnection("127.0.0.1", _PORT_CRO, timeout=30)
+    payload = raw
+    hdrs = dict(headers or {})
+    if body is not None:
+        payload = json.dumps(body).encode()
+        hdrs.setdefault("Content-Type", "application/json")
+    conn.request(method, path, body=payload, headers=hdrs)
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+def _cro_rows(event):
+    c = db()
+    rows = c.execute("SELECT * FROM funnel_events WHERE event=?",
+                     (event,)).fetchall()
+    c.close()
+    return rows
+
+
+_UA_IOS = {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0"
+                         " like Mac OS X) AppleWebKit/605.1.15"}
+
+# CRO-P1: a valid event is accepted (204) and stored with exactly the
+# sent event/page/source and the UA-derived device class.
+_st, _ = _cro_req("POST", "/api/event",
+                  {"event": "scan_started", "page": "/",
+                   "source": "ig"}, _UA_IOS)
+_rows = _cro_rows("scan_started")
+check("CRO-P1 valid /api/event -> 204, row stored with sent fields "
+      "and derived device",
+      _st == 204 and len(_rows) == 1
+      and _rows[0]["page"] == "/" and _rows[0]["source"] == "ig"
+      and _rows[0]["device"] == "ios")
+
+# CRO-P2: an unknown event name is refused (400) and stores nothing.
+_st, _ = _cro_req("POST", "/api/event",
+                  {"event": "scan_hacked", "page": "/",
+                   "source": "ig"}, _UA_IOS)
+check("CRO-P2 unknown event -> 400, no row stored",
+      _st == 400 and len(_cro_rows("scan_hacked")) == 0)
+
+# CRO-P3: extra keys are ignored — the injected values appear nowhere
+# in the stored row.
+_st, _ = _cro_req("POST", "/api/event",
+                  {"event": "scan_completed", "page": "/",
+                   "source": "ig",
+                   "url": "https://evil.example/secret",
+                   "email": "victim@example.com",
+                   "findings": "SECRET_FINDING_XYZ"}, _UA_IOS)
+_rows = _cro_rows("scan_completed")
+_blob = " ".join(str(v) for r in _rows for v in tuple(r)) \
+    if _rows else ""
+check("CRO-P3 extra keys ignored, injected values nowhere in row",
+      _st == 204 and len(_rows) == 1
+      and "evil.example" not in _blob
+      and "victim@example.com" not in _blob
+      and "SECRET_FINDING_XYZ" not in _blob
+      and _rows[0]["page"] == "/" and _rows[0]["source"] == "ig")
+
+# CRO-P4: a malformed JSON body is refused (400).
+_st, _ = _cro_req("POST", "/api/event", raw=b"{not json",
+                  headers={"Content-Type": "application/json"})
+check("CRO-P4 malformed JSON -> 400", _st == 400)
+
+# CRO-P5: the admin aggregate is token-guarded (404 without, like the
+# other register routes) and reports the stored event by
+# count/device/source.
+_st, _ = _cro_req("GET", "/api/events")
+_st2, _body = _cro_req("GET", "/api/events",
+                       headers={"X-Admin-Token": "catalog-admin"})
+_agg = json.loads(_body) if _st2 == 200 else {}
+check("CRO-P5 /api/events 404 without token; with token counts "
+      "include the stored event by device and source",
+      _st == 404 and _st2 == 200
+      and _agg.get("counts", {}).get("scan_started", 0) >= 1
+      and _agg.get("by_device", {}).get("scan_started", {})
+      .get("ios", 0) >= 1
+      and _agg.get("by_source", {}).get("scan_started", {})
+      .get("ig", 0) >= 1)
+
+# CRO-P6: the shipped landing carries the new hero line, the trust
+# row, and the secondary free-scan CTA inside the report-teaser
+# section, after the sample-report link.
+_here = os.path.dirname(os.path.abspath(__file__))
+_html = open(os.path.join(_here, "index.html")).read()
+_t0 = _html.index("report-teaser")
+_teaser = _html[_t0:_html.index("</section>", _t0)]
+check("CRO-P6 index.html: new hero line, trust row, teaser CTA",
+      "Is your customer data exposed?" in _html
+      and "NO SIGNUP" in _html
+      and "NO PASSWORD NEEDED" in _html
+      and "READ-ONLY PUBLIC CHECKS" in _html
+      and 'class="button teaser-cta" href="#scan"' in _teaser
+      and "Run the free scan" in _teaser)
+
+# CRO-P7: app.js wires all eight funnel events.
+_js = open(os.path.join(_here, "app.js")).read()
+check("CRO-P7 app.js contains all 8 funnel event names",
+      all(n in _js for n in (
+          "scan_form_viewed", "scan_url_entered",
+          "scan_submit_clicked", "scan_authorization_missing",
+          "scan_validation_failed", "scan_started",
+          "scan_completed", "scan_failed")))
+
+# CRO-P8: /api/scan without consent is refused (400) before any scan
+# runs. (Checked first: not previously pinned anywhere in this
+# catalog — no _api_scan call or consent assertion existed.)
+_st, _ = _cro_req("POST", "/api/scan",
+                  {"url": "https://example.com"})
+check("CRO-P8 /api/scan without consent -> 400", _st == 400)
+
+_SRV_CRO.shutdown()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

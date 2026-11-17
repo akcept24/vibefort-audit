@@ -9,6 +9,18 @@ const scanForm = document.querySelector('#scan-form');
 const output = document.querySelector('#scan-output');
 const checks = ['TLS configuration', 'Security headers', 'CORS policy', 'Exposed files', 'JavaScript bundle secrets', 'Public database probes', 'Email records'];
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+// Funnel analytics: fire-and-forget event sink. Only the event name,
+// the page path and the sanitized utm_source ever leave the browser —
+// never the scanned URL or any finding. Every failure is swallowed:
+// analytics must never break the scan flow.
+function trackEvent(name) {
+  try {
+    const payload = JSON.stringify({ event: name, page: location.pathname, source: (new URLSearchParams(location.search).get('utm_source') || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 32) });
+    let sent = false;
+    if (navigator.sendBeacon) sent = navigator.sendBeacon('/api/event', new Blob([payload], { type: 'application/json' }));
+    if (!sent) fetch('/api/event', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: payload, keepalive: true }).catch(() => {});
+  } catch (e) { /* analytics is best-effort only */ }
+}
 async function runScan(url, consent) {
   // Real backend scan: POST /api/scan runs the surface checks server-side.
   // The checklist animates while the request is in flight; the results are
@@ -24,13 +36,18 @@ async function runScan(url, consent) {
     const resp = await fetch('/api/scan', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, consent }) });
     const result = await resp.json();
     if (!resp.ok || !result.ok) throw new Error(result.error || 'scan failed');
+    trackEvent('scan_started');
     return result;
+  } catch (e) {
+    trackEvent('scan_failed');
+    throw e;
   } finally {
     clearInterval(timer);
     document.querySelectorAll('[data-check] b').forEach(b => { b.textContent = 'DONE'; });
   }
 }
 if (scanForm) scanForm.addEventListener('submit', async event => {
+  trackEvent('scan_submit_clicked');
   event.preventDefault();
   const urlInput = document.querySelector('#scan-url'); const consentBox = scanForm.querySelector('.check input'); const button = scanForm.querySelector('button'); const scanError = document.querySelector('#scan-error');
   const showScanError = msg => { if (scanError) { scanError.textContent = msg; scanError.hidden = false; } };
@@ -42,8 +59,8 @@ if (scanForm) scanForm.addEventListener('submit', async event => {
   if (rawUrl && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(rawUrl)) rawUrl = 'https://' + rawUrl;
   let parsedUrl = null;
   try { parsedUrl = new URL(rawUrl); } catch (e) { parsedUrl = null; }
-  if (!parsedUrl || !parsedUrl.hostname || !parsedUrl.hostname.includes('.')) { showScanError("Enter your app's address — for example yourapp.com"); urlInput.focus(); return; }
-  if (!consentBox.checked) { showScanError('Tick the box to confirm this is your site, then run the scan.'); consentBox.focus(); return; }
+  if (!parsedUrl || !parsedUrl.hostname || !parsedUrl.hostname.includes('.')) { trackEvent('scan_validation_failed'); showScanError("Enter your app's address — for example yourapp.com"); urlInput.focus(); return; }
+  if (!consentBox.checked) { trackEvent('scan_authorization_missing'); showScanError('Tick the box to confirm this is your site, then run the scan.'); consentBox.focus(); return; }
   const url = rawUrl; const consent = consentBox.checked; button.disabled = true;
   output.innerHTML = `<div class="scan-panel"><div class="scan-panel-head"><span>SURFACE CHECK / CHECKLIST</span><span>IN PROGRESS</span></div><div class="checklist">${checks.map((c,i)=>`<div data-check="${i}"><span>${String(i+1).padStart(2,'0')} / ${c}</span><b>WAITING</b></div>`).join('')}</div></div>`;
   try {
@@ -61,12 +78,33 @@ if (scanForm) scanForm.addEventListener('submit', async event => {
     output.innerHTML = `<div class="scan-panel results"><div class="scan-panel-head"><span>SURFACE CHECK / RESULTS</span><span>COMPLETE</span></div><div class="result-title"><div><span class="eyebrow">SURFACE SCORE</span><h3>${result.grade}<small>${result.score} / 100</small></h3></div><div class="stamp">Live scan</div></div><p class="fine">Real checks against your live site, run just now. Paid audits add a second, independent verification pass to every finding.</p>${topHtml}${moreLine}${zeroHtml}${deepCta}${restHtml}</div>`;
     const cta = output.querySelector('.scan-deep-cta');
     if (cta) cta.addEventListener('click', () => { const trigger = document.querySelector('.brief-trigger[data-tier="Deep Scan"]'); if (trigger) trigger.click(); });
+    trackEvent('scan_completed');
   } catch (err) {
     const mailtoFail = `mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent('Free scan request')}&body=${encodeURIComponent('Please run a free scan for: ' + url)}`;
     output.innerHTML = `<div class="scan-panel"><div class="scan-panel-head"><span>SURFACE CHECK / ERROR</span><span>NOT COMPLETED</span></div><p class="scan-notice">We couldn't complete the scan. Check that the address is a public site starting with https:// and try again — or send us the URL by email and we'll run it for you.</p><p><a class="button outline" href="${mailtoFail}">Email us this address — we'll run it and send the results</a></p></div>`;
   }
   button.disabled = false;
 });
+// Funnel: form visibility + first URL entry (each fires once per load).
+if (scanForm) {
+  if ('IntersectionObserver' in window) {
+    const formObserver = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { trackEvent('scan_form_viewed'); formObserver.unobserve(scanForm); }
+    }, { threshold: 0.3 });
+    formObserver.observe(scanForm);
+  } else if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => trackEvent('scan_form_viewed'));
+  } else {
+    trackEvent('scan_form_viewed');
+  }
+}
+const scanUrlInput = document.querySelector('#scan-url');
+if (scanUrlInput) {
+  let urlEnteredFired = false;
+  scanUrlInput.addEventListener('input', () => {
+    if (!urlEnteredFired && scanUrlInput.value.trim()) { urlEnteredFired = true; trackEvent('scan_url_entered'); }
+  });
+}
 // Human fallback under the scan form: keep the mailto's body in sync with
 // whatever address is currently typed, so a stuck visitor's address reaches
 // us without retyping. An empty field still sends the plain prefilled body.
