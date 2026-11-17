@@ -7446,6 +7446,85 @@ check("CRO-P8 /api/scan without consent -> 400", _st == 400)
 
 _SRV_CRO.shutdown()
 
+# ---------------------------------------------------------------------------
+# Guide wave (2026-11-17): the free lead-magnet guide. guide.html is a
+# standalone page in the checklist skeleton carrying the 12 self-checks
+# and two woven free-scan CTAs; guide.pdf is its printable twin. Both
+# are served through STATIC_FILES like the other trust pages.
+import http.client as _hcGDE
+import http.server as _hsGDE
+import threading as _thGDE
+
+_SRV_GDE = _hsGDE.ThreadingHTTPServer(("127.0.0.1", 0), SR.Handler)
+_PORT_GDE = _SRV_GDE.server_address[1]
+_thGDE.Thread(target=_SRV_GDE.serve_forever,
+              kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+
+def _gde_req(path):
+    conn = _hcGDE.HTTPConnection("127.0.0.1", _PORT_GDE, timeout=30)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    data = resp.read()
+    ctype = resp.getheader("Content-Type")
+    conn.close()
+    return resp.status, ctype, data
+
+
+_GDE_HEADINGS = (
+    "Your database answers anonymous reads",
+    "Anonymous writes work too",
+    "Your database functions are callable by strangers",
+    "A real secret shipped in your JavaScript",
+    "A view quietly bypasses your row-level security",
+    "A column you revoked is still readable",
+    "Realtime subscriptions stream other people's rows",
+    "Phone signup confirms itself",
+    "Your file storage is a public bucket",
+    "An AI endpoint answers without a login",
+    "Wildcard CORS on your API and auth routes",
+    "No Content-Security-Policy, or one switched off politely",
+)
+
+# GUIDE-P1: the guide page carries all 12 check headings, both woven
+# free-scan CTAs, the Deep Scan mention and the PDF download link.
+_guide = open(os.path.join(_here, "guide.html")).read()
+check("GUIDE-P1 guide.html: 12 check headings, two /#scan CTAs, "
+      "Deep Scan mention, PDF link",
+      all(h in _guide for h in _GDE_HEADINGS)
+      and _guide.count('href="/#scan"') >= 2
+      and "Rather have it checked independently" in _guide
+      and "Deep Scan ($29)" in _guide
+      and "full automated version of this guide" in _guide
+      and 'href="/guide.pdf"' in _guide)
+
+# GUIDE-P2: /guide.html is served by the real Handler as HTML.
+_st, _ct, _body = _gde_req("/guide.html")
+check("GUIDE-P2 GET /guide.html -> 200 text/html with guide content",
+      _st == 200 and _ct is not None and _ct.startswith("text/html")
+      and b"Check your AI-built app yourself" in _body)
+
+# GUIDE-P3: /guide.pdf is served by the real Handler as a real PDF.
+_st, _ct, _body = _gde_req("/guide.pdf")
+check("GUIDE-P3 GET /guide.pdf -> 200 application/pdf, %PDF body",
+      _st == 200 and _ct == "application/pdf"
+      and _body.startswith(b"%PDF-") and len(_body) > 10000)
+
+# GUIDE-P4: the checklist page carries the one line to the guide.
+_checklist = open(os.path.join(_here, "checklist.html")).read()
+check("GUIDE-P4 checklist.html links the free guide line to /guide.html",
+      '<a href="/guide.html">Prefer a printable version? '
+      'Get the free guide (PDF)</a>' in _checklist)
+
+# GUIDE-P5: the guide page carries the formal disclaimer block and the
+# copyright line (legal wave 2026-11-17; wording per LEGAL_SOURCE_AND_GUIDE).
+check("GUIDE-P5 guide.html: disclaimer block + copyright line present",
+      "general educational information" in _guide
+      and "ShipAudit Lab and Probcapital LLC accept no liability" in _guide
+      and "© 2026 Probcapital LLC" in _guide)
+
+_SRV_GDE.shutdown()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

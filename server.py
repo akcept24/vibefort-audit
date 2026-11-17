@@ -106,6 +106,8 @@ STATIC_FILES = {
     "/privacy.html": ("privacy.html", "text/html"),
     "/methodology.html": ("methodology.html", "text/html"),
     "/checklist.html": ("checklist.html", "text/html"),
+    "/guide.html": ("guide.html", "text/html"),
+    "/guide.pdf": ("guide.pdf", "application/pdf"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
     "/robots.txt": ("robots.txt", "text/plain"),
     "/sitemap.xml": ("sitemap.xml", "application/xml"),
