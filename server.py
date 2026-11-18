@@ -108,6 +108,7 @@ STATIC_FILES = {
     "/checklist.html": ("checklist.html", "text/html"),
     "/guide.html": ("guide.html", "text/html"),
     "/guide.pdf": ("guide.pdf", "application/pdf"),
+    "/free-guide.html": ("free-guide.html", "text/html"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
     "/robots.txt": ("robots.txt", "text/plain"),
     "/sitemap.xml": ("sitemap.xml", "application/xml"),
@@ -2255,7 +2256,8 @@ RATE_LIMITS = {"brief": (5, 600), "scan": (3, 600),
 FUNNEL_EVENTS = frozenset({
     "scan_form_viewed", "scan_url_entered", "scan_submit_clicked",
     "scan_authorization_missing", "scan_validation_failed",
-    "scan_started", "scan_completed", "scan_failed"})
+    "scan_started", "scan_completed", "scan_failed",
+    "guide_page_viewed", "guide_download_clicked"})
 FUNNEL_PAGE_RX = re.compile(r"/[A-Za-z0-9/_-]*")
 FUNNEL_SOURCE_RX = re.compile(r"[a-z0-9_-]{0,32}")
 

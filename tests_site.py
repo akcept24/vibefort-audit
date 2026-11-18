@@ -7525,6 +7525,113 @@ check("GUIDE-P5 guide.html: disclaimer block + copyright line present",
 
 _SRV_GDE.shutdown()
 
+# ---------------------------------------------------------------------------
+# Guide landing wave (2026-11-17): free-guide.html is the dedicated ad
+# landing that sells the free guide — no site nav, one job (download
+# the PDF), the guide's own 12 titles and sourced stats, the verbatim
+# disclaimer block, and two funnel events of its own
+# (guide_page_viewed / guide_download_clicked) through the same
+# content-free /api/event sink.
+import http.client as _hcLND
+import http.server as _hsLND
+import threading as _thLND
+
+_SRV_LND = _hsLND.ThreadingHTTPServer(("127.0.0.1", 0), SR.Handler)
+_PORT_LND = _SRV_LND.server_address[1]
+_thLND.Thread(target=_SRV_LND.serve_forever,
+              kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+
+def _lnd_req(method, path, body=None, headers=None):
+    conn = _hcLND.HTTPConnection("127.0.0.1", _PORT_LND, timeout=30)
+    payload = None
+    hdrs = dict(headers or {})
+    if body is not None:
+        payload = json.dumps(body).encode()
+        hdrs.setdefault("Content-Type", "application/json")
+    conn.request(method, path, body=payload, headers=hdrs)
+    resp = conn.getresponse()
+    data = resp.read()
+    ctype = resp.getheader("Content-Type")
+    conn.close()
+    return resp.status, ctype, data
+
+
+def _lnd_rows(event):
+    c = db()
+    rows = c.execute("SELECT * FROM funnel_events WHERE event=?",
+                     (event,)).fetchall()
+    c.close()
+    return rows
+
+
+# LAND-P1: the landing carries the H1, both PDF download buttons, the
+# trust row, all 12 guide check titles, the three sourced stats, the
+# free-scan text link, the verbatim disclaimer block and its two
+# analytics event names.
+_land = open(os.path.join(_here, "free-guide.html")).read()
+check("LAND-P1 free-guide.html: H1, two download buttons, trust row, "
+      "12 titles, 3 sourced stats, scan link, disclaimer, analytics",
+      "Your AI built the app. Did it leave the database open?" in _land
+      and "Free guide · PDF · No email required" in _land
+      and _land.count('href="/guide.pdf"') == 2
+      and _land.count("Download the free guide (PDF)") == 2
+      and "NO SIGNUP" in _land
+      and "NO PASSWORD NEEDED" in _land
+      and "READ-ONLY PUBLIC CHECKS" in _land
+      and all(h in _land for h in _GDE_HEADINGS)
+      and "of AI-generated code samples introduced a security flaw"
+      in _land and "VERACODE" in _land
+      and "high-impact vulnerabilities found in 5,600 live vibe-coded "
+      "apps" in _land and "ESCAPE.TECH RESEARCH" in _land
+      and "of 1,645 Lovable apps in one study had their database "
+      "access wide open" in _land and "LOVABLE APPS STUDY" in _land
+      and "Or skip the reading — run the free scan now" in _land
+      and 'href="/#scan"' in _land
+      and "general educational information" in _land
+      and "ShipAudit Lab and Probcapital LLC accept no liability"
+      in _land
+      and "© 2026 Probcapital LLC" in _land
+      and "guide_page_viewed" in _land
+      and "guide_download_clicked" in _land)
+
+# LAND-P2: /free-guide.html is served by the real Handler as HTML.
+_st, _ct, _body = _lnd_req("GET", "/free-guide.html")
+check("LAND-P2 GET /free-guide.html -> 200 text/html with H1",
+      _st == 200 and _ct is not None and _ct.startswith("text/html")
+      and b"Did it leave the database open?" in _body)
+
+# LAND-P3: the sink accepts the two guide events (204, rows stored
+# with the sent source and the UA-derived device) and still refuses
+# an unknown event (400). The stored page is "/": the sink's page
+# shape (FUNNEL_PAGE_RX) admits no dot, so a .html path normalizes
+# to "/" — the pre-existing behaviour for every page on the site,
+# unchanged by this wave.
+_st1, _, _ = _lnd_req("POST", "/api/event",
+                      {"event": "guide_page_viewed",
+                       "page": "/free-guide.html", "source": "ig"},
+                      _UA_IOS)
+_st2, _, _ = _lnd_req("POST", "/api/event",
+                      {"event": "guide_download_clicked",
+                       "page": "/free-guide.html", "source": "ig"},
+                      _UA_IOS)
+_st3, _, _ = _lnd_req("POST", "/api/event",
+                      {"event": "guide_hacked",
+                       "page": "/free-guide.html", "source": "ig"},
+                      _UA_IOS)
+_rows_v = _lnd_rows("guide_page_viewed")
+_rows_d = _lnd_rows("guide_download_clicked")
+check("LAND-P3 /api/event accepts guide events (204, stored), "
+      "unknown event still 400",
+      _st1 == 204 and _st2 == 204 and _st3 == 400
+      and len(_rows_v) == 1 and _rows_v[0]["page"] == "/"
+      and _rows_v[0]["source"] == "ig"
+      and _rows_v[0]["device"] == "ios"
+      and len(_rows_d) == 1 and _rows_d[0]["page"] == "/"
+      and len(_lnd_rows("guide_hacked")) == 0)
+
+_SRV_LND.shutdown()
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:
