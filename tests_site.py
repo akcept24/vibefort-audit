@@ -7630,6 +7630,18 @@ check("LAND-P3 /api/event accepts guide events (204, stored), "
       and len(_rows_d) == 1 and _rows_d[0]["page"] == "/"
       and len(_lnd_rows("guide_hacked")) == 0)
 
+# LAND-P4: the landing links the site stylesheet and shows the guide
+# cover; /guide-cover.png is served by the real Handler as a real PNG.
+_st, _ct, _body = _lnd_req("GET", "/guide-cover.png")
+check("LAND-P4 free-guide.html links /style.css + cover; "
+      "GET /guide-cover.png -> 200 image/png, PNG magic",
+      '<link rel="stylesheet" href="/style.css">' in _land
+      and 'src="/guide-cover.png"' in _land
+      and 'alt="The free ShipAudit Lab guide — first page"' in _land
+      and _st == 200 and _ct is not None
+      and _ct.startswith("image/png")
+      and _body.startswith(b"\x89PNG\r\n\x1a\n"))
+
 _SRV_LND.shutdown()
 
 failed = [n for n, ok in PASS if not ok]
