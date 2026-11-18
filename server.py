@@ -1427,6 +1427,17 @@ def validate_brief(data):
     url = _s(data.get("url"))
     tier = _s(data.get("tier"))
     notes = _s(data.get("notes"))
+    # Money-path wave (2026-11-17): a Deep Scan ordered straight from
+    # the scan-result panel never asks for a name — the mini-form
+    # carries email + authorization only. For exactly that path
+    # (tier == "Deep Scan" AND source == "scan_result") an empty name
+    # is accepted and the stored name is derived from the client's
+    # own email local part (the part before "@"). Every other
+    # tier/source combination keeps the name requirement unchanged.
+    if not name and tier == "Deep Scan" \
+            and _s(data.get("source")) == "scan_result" \
+            and EMAIL_RX.match(email):
+        name = email.split("@", 1)[0]
     if not name or len(name) > 200:
         errors["name"] = "Enter your name."
     if not EMAIL_RX.match(email) or len(email) > 254:
@@ -2259,7 +2270,8 @@ FUNNEL_EVENTS = frozenset({
     "scan_form_viewed", "scan_url_entered", "scan_submit_clicked",
     "scan_authorization_missing", "scan_validation_failed",
     "scan_started", "scan_completed", "scan_failed",
-    "guide_page_viewed", "guide_download_clicked"})
+    "guide_page_viewed", "guide_download_clicked",
+    "deep_scan_checkout_started"})
 FUNNEL_PAGE_RX = re.compile(r"/[A-Za-z0-9/_-]*")
 FUNNEL_SOURCE_RX = re.compile(r"[a-z0-9_-]{0,32}")
 

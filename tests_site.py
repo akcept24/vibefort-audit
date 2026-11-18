@@ -7654,6 +7654,139 @@ check("LAND-P5 free-guide.html references inside page; "
 
 _SRV_LND.shutdown()
 
+# ---------------------------------------------------------------------------
+# Money-path wave (2026-11-17): the automated Deep Scan no longer
+# routes through the 5-field brief dialog at the hottest moment —
+# the scan-result panel carries an inline mini-form (email +
+# authorization) that files the brief and goes straight to Stripe.
+# The server accepts a name-less brief for exactly one combination
+# (tier "Deep Scan" AND source "scan_result") and derives the stored
+# name from the client's own email local part; every other
+# combination keeps the name requirement. The brief dialog itself
+# is unchanged for all tiers; only its success pane reorders the
+# payment button above the reply-time line.
+import http.client as _hcFLW
+import http.server as _hsFLW
+import threading as _thFLW
+
+_prev_tg_flw = S.send_telegram
+_prev_resend_flw = S.send_resend
+S.send_telegram = lambda text: (True, "stub")
+S.send_resend = lambda to, subject, text, html=None: (True, "stub")
+
+_SRV_FLW = _hsFLW.ThreadingHTTPServer(("127.0.0.1", 0), S.Handler)
+_PORT_FLW = _SRV_FLW.server_address[1]
+_thFLW.Thread(target=_SRV_FLW.serve_forever,
+              kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+
+def _flw_req(method, path, body=None):
+    conn = _hcFLW.HTTPConnection("127.0.0.1", _PORT_FLW, timeout=30)
+    payload = None
+    hdrs = {}
+    if body is not None:
+        payload = json.dumps(body).encode()
+        hdrs["Content-Type"] = "application/json"
+    conn.request(method, path, body=payload, headers=hdrs)
+    resp = conn.getresponse()
+    data = resp.read()
+    conn.close()
+    return resp.status, data
+
+
+def _flw_order(email):
+    c = db()
+    row = c.execute("SELECT * FROM orders WHERE email=?",
+                    (email,)).fetchone()
+    c.close()
+    return row
+
+
+# FLOW-P1: the scan-result CTA template in app.js carries the
+# mini-form — email input with the report-email placeholder, the
+# authorization label verbatim, the checkout button text and the
+# brief-instead fallback line.
+_appjs = open(os.path.join(_here, "app.js")).read()
+check("FLOW-P1 app.js result CTA carries the Deep Scan mini-form "
+      "(email input, verbatim authorization label, checkout button, "
+      "brief fallback)",
+      'class="deep-mini-form"' in _appjs
+      and 'class="deep-mini-email" type="email"' in _appjs
+      and 'placeholder=\"Your email for the report\"' in _appjs
+      and "I confirm I own this application or have written "
+      "authorization to have it tested." in _appjs
+      and "Run automated Deep Scan — $29" in _appjs
+      and "Questions first?" in _appjs
+      and "Send a brief instead" in _appjs
+      and "deep_scan_checkout_started" in _appjs
+      and "prefilled_email=" in _appjs)
+
+# FLOW-P2: a Deep Scan brief from the scan-result path with an
+# empty name is accepted; the stored order's name is the email
+# local part.
+_st, _body = _flw_req("POST", "/api/brief",
+                      {"name": "", "email": "flowpath@example.com",
+                       "url": "https://example.com",
+                       "tier": "Deep Scan", "notes": "",
+                       "authorized": True, "source": "scan_result"})
+_resp = json.loads(_body) if _body else {}
+_row = _flw_order("flowpath@example.com")
+check("FLOW-P2 Deep Scan + source=scan_result + empty name -> 200, "
+      "order stored with name derived from the email local part",
+      _st == 200 and _resp.get("ok") is True
+      and _row is not None and _row["name"] == "flowpath"
+      and _row["tier"] == "Deep Scan")
+
+# FLOW-P3: the name requirement is unchanged everywhere else — a
+# Quick Audit brief carrying source=scan_result with an empty name
+# is rejected, and so is a Deep Scan brief with an empty name but
+# no source.
+_st1, _b1 = _flw_req("POST", "/api/brief",
+                     {"name": "", "email": "flowquick@example.com",
+                      "url": "https://example.com",
+                      "tier": "Quick Audit", "notes": "",
+                      "authorized": True, "source": "scan_result"})
+_st2, _b2 = _flw_req("POST", "/api/brief",
+                     {"name": "", "email": "flownosrc@example.com",
+                      "url": "https://example.com",
+                      "tier": "Deep Scan", "notes": "",
+                      "authorized": True})
+_e1 = (json.loads(_b1) if _b1 else {}).get("errors", {})
+_e2 = (json.loads(_b2) if _b2 else {}).get("errors", {})
+check("FLOW-P3 empty name still rejected for Quick Audit + "
+      "scan_result and for Deep Scan without source; no orders "
+      "stored",
+      _st1 == 400 and "name" in _e1
+      and _st2 == 400 and "name" in _e2
+      and _flw_order("flowquick@example.com") is None
+      and _flw_order("flownosrc@example.com") is None)
+
+# FLOW-P4: the new funnel event is whitelisted — accepted (204)
+# and stored by the /api/event sink.
+_st, _ = _flw_req("POST", "/api/event",
+                  {"event": "deep_scan_checkout_started",
+                   "page": "/", "source": ""})
+_c = db()
+_rows = _c.execute("SELECT * FROM funnel_events WHERE event=?",
+                   ("deep_scan_checkout_started",)).fetchall()
+_c.close()
+check("FLOW-P4 /api/event accepts deep_scan_checkout_started "
+      "(204, stored)",
+      _st == 204 and len(_rows) == 1)
+
+# FLOW-P5: in the brief-success pane the payment paragraph now
+# precedes the "We reply within one business day." paragraph.
+_index = open(os.path.join(_here, "index.html")).read()
+_seg = _index[_index.index('id="brief-success"'):]
+check("FLOW-P5 #brief-success: payment paragraph precedes the "
+      "reply-time paragraph",
+      _seg.index('id="brief-pay"')
+      < _seg.index("We reply within one business day."))
+
+_SRV_FLW.shutdown()
+S.send_telegram = _prev_tg_flw
+S.send_resend = _prev_resend_flw
+
 failed = [n for n, ok in PASS if not ok]
 print(f"\n{len(PASS) - len(failed)}/{len(PASS)} catalog checks pass")
 if failed:

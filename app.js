@@ -73,11 +73,41 @@ if (scanForm) scanForm.addEventListener('submit', async event => {
     const topHtml = top.length ? `<div class="top-findings"><p class="top-findings-head">Top findings from this scan</p>${top.map(f=>`<div class="top-finding"><span class="chip ${f.severity.toLowerCase()}">${f.severity}</span><div><strong>${esc(f.finding)}</strong><code>${esc(f.evidence)}</code></div></div>`).join('')}</div>` : '';
     const moreLine = rest.length ? `<p class="more-findings">+ ${rest.length} more finding${rest.length === 1 ? '' : 's'} from this free scan — full list below.</p>` : '';
     const zeroHtml = findings.length ? '' : `<div class="passed-checks"><p class="passed-line">No issues found on the public surface.</p><ul>${checks.map(c=>`<li><span>${c}</span><b>CHECKED</b></li>`).join('')}</ul><p class="fine">The scan ran these checks against your live site just now and reported no findings.</p></div>`;
-    const deepCta = `<div class="deep-cta"><div><h4>Go deeper: the Deep Scan</h4><p>This free scan reads the homepage surface. The Deep Scan checks the whole public surface — every public table probed, a secrets scan of all scripts — and delivers a PDF report with a re-scan within 14 days.</p></div><button class="button scan-deep-cta" type="button">Get the Deep Scan — $29 <svg class="arr" viewBox="0 0 10 10" aria-hidden="true" focusable="false"><path d="M2.2 7.8 7.8 2.2M7.8 2.2H3.4M7.8 2.2v4.4" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg></button></div>`;
+    const deepCta = `<div class="deep-cta"><div><h4>Go deeper: the Deep Scan</h4><p>This free scan reads the homepage surface. The Deep Scan checks the whole public surface — every public table probed, a secrets scan of all scripts — and delivers a PDF report with a re-scan within 14 days.</p></div><button class="button scan-deep-cta" type="button">Get the Deep Scan — $29 <svg class="arr" viewBox="0 0 10 10" aria-hidden="true" focusable="false"><path d="M2.2 7.8 7.8 2.2M7.8 2.2H3.4M7.8 2.2v4.4" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round"/></svg></button><form class="deep-mini-form" novalidate><input class="deep-mini-email" type="email" autocomplete="email" placeholder="Your email for the report" aria-label="Your email for the report" required><p class="field-error deep-mini-error" hidden></p><label class="check"><input class="deep-mini-authorized" type="checkbox" required> <span>I confirm I own this application or have written authorization to have it tested.</span></label><button class="button" type="submit">Run automated Deep Scan — $29</button><p class="fine deep-mini-alt">Questions first? <a href="#" class="deep-mini-brief">Send a brief instead</a></p></form></div>`;
     const restHtml = rest.length ? `<p class="also-head">Also from this free scan</p><table class="findings-table"><thead><tr><th>SEVERITY</th><th>FINDING</th><th>EVIDENCE</th><th>STATUS</th></tr></thead><tbody>${rest.map(rowHtml).join('')}</tbody></table>` : '';
     output.innerHTML = `<div class="scan-panel results"><div class="scan-panel-head"><span>SURFACE CHECK / RESULTS</span><span>COMPLETE</span></div><div class="result-title"><div><span class="eyebrow">SURFACE SCORE</span><h3>${result.grade}<small>${result.score} / 100</small></h3></div><div class="stamp">Live scan</div></div><p class="fine">Real checks against your live site, run just now. Paid audits add a second, independent verification pass to every finding.</p>${topHtml}${moreLine}${zeroHtml}${deepCta}${restHtml}</div>`;
     const cta = output.querySelector('.scan-deep-cta');
-    if (cta) cta.addEventListener('click', () => { const trigger = document.querySelector('.brief-trigger[data-tier="Deep Scan"]'); if (trigger) trigger.click(); });
+    const miniForm = output.querySelector('.deep-mini-form');
+    const miniEmail = output.querySelector('.deep-mini-email');
+    // Money path: the result-panel Deep Scan button no longer opens
+    // the brief dialog — it takes the visitor straight to the inline
+    // mini-form (email + authorization) rendered in the same block.
+    // The dialog stays one click away via the "Send a brief instead"
+    // link and every other tier's trigger.
+    if (cta && miniEmail) cta.addEventListener('click', () => { miniEmail.scrollIntoView({ behavior: 'smooth', block: 'center' }); miniEmail.focus({ preventScroll: true }); });
+    const miniBrief = output.querySelector('.deep-mini-brief');
+    if (miniBrief) miniBrief.addEventListener('click', event => { event.preventDefault(); const trigger = document.querySelector('.brief-trigger[data-tier="Deep Scan"]'); if (trigger) trigger.click(); });
+    if (miniForm && miniEmail) miniForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const email = miniEmail.value.trim();
+      const authorizedBox = miniForm.querySelector('.deep-mini-authorized');
+      const miniError = miniForm.querySelector('.deep-mini-error');
+      const showMiniError = msg => { miniError.textContent = msg; miniError.hidden = false; };
+      miniError.hidden = true; miniError.textContent = '';
+      if (!email || !miniEmail.checkValidity()) { showMiniError('Enter a valid work email.'); miniEmail.focus(); return; }
+      if (!authorizedBox.checked) { showMiniError('Please confirm you own this application or have written authorization to test it.'); authorizedBox.focus(); return; }
+      const btn = miniForm.querySelector('button[type=submit]'); btn.disabled = true;
+      try {
+        const resp = await fetch('/api/brief', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: '', email, url, tier: 'Deep Scan', notes: '', authorized: true, source: 'scan_result' }) });
+        const data = await resp.json().catch(() => ({}));
+        if (!resp.ok || !data.ok) throw new Error('brief rejected');
+        trackEvent('deep_scan_checkout_started');
+        window.location.href = CHECKOUT_URLS['Deep Scan'] + '?prefilled_email=' + encodeURIComponent(email);
+      } catch (e) {
+        showMiniError('Something went wrong sending your brief. Please try again, or email us directly at ' + CONTACT_EMAIL + '.');
+        btn.disabled = false;
+      }
+    });
     trackEvent('scan_completed');
   } catch (err) {
     const mailtoFail = `mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent('Free scan request')}&body=${encodeURIComponent('Please run a free scan for: ' + url)}`;
