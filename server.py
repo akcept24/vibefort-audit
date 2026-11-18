@@ -110,6 +110,7 @@ STATIC_FILES = {
     "/guide.pdf": ("guide.pdf", "application/pdf"),
     "/free-guide.html": ("free-guide.html", "text/html"),
     "/guide-cover.png": ("guide-cover.png", "image/png"),
+    "/guide-inside.png": ("guide-inside.png", "image/png"),
     "/favicon.svg": ("favicon.svg", "image/svg+xml"),
     "/robots.txt": ("robots.txt", "text/plain"),
     "/sitemap.xml": ("sitemap.xml", "application/xml"),

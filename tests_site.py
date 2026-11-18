@@ -7642,6 +7642,16 @@ check("LAND-P4 free-guide.html links /style.css + cover; "
       and _ct.startswith("image/png")
       and _body.startswith(b"\x89PNG\r\n\x1a\n"))
 
+# LAND-P5: the landing shows a second guide page fanned behind the
+# cover; /guide-inside.png is served by the real Handler as a real PNG.
+_st, _ct, _body = _lnd_req("GET", "/guide-inside.png")
+check("LAND-P5 free-guide.html references inside page; "
+      "GET /guide-inside.png -> 200 image/png, PNG magic",
+      'src="/guide-inside.png"' in _land
+      and _st == 200 and _ct is not None
+      and _ct.startswith("image/png")
+      and _body.startswith(b"\x89PNG\r\n\x1a\n"))
+
 _SRV_LND.shutdown()
 
 failed = [n for n, ok in PASS if not ok]
